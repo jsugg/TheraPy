@@ -5,9 +5,21 @@ name = "pypi"
 
 [packages]
 coqui-tts = "*"
-transformers = "*"
 tts = "*"
 soundfile = "*"
+streamlit = "*"
+streamlit-webrtc = "*"
+python-dotenv = "*"
+# insanely-fast-whisper = "0.0.13"
+librosa = "*"
+colorama = "*"
+optimum = "*"
+accelerate = "*"
+torch = "*"
+openai-whisper = "*"
+transformers = {ref = "v4.40.2", git = "git+https://github.com/huggingface/transformers.git@v4.40.2"}
+webrtcvad = "*"
+watchdog = "*"
 
 [dev-packages]
 

@@ -100,3 +100,6 @@ target/
 
 # Models
 models/**/*
+
+# Venv
+.venv/

@@ -1,0 +1,8 @@
+torch
+transformers
+insanely_fast_whisper
+TTS
+streamlit
+transformers
+insanely_fast_whisper
+pydantic

@@ -1,49 +1,81 @@
 import logging
+from typing import Any, List, Union
 
-from TTS.utils.io import load_config
-from TTS.utils.synthesizers import Synthesizer
+from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers.tokenization_utils import PreTrainedTokenizer
+from transformers.tokenization_utils_fast import PreTrainedTokenizerFast
+
+from app.types import SingletonMeta
+import time
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
 )
-logger = logging.getLogger(__name__)
+logger: logging.Logger = logging.getLogger(name=__name__)
 
 
-class TextToSpeechService:
-    def __init__(self, config_path, model_path, vocoder_path):
-        self.config = load_config(config_path)
+class ChatbotService(metaclass=SingletonMeta):
+    def __init__(self, model_name="microsoft/Phi-3-mini-4k-instruct") -> None:
+        logger.info(
+            msg="Initializing ChatbotService..."
+        )
+        start_time: float = time.time()
         try:
-            self.synthesizer = Synthesizer(
-                tts_checkpoint=model_path,
-                tts_config_path=config_path,
-                vocoder_checkpoint=vocoder_path,
-                vocoder_config=self.config,
-                use_cuda=True,
+            logger.info(
+                msg="Loading chatbot model from HuggingFace..."
             )
-            logger.info("Text-to-Speech model loaded successfully.")
+            self.tokenizer: Union[
+                PreTrainedTokenizer, PreTrainedTokenizerFast
+            ] = AutoTokenizer.from_pretrained(
+                pretrained_model_name_or_path=model_name,
+                trust_remote_code=True,
+            )
+            self.model: Any = AutoModelForCausalLM.from_pretrained(
+                pretrained_model_name_or_path=model_name,
+                trust_remote_code=True,
+            )
+            logger.info(msg=f"Chatbot model loaded in {time.time() - start_time:.2f} seconds.")
         except Exception as e:
-            logger.error(f"Failed to load TTS model: {e}")
-            raise RuntimeError(f"Text-to-Speech model loading failed: {e}")
+            logger.error(msg=f"Failed to load chatbot model: {e}")
+            raise RuntimeError(f"Chatbot model loading failed: {e}") from e
+        logger.info(
+            msg=f"ChatbotService initialized in {time.time() - start_time:.2f} seconds."
+        )
 
-    def synthesize_text(self, text):
+    def generate_response(self, input_text) -> str:
+        start_time: float = time.time()
         try:
-            audio, _, _ = self.synthesizer.tts(text)
-            logger.info("Audio synthesis successful.")
-            return audio
+            inputs: List[int] = self.tokenizer.encode(
+                text=input_text, return_tensors="pt"
+            )
+            logger.info(msg="Input text encoded successfully.")
+            response: Any = self.model.generate(
+                inputs, max_length=50, num_return_sequences=1
+            )
+            response_text: str = self.tokenizer.decode(
+                token_ids=response[0], skip_special_tokens=True
+            )
+            logger.info(msg="Response generated successfully.")
+            response_text = self.tokenizer.decode(
+                token_ids=response[0], skip_special_tokens=True
+            )
+            logger.info(
+                msg=(
+                    "Response decoded successfully. Total time: "
+                    f"{time.time() - start_time:.2f} seconds."
+                )
+            )
+            return response_text
         except Exception as e:
-            logger.error(f"Error during text synthesis: {e}")
-            return None
+            logger.error(msg=f"Error generating response: {e}")
+            return "I'm sorry, I couldn't process your request."
 
 
 # Example usage
 if __name__ == "__main__":
-    tts_service = TextToSpeechService(
-        config_path="config.json",
-        model_path="tts_model.pth.tar",
-        vocoder_path="vocoder_model.pth.tar",
+    chatbot_service = ChatbotService()
+    answer: str = chatbot_service.generate_response(
+        "What is occupational therapy?"
     )
-    audio_output = tts_service.synthesize_text(
-        "Hello, how can I assist you today?"
-    )
-    # Handling of audio output to be added based on system requirements
+    print(answer)

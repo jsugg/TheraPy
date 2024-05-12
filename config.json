@@ -1,0 +1,7 @@
+{
+    "stt_model_path": "models/stt_model.pth",
+    "tts_config": "configs/tts_config.json",
+    "tts_model_path": "models/tts_model.pth.tar",
+    "vocoder_path": "models/vocoder_model.pth.tar",
+    "chatbot_model_name": "gpt-neo-2.7B"
+}
