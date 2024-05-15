@@ -20,6 +20,7 @@ watchdog = "*"
 flask-socketio = "*"
 pydub = "*"
 pymediainfo = "*"
+flask = "*"
 
 [dev-packages]
 

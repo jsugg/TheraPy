@@ -4,6 +4,7 @@ import logging
 from flask import Flask, render_template, request
 from flask_socketio import SocketIO, emit
 import numpy as np
+from numpy.typing import NDArray
 from pydub import AudioSegment
 from pydub.exceptions import CouldntDecodeError
 from transformers.models.whisper.modeling_whisper import WhisperModel
@@ -15,37 +16,40 @@ logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
 )
 
-logger = logging.getLogger(__name__)
+logger: logging.Logger = logging.getLogger(name=__name__)
 stt_service = SpeechToTextService(model_path="openai/whisper-medium")
 
-app = Flask(__name__)
+app = Flask(import_name=__name__)
 app.config["SECRET_KEY"] = "secret!"
-socketio = SocketIO(app)
+socketio: SocketIO = SocketIO(app=app)
 
 # Load Whisper model
-model = stt_service.model
-lock = threading.Lock()
+model: WhisperModel = stt_service.model
+lock: threading.Lock = threading.Lock()
 
 
-def transcribe_audio(audio_chunk):
-    waveform = np.array(audio_chunk.get_array_of_samples(), dtype=np.float32)
+def transcribe_audio(audio_chunk) -> str:
+    waveform: NDArray[np.float32] = np.array(
+        audio_chunk.get_array_of_samples(), dtype=np.float32
+    )
     waveform /= np.iinfo(audio_chunk.sample_width * 8).max
     result = model.transcribe(waveform)
     return result["text"]
 
 
-audio_buffers = {}
+audio_buffers: dict[str, AudioSegment] = {}
 
 
-@socketio.on("audio_message")
-def handle_audio_stream(msg):
+@socketio.on(message="audio_message")
+def handle_audio_stream(msg) -> None:
     user_id = request.sid
-    logger.info(f"Received audio message from {user_id}, size: {len(msg)}")
+    logger.info(msg=f"Received audio message from {user_id}, size: {len(msg)}")
     audio_segment = None
+    
     try:
-        audio_segment = AudioSegment.from_file(io.BytesIO(msg), format='webm')
+        audio_segment = AudioSegment.from_file(io.BytesIO(msg), format="webm")
     except CouldntDecodeError as e:
-        logger.error(f"Error processing audio file: {e}")
+        logger.error(msg=f"Error processing audio file: {e}")
         return
 
     # Ensure thread safety when accessing/modifying shared audio buffer
@@ -54,22 +58,24 @@ def handle_audio_stream(msg):
             audio_buffers[user_id] = AudioSegment.empty()
         if audio_segment:
             audio_buffers[user_id] += audio_segment
-            logger.info(f"Buffer size now: {len(audio_buffers[user_id])}")
+            logger.info(msg=f"Buffer size now: {len(audio_buffers[user_id])}")
             process_and_transcribe_audio(user_id=user_id)
 
 
 def process_and_transcribe_audio(user_id):
     with lock:  # Ensure thread safety when processing audio data
-        current_buffer = audio_buffers[user_id]
+        current_buffer: AudioSegment = audio_buffers[user_id]
         if len(current_buffer) >= 5000:  # Process buffer if it's long enough
             transcript = transcribe_audio(audio_chunk=current_buffer)
             emit("transcription", transcript, to=user_id)
             logger.info(f"Transcription: {transcript}")
-            audio_buffers[user_id] = AudioSegment.empty()  # Clear buffer after processing
+            audio_buffers[user_id] = (
+                AudioSegment.empty()
+            )  # Clear buffer after processing
 
 
 @app.route("/")
-def index():
+def index() -> str:
     return render_template("index2.html")
 
 
