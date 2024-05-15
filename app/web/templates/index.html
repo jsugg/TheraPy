@@ -1,0 +1,52 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Real-Time Voice Chatbot</title>
+    <script src="https://cdn.socket.io/4.0.0/socket.io.min.js"></script>
+    <script>
+        document.addEventListener('DOMContentLoaded', function () {
+            var socket = io();
+            var audioContext = new AudioContext();
+
+            navigator.mediaDevices.getUserMedia({ audio: true, video: false })
+                .then(function(stream) {
+                    const mediaStreamSource = audioContext.createMediaStreamSource(stream);
+                    const processor = audioContext.createScriptProcessor(1024, 1, 1);
+                    mediaStreamSource.connect(processor);
+                    processor.connect(audioContext.destination);
+
+                    processor.onaudioprocess = function(e) {
+                        const inputData = e.inputBuffer.getChannelData(0);
+                        const inputDataArray = Array.from(inputData);
+                        socket.emit('stream_audio', { audio: inputDataArray });
+                    };
+
+                    socket.on('audio_response', function(data) {
+                        playAudio(data.audio);
+                    });
+
+                    console.log('Audio capture and streaming started.');
+                })
+                .catch(function(err) {
+                    console.error('Audio capture error:', err);
+                });
+
+            function playAudio(audioData) {
+                var arrayBuffer = new Float32Array(audioData).buffer;
+                audioContext.decodeAudioData(arrayBuffer, function(buffer) {
+                    var source = audioContext.createBufferSource();
+                    source.buffer = buffer;
+                    source.connect(audioContext.destination);
+                    source.start(0);
+                }, function(e) {
+                    console.log('Error decoding audio data:', e);
+                });
+            }
+        });
+    </script>
+</head>
+<body>
+    <h1>Real-Time Voice Chatbot</h1>
+</body>
+</html>

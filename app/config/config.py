@@ -21,23 +21,23 @@ class Config(SingletonMeta):
     PROCESSED_DATA_PATH = os.path.join(DATA_DIR, "processed")
 
     # Coqui STT paths
-    STT_MODEL_PATH = os.path.join(
+    STT_MODEL_PATH: str = os.path.join(
             MODELS_DIR,
-            os.getenv("STT_MODEL_PATH")
+            os.environ.get("STT_MODEL_PATH", default="openai/whisper-medium")
         )
     STT_MODEL_FILEPATH = os.path.join(
             MODELS_DIR,
             "stt",
             "rhasspy",
             "faster-whisper-medium-int8",
-            os.environ.get("STT_MODEL_FILENAME", "model.bin")
+            os.environ.get("STT_MODEL_FILENAME", default="model.bin")
         )
     STT_CONFIG_PATH = os.path.join(
             MODELS_DIR,
             "stt",
             "rhasspy",
             "faster-whisper-medium-int8",
-            os.environ.get("STT_CONFIG_FILENAME", "config.json")
+            os.environ.get("STT_CONFIG_FILENAME", default="config.json")
         )
     # STT_SCORER_PATH = os.path.join(MODELS_DIR, "stt", "scorer.scorer")
 

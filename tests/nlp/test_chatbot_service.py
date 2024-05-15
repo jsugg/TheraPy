@@ -1,5 +1,5 @@
 import unittest
-from app.chatbot.chatbot_service import ChatbotService
+from src.chatbot.chatbot_service import ChatbotService
 
 class TestChatbotService(unittest.TestCase):
     def test_response_generation(self):

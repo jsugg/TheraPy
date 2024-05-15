@@ -1,6 +1,7 @@
 """
 Module for creating singleton instances of classes.
 """
+import threading
 from typing import Any, Dict
 
 
@@ -21,9 +22,11 @@ class SingletonMeta(type):
     """
 
     _instances: dict = {}
+    _lock: threading.Lock = threading.Lock()
 
-    def __call__(cls, *args, **kwargs) -> Dict:
-        if cls not in cls._instances:
-            instance: Any = super().__call__(*args, **kwargs)
-            cls._instances[cls] = instance
-        return cls._instances[cls]
+    def __call__(cls, *args, **kwargs):
+        with cls._lock:
+            if cls not in cls._instances:
+                instance: Any = super().__call__(*args, **kwargs)
+                cls._instances[cls] = instance
+            return cls._instances[cls]

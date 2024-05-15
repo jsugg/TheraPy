@@ -1,0 +1,41 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Real-Time Speech-to-Text</title>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.0.0/socket.io.js"></script>
+</head>
+<body>
+    <ul id="transcriptions"></ul>
+
+    <script>
+        const socket = io();
+        let mediaRecorder;
+
+        window.onload = () => {
+            navigator.mediaDevices.getUserMedia({ audio: true }).then(stream => {
+                let options = { mimeType: 'audio/webm; codecs=opus' };
+                mediaRecorder = new MediaRecorder(stream, options);
+                mediaRecorder.start(1000);  // Emit audio data every 1000 ms
+
+                mediaRecorder.ondataavailable = event => {
+                    if (event.data.size > 0) {
+                        socket.emit('audio_message', event.data);
+                    }
+                };
+
+                mediaRecorder.onstop = () => {
+                    socket.emit('audio_end');
+                };
+            }).catch(console.error);
+        };
+
+        socket.on('transcription', function(text) {
+            const node = document.createElement("LI");
+            const textnode = document.createTextNode(text);
+            node.appendChild(textnode);
+            document.getElementById('transcriptions').appendChild(node);
+        });
+    </script>
+</body>
+</html>

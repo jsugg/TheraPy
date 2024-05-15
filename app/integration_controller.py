@@ -2,10 +2,10 @@
 
 import asyncio
 import logging
-from typing import Any, AsyncGenerator, Union
-from app.stt.speech_to_text_service import SpeechToTextService
-from app.tts.text_to_speech_service import TextToSpeechService
-from app.chatbot.chatbot_service import ChatbotService
+from typing import Optional
+from app.services.stt import SpeechToTextService
+from app.services.tts import TextToSpeechService
+from app.services.chatbot import ChatbotService
 
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
@@ -32,27 +32,30 @@ class IntegrationController:
         )
 
     async def handle_interaction(
-        self, audio_stream
-    ) -> AsyncGenerator[Any, None]:
+        self, audio_data
+    ):
         logger.info(msg="Starting interaction handling process.")
         try:
-            transcription: Union[str, None] = (
+            transcription: Optional[str] = (
                 await self.stt_service.transcribe_until_pause(
-                    audio_stream=audio_stream
+                    audio_stream=audio_data['audio']
                 )
             )
             if transcription:
                 logger.info(msg=f"Transcription: {transcription}")
                 response_text: str = self.chatbot_service.generate_response(
-                    transcription
+                    input_text=transcription
                 )
                 logger.info(msg=f"Generated response: {response_text}")
-                yield self.tts_service.synthesize_text(text=response_text)
+                async for audio_chunk in self.tts_service.synthesize_text(text=response_text):
+                    yield audio_chunk
                 # async for audio_chunk in self.tts_service.synthesize_text(
                 #     text=response_text
                 # ):
                 #     yield audio_chunk
                 #     logger.info(msg="Audio chunk synthesized and yielded.")
+            else:    
+                logger.info(msg="SpeechToTextService - Transcription from the audiostream is None.")
         except Exception as e:
             logging.error(msg=f"Failed to handle interaction: {e}")
             yield None

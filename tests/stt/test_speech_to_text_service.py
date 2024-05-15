@@ -1,5 +1,5 @@
 import unittest
-from app.stt.speech_to_text_service import SpeechToTextService
+from src.services.stt.speech_to_text_service import SpeechToTextService
 
 
 class TestSpeechToTextService(unittest.TestCase):
