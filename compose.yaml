@@ -1,0 +1,14 @@
+services:
+  therapy:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      THERAPY_DATA_DIR: /data
+    volumes:
+      # All personal data (audio archive, timelines, user model) lives here —
+      # on user-controlled infrastructure only (SPEC §8).
+      - therapy-data:/data
+
+volumes:
+  therapy-data:

@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+.pytest_cache/
+.ruff_cache/
+
+# Environment / secrets
+.env
+.env.*
+
+# Data — personal audio, transcripts, user model. Never committed.
+data/
+*.db
+*.sqlite3
+*.wav
+*.ogg
+*.webm
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/

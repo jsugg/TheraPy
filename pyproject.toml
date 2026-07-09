@@ -1,0 +1,40 @@
+[project]
+name = "therapy"
+version = "0.1.0"
+description = "Voice-first personal assistant for self-understanding — CBT/OT-informed, emotion-aware."
+authors = [{ name = "Juan Sugg", email = "juanpedrosugg@gmail.com" }]
+license = { text = "MIT" }
+license-files = ["LICENSE"]
+readme = "README.md"
+requires-python = ">=3.12,<3.14"
+keywords = ["voice", "assistant", "speech", "emotion", "neurodiversity"]
+dependencies = [
+  "fastapi>=0.115,<1.0",
+  "uvicorn[standard]>=0.30,<1.0",
+]
+
+# Phase-gated dependencies — added when their phase lands (docs/SPEC.md §9):
+#   pipeline framework: pipecat-ai OR livekit-agents (docs/framework-spike.md)
+#   faster-whisper (STT), kokoro (TTS)          — phase 1
+#   ser (speech emotion recognition)            — phase 3
+
+[dependency-groups]
+dev = [
+  "pytest>=8,<9",
+  "httpx>=0.27,<1.0",
+  "ruff>=0.6",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/therapy"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 88
