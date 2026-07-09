@@ -9,13 +9,16 @@ readme = "README.md"
 requires-python = ">=3.12,<3.14"
 keywords = ["voice", "assistant", "speech", "emotion", "neurodiversity"]
 dependencies = [
+  "anthropic>=0.116.0",
   "fastapi>=0.115,<1.0",
+  "httpx>=0.28.1",
+  "kokoro-onnx>=0.5.0",
+  "pipecat-ai[silero,webrtc,whisper]>=1.5.0",
+  "requests>=2.34.2",
   "uvicorn[standard]>=0.30,<1.0",
 ]
 
 # Phase-gated dependencies — added when their phase lands (docs/SPEC.md §9):
-#   pipeline framework: pipecat-ai OR livekit-agents (docs/framework-spike.md)
-#   faster-whisper (STT), kokoro (TTS)          — phase 1
 #   ser (speech emotion recognition)            — phase 3
 
 [dependency-groups]

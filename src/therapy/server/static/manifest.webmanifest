@@ -1,0 +1,12 @@
+{
+  "name": "TheraPy",
+  "short_name": "TheraPy",
+  "description": "Voice-first companion for self-understanding",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#f6f4ef",
+  "theme_color": "#1b4332",
+  "icons": [
+    { "src": "/icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any" }
+  ]
+}
