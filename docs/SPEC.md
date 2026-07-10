@@ -222,6 +222,8 @@ A second knowledge store, deliberately separate from the user model: the user mo
 - Naming: **keep TheraPy** — archive the old repo, recreate fresh under the same name.
 
 **Settled (2026-07-10):**
+- Whisper model stays `small` on this host: measured `large-v3-turbo` (CPU int8, Intel Mac) — warm TTFA went from 9–13 s to 34–124 s in the dry run for marginal transcript gains. Meaningful STT quality improvement is gated on the VPS/GPU migration; `THERAPY_WHISPER_MODEL` stays the escape hatch.
+
 - Reply language is user-selectable (Auto · ES · EN · PT) with **Auto = dominant language of the last phrase**, word-level majority via **lingua-py** (new dependency, phase-1-gated in pyproject); ties/low confidence keep the current language; a pin constrains replies only (STT stays auto); selection persists client-side (§7).
 
 - Raw utterance audio: **kept indefinitely** (encrypted at rest before any VPS move). Each ser upgrade re-analyzes history — the emotional timeline gets retroactively smarter, and the archive doubles as eval data for ser itself.
