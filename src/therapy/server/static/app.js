@@ -2,8 +2,9 @@
  *
  * Voice and text share one conversation: mic audio flows over the peer
  * connection; typed turns and transcripts flow over the "chat" data channel.
- * Reply modality mirrors the input by default (typing mutes voice replies),
- * with manual overrides (🎙️ mic, 🔊 voice replies).
+ * Reply modality mirrors the input by default — the server skips TTS for
+ * typed turns entirely; the 🔊 toggle sends a "voice_replies" override so
+ * the decision is server-side (SPEC §5). Local mute is instant feedback.
  */
 
 const $ = (id) => document.getElementById(id);
@@ -39,6 +40,11 @@ function applySpeaker(defaultOn) {
   const on = speakerOverride === null ? defaultOn : speakerOverride;
   botAudio.muted = !on;
   $("speaker").setAttribute("aria-pressed", String(on));
+}
+
+function sendSpeakerOverride() {
+  if (!channel || channel.readyState !== "open") return;
+  channel.send(JSON.stringify({ type: "voice_replies", enabled: speakerOverride }));
 }
 
 async function connect() {
@@ -124,6 +130,7 @@ $("mic").addEventListener("click", () => {
 $("speaker").addEventListener("click", () => {
   speakerOverride = botAudio.muted; // flip
   applySpeaker(speakerOverride);
+  sendSpeakerOverride();
 });
 
 if ("serviceWorker" in navigator) {

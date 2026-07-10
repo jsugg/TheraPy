@@ -8,6 +8,10 @@ services:
         required: false
     environment:
       THERAPY_DATA_DIR: /data
+    extra_hosts:
+      # Lets THERAPY_LLM=ollama reach an Ollama server on the host
+      # (no-op on Docker Desktop, needed on Linux).
+      - "host.docker.internal:host-gateway"
     volumes:
       # All personal data (audio archive, timelines, user model) lives here —
       # on user-controlled infrastructure only (SPEC §8).

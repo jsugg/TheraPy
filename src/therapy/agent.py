@@ -7,7 +7,8 @@ verdict — touches this file and the client transport layer only (SPEC §5).
 
 Pipeline per connection:
 
-    transport.input (WebRTC + Silero VAD)
+    transport.input (WebRTC)
+      → VADProcessor (Silero)
       → MultilingualWhisperSTT (per-utterance language detection)
       → TurnRelay (voice-switch TTS to the turn's language; transcript → client)
       → context.user aggregator
@@ -20,6 +21,11 @@ Pipeline per connection:
 
 Typed turns arrive on the data channel (`on_app_message`) and are appended
 to the same context — voice and text are one conversation (SPEC §5).
+
+Reply modality mirrors the input server-side (SPEC §5): each user turn
+pushes `LLMConfigureOutputFrame(skip_tts=…)` so typed turns get silent
+replies — no wasted synthesis — while spoken turns get voice. The client's
+speaker toggle sends a `voice_replies` override on the same data channel.
 """
 
 import asyncio
@@ -34,6 +40,8 @@ from pipecat.audio.vad.silero import SileroVADAnalyzer
 from pipecat.audio.vad.vad_analyzer import VADParams
 from pipecat.frames.frames import (
     Frame,
+    InputAudioRawFrame,
+    LLMConfigureOutputFrame,
     LLMFullResponseEndFrame,
     LLMMessagesAppendFrame,
     LLMTextFrame,
@@ -48,6 +56,7 @@ from pipecat.pipeline.runner import PipelineRunner
 from pipecat.pipeline.task import PipelineParams, PipelineTask
 from pipecat.processors.aggregators.llm_context import LLMContext
 from pipecat.processors.aggregators.llm_response_universal import LLMContextAggregatorPair
+from pipecat.processors.audio.vad_processor import VADProcessor
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 from pipecat.services.kokoro.tts import KokoroTTSService, KokoroTTSSettings
 from pipecat.services.whisper.stt import WhisperSTTService, WhisperSTTSettings
@@ -56,7 +65,8 @@ from pipecat.transports.base_transport import TransportParams
 from pipecat.transports.smallwebrtc.transport import SmallWebRTCTransport
 from pipecat.utils.time import time_now_iso8601
 
-from therapy.dialogue.policy import build_system_prompt
+from therapy.dialogue.modality import TEXT, VOICE, ReplyModality
+from therapy.dialogue.policy import build_system_prompt, language_switch_note
 from therapy.perception.stt import (
     DEFAULT_LANGUAGE,
     clamp_language,
@@ -71,10 +81,10 @@ LANGUAGE_ENUM = {"en": Language.EN, "es": Language.ES, "pt": Language.PT}
 def tts_settings_for(language: str) -> TTSUpdateSettingsFrame:
     """TTS voice+language switch frame for a supported language code."""
     return TTSUpdateSettingsFrame(
-        settings={
-            "voice": voice_for(language),
-            "language": LANGUAGE_ENUM[language],
-        }
+        delta=KokoroTTSSettings(
+            voice=voice_for(language),
+            language=LANGUAGE_ENUM[language],
+        )
     )
 
 
@@ -125,16 +135,18 @@ class MultilingualWhisperSTTService(WhisperSTTService):
 
 
 class TurnRelay(FrameProcessor):
-    """Per-turn language handling + user transcript relay to the client.
+    """Per-turn language + modality handling; user transcript relay.
 
-    On each user turn: if the utterance language changed, re-voice the TTS
-    (voice + language) before the reply is synthesized; always forward the
-    transcript over the data channel so the client can render it.
+    On each voice turn: if the utterance language changed, re-voice the TTS
+    (voice + language) before the reply is synthesized; tell the LLM whether
+    the reply should be spoken (modality mirroring, SPEC §5); always forward
+    the transcript over the data channel so the client can render it.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, modality: ReplyModality) -> None:
         super().__init__()
         self._language: str | None = None
+        self._modality = modality
 
     @property
     def language(self) -> str | None:
@@ -148,6 +160,11 @@ class TurnRelay(FrameProcessor):
         if language != self._language:
             self._language = language
             await self.push_frame(tts_settings_for(language))
+            await self.push_frame(
+                LLMMessagesAppendFrame(
+                    messages=[{"role": "system", "content": language_switch_note(language)}]
+                )
+            )
 
     async def process_frame(self, frame: Frame, direction: FrameDirection) -> None:
         await super().process_frame(frame, direction)
@@ -157,6 +174,9 @@ class TurnRelay(FrameProcessor):
                 self._language or DEFAULT_LANGUAGE,
             )
             await self._maybe_switch(language)
+            # Spoken turn → spoken reply unless the user overrode the speaker.
+            speak = self._modality.note_turn(VOICE)
+            await self.push_frame(LLMConfigureOutputFrame(skip_tts=not speak))
             await self.push_frame(
                 OutputTransportMessageUrgentFrame(
                     message={
@@ -201,6 +221,34 @@ class BotTextRelay(FrameProcessor):
         await self.push_frame(frame, direction)
 
 
+class InputAudioProbe(FrameProcessor):
+    """Diagnostics (THERAPY_DEBUG_AUDIO=1): logs input level once per second.
+
+    Confirms what the pipeline actually hears — separates transport problems
+    from VAD/STT problems when a client claims to be speaking.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._samples = 0
+        self._sumsq = 0.0
+        self._rate = 16_000
+
+    async def process_frame(self, frame: Frame, direction: FrameDirection) -> None:
+        await super().process_frame(frame, direction)
+        if isinstance(frame, InputAudioRawFrame):
+            samples = np.frombuffer(frame.audio, dtype=np.int16)
+            self._rate = frame.sample_rate
+            self._samples += samples.size
+            self._sumsq += float(np.sum(samples.astype(np.float64) ** 2))
+            if self._samples >= self._rate:
+                rms = (self._sumsq / self._samples) ** 0.5
+                logger.info(f"Input audio: rms={rms:.0f} over {self._samples} samples @{self._rate}Hz")
+                self._samples = 0
+                self._sumsq = 0.0
+        await self.push_frame(frame, direction)
+
+
 class TTFAMonitor(FrameProcessor):
     """Logs time from end-of-user-speech to first synthesized audio (R1)."""
 
@@ -233,7 +281,7 @@ def make_llm_service():
 
         return AnthropicLLMService(
             api_key=os.environ["ANTHROPIC_API_KEY"],
-            model=model or "claude-opus-4-8",
+            settings=AnthropicLLMService.Settings(model=model or "claude-opus-4-8"),
         )
     if provider == "openrouter":
         from pipecat.services.openrouter.llm import OpenRouterLLMService
@@ -241,13 +289,16 @@ def make_llm_service():
         return OpenRouterLLMService(
             api_key=os.environ["OPENROUTER_API_KEY"],
             # Meta-route to whichever free model is currently available.
-            model=model or "openrouter/free",
+            settings=OpenRouterLLMService.Settings(model=model or "openrouter/free"),
         )
     if provider == "ollama":
         from pipecat.services.ollama.llm import OLLamaLLMService
 
         return OLLamaLLMService(
-            model=model or "llama3.2",
+            # gemma3:4b — best es/en/pt quality that still streams fast enough
+            # for voice on a CPU-only host; override via THERAPY_LLM_MODEL.
+            settings=OLLamaLLMService.Settings(model=model or "gemma3:4b"),
+            # In Docker, Ollama runs on the host: host.docker.internal.
             base_url=os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434/v1"),
         )
     raise ValueError(f"Unknown THERAPY_LLM provider: {provider!r}")
@@ -260,12 +311,16 @@ async def run_bot(webrtc_connection: Any) -> None:
         params=TransportParams(
             audio_in_enabled=True,
             audio_out_enabled=True,
-            vad_analyzer=SileroVADAnalyzer(params=VADParams(stop_secs=0.7)),
         ),
     )
+    # Pipecat ≥1.x: VAD is an explicit pipeline stage. `TransportParams`
+    # still accepts a `vad_analyzer` but non-Daily transports ignore it —
+    # without this processor no speech is ever detected.
+    vad = VADProcessor(vad_analyzer=SileroVADAnalyzer(params=VADParams(stop_secs=0.7)))
 
     stt = MultilingualWhisperSTTService()
-    turn_relay = TurnRelay()
+    modality = ReplyModality()
+    turn_relay = TurnRelay(modality)
     tts = KokoroTTSService(
         settings=KokoroTTSSettings(
             voice=voice_for(DEFAULT_LANGUAGE),
@@ -279,9 +334,13 @@ async def run_bot(webrtc_connection: Any) -> None:
     )
     aggregators = LLMContextAggregatorPair(context)
 
+    stages: list[FrameProcessor] = [transport.input()]
+    if os.environ.get("THERAPY_DEBUG_AUDIO"):
+        stages.append(InputAudioProbe())
     pipeline = Pipeline(
-        [
-            transport.input(),
+        stages
+        + [
+            vad,
             stt,
             turn_relay,
             aggregators.user(),
@@ -304,8 +363,18 @@ async def run_bot(webrtc_connection: Any) -> None:
 
     @transport.event_handler("on_app_message")
     async def on_app_message(transport: Any, message: Any, sender: str) -> None:
+        if not isinstance(message, dict):
+            return
+
+        # Speaker override from the client: true/false, or null for auto.
+        if message.get("type") == "voice_replies":
+            enabled = message.get("enabled")
+            speak = modality.set_override(enabled if isinstance(enabled, bool) else None)
+            await task.queue_frames([LLMConfigureOutputFrame(skip_tts=not speak)])
+            return
+
         # Typed turn from the data channel — same conversation, text modality.
-        if not (isinstance(message, dict) and message.get("type") == "user_text"):
+        if message.get("type") != "user_text":
             return
         text = str(message.get("text", "")).strip()
         if not text:
@@ -314,8 +383,16 @@ async def run_bot(webrtc_connection: Any) -> None:
         frames: list[Frame] = []
         if language != turn_relay.language:
             frames.append(tts_settings_for(language))
+            frames.append(
+                LLMMessagesAppendFrame(
+                    messages=[{"role": "system", "content": language_switch_note(language)}]
+                )
+            )
         stt.current_language = language
         turn_relay.note_language(language)
+        # Typed turn → silent reply unless the user overrode the speaker.
+        speak = modality.note_turn(TEXT)
+        frames.append(LLMConfigureOutputFrame(skip_tts=not speak))
         frames.append(
             LLMMessagesAppendFrame(
                 messages=[{"role": "user", "content": text}], run_llm=True
