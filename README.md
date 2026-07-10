@@ -80,12 +80,12 @@ docker compose exec therapy uv run --no-dev python scripts/phase1_dryrun.py
 docker compose logs therapy | grep TTFA   # server-side numbers (risk R1)
 ```
 
-Latest dry-run result (2026-07-10, fully-local gemma3:4b): all ten
-scenarios green — trilingual turns, typed-turn silence, barge-in, both
-SPEC §7 normative code-switched phrases, pin/unpin. Client-side TTFA
-7.9–50.5 s (first turn pays cold model loading; whisper, Kokoro, and the
-LLM share this CPU) — to be re-measured with the target provider during
-the acceptance run.
+Latest dry-run result (2026-07-10, shipped image, fully-local gemma3:4b):
+all ten scenarios green — trilingual turns, typed-turn silence, barge-in,
+both SPEC §7 normative code-switched phrases, pin/unpin. Client-side TTFA
+9.2–32.5 s on a warm container (whisper, Kokoro, and the LLM share this
+CPU) — to be re-measured with the target provider during the acceptance
+run.
 
 Phase-2 acceptance (continuity + data round-trip; runs a scripted
 two-session conversation against the live server, then exercises
