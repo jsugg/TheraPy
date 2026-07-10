@@ -1,5 +1,6 @@
 import asyncio
 import json
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 import wave
 
@@ -39,6 +40,78 @@ def test_session_lifecycle(tmp_path: Path) -> None:
     assert turns[0]["language"] == "es"
     assert turns[1]["role"] == "assistant"
     assert turns[1]["text"] == "That sounds heavy."
+
+
+def test_resume_candidate_returns_recently_ended_newest_session(
+    tmp_path: Path,
+) -> None:
+    store = MemoryStore(tmp_path)
+    session_id = store.create_session()
+    store.add_turn(session_id, "user", "text", "en", "Hello.")
+    store.end_session(session_id)
+
+    assert store.resume_candidate(900.0) == session_id
+
+
+def test_resume_candidate_returns_none_when_stale(tmp_path: Path) -> None:
+    store = MemoryStore(tmp_path)
+    session_id = store.create_session()
+    store.add_turn(session_id, "user", "text", "en", "Hello.")
+    store.end_session(session_id)
+
+    assert store.resume_candidate(900.0, now=datetime.now(UTC) + timedelta(hours=2)) is None
+
+
+def test_resume_candidate_uses_last_turn_for_unfinalized_session(
+    tmp_path: Path,
+) -> None:
+    store = MemoryStore(tmp_path)
+    session_id = store.create_session()
+    stale_started_at = (datetime.now(UTC) - timedelta(hours=2)).isoformat(
+        timespec="microseconds"
+    )
+    with store._connect() as connection:
+        with connection:
+            connection.execute(
+                "UPDATE sessions SET started_at = ? WHERE id = ?",
+                (stale_started_at, session_id),
+            )
+    store.add_turn(session_id, "user", "text", "en", "Still here.")
+    last_turn = store.session_turns(session_id)[-1]
+    now = datetime.fromisoformat(str(last_turn["ts"])) + timedelta(minutes=5)
+
+    assert store.resume_candidate(900.0, now=now) == session_id
+
+
+def test_resume_candidate_empty_store_returns_none(tmp_path: Path) -> None:
+    store = MemoryStore(tmp_path)
+
+    assert store.resume_candidate(900.0) is None
+
+
+def test_resume_candidate_zero_window_returns_none_for_fresh_session(
+    tmp_path: Path,
+) -> None:
+    store = MemoryStore(tmp_path)
+    store.create_session()
+
+    assert store.resume_candidate(0.0) is None
+
+
+def test_reopen_session_clears_finalization_and_summary_history(
+    tmp_path: Path,
+) -> None:
+    store = MemoryStore(tmp_path)
+    session_id = store.create_session()
+    store.end_session(session_id, "The user checked in.")
+    assert store.recent_summaries()[0]["summary"] == "The user checked in."
+
+    store.reopen_session(session_id)
+
+    session = store.sessions()[0]
+    assert session["ended_at"] is None
+    assert session["summary"] is None
+    assert store.recent_summaries() == []
 
 
 def test_audio_archival(tmp_path: Path) -> None:

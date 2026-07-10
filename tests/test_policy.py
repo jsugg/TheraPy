@@ -4,7 +4,32 @@ from therapy.dialogue.policy import (
     crisis_resources,
     language_pin_note,
     language_switch_note,
+    rehydrate_messages,
+    resume_note,
 )
+
+
+def test_resume_note_forbids_regreeting() -> None:
+    note = resume_note()
+    assert "same ongoing conversation" in note
+    assert "do not greet" in note
+
+
+def test_rehydrate_messages_maps_turns_verbatim_and_caps() -> None:
+    turns = [
+        {"role": "user", "text": "Hola", "language": "es", "modality": "voice"},
+        {"role": "assistant", "text": "Hola, ¿cómo estás?", "language": "es"},
+        {"role": "user", "text": "", "language": "es"},  # empty → dropped
+    ]
+    messages = rehydrate_messages(turns)
+    assert messages == [
+        {"role": "user", "content": "Hola"},
+        {"role": "assistant", "content": "Hola, ¿cómo estás?"},
+    ]
+    many = [{"role": "user", "text": f"t{i}"} for i in range(60)]
+    capped = rehydrate_messages(many, limit=40)
+    assert len(capped) == 40
+    assert capped[0]["content"] == "t20"  # most recent turns win
 
 
 def test_prompt_covers_trilingual_and_boundaries() -> None:

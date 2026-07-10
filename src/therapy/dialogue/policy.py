@@ -105,6 +105,35 @@ def continuity_note(summaries: list[dict], facts: list[dict]) -> str | None:
     return "\n\n".join(parts)
 
 
+def resume_note() -> str:
+    """Marker preceding rehydrated turns after a reconnect (SPEC §8).
+
+    A dropped WebRTC connection is not a session boundary: the prior turns
+    re-enter the context verbatim, and this note keeps the model from
+    greeting the user as if the conversation were starting over.
+    """
+    return (
+        "The connection dropped briefly and was restored. The messages below "
+        "are the same ongoing conversation — continue it naturally; do not "
+        "greet the user again or treat their next message as an opener."
+    )
+
+
+def rehydrate_messages(turns: list[dict], limit: int = 40) -> list[dict]:
+    """Verbatim chat messages rebuilt from a resumed session's stored turns.
+
+    Within one session the conversation reaches the LLM verbatim (the
+    summaries-only rule applies across sessions, not to an interrupted
+    one). Capped to the most recent turns so a marathon session cannot
+    blow up the context on reconnect.
+    """
+    return [
+        {"role": str(turn["role"]), "content": str(turn["text"])}
+        for turn in turns[-limit:]
+        if turn.get("text")
+    ]
+
+
 _LANGUAGE_NAMES = {"en": "English", "es": "Spanish", "pt": "Portuguese"}
 
 

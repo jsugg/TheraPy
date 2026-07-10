@@ -120,6 +120,67 @@ class MemoryStore:
                     (_utc_now(), summary, session_id),
                 )
 
+    def resume_candidate(
+        self, window_secs: float, now: datetime | None = None
+    ) -> str | None:
+        """Return the newest session id when it is recent enough to resume.
+
+        This backs reconnect-resume: a dropped WebRTC connection should not
+        split one conversation into two sessions.
+        """
+        if window_secs <= 0:
+            return None
+        if now is None:
+            now = datetime.now(UTC)
+
+        with self._connect() as connection:
+            session = connection.execute(
+                """
+                SELECT id, started_at, ended_at
+                FROM sessions
+                ORDER BY started_at DESC, rowid DESC
+                LIMIT 1
+                """
+            ).fetchone()
+            if session is None:
+                return None
+
+            session_id = str(session["id"])
+            started_at = str(session["started_at"])
+            ended_at = session["ended_at"]
+            if ended_at is not None:
+                activity_ts = str(ended_at)
+            else:
+                turn = connection.execute(
+                    """
+                    SELECT ts
+                    FROM turns
+                    WHERE session_id = ?
+                    ORDER BY ts DESC, id DESC
+                    LIMIT 1
+                    """,
+                    (session_id,),
+                ).fetchone()
+                activity_ts = str(turn["ts"]) if turn is not None else started_at
+
+        last_activity = datetime.fromisoformat(activity_ts)
+        if (now - last_activity).total_seconds() <= window_secs:
+            return session_id
+        return None
+
+    def reopen_session(self, session_id: str) -> None:
+        """Clear finalization fields so an interrupted session can continue."""
+        with self._connect() as connection:
+            with connection:
+                connection.execute(
+                    """
+                    UPDATE sessions
+                    SET ended_at = NULL, summary = NULL
+                    WHERE id = ?
+                    """,
+                    (session_id,),
+                )
+
     def add_turn(
         self,
         session_id: str,

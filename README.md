@@ -45,6 +45,11 @@ ollama pull gemma3:4b       # default model — decent es/en/pt, CPU-friendly
 #       OLLAMA_BASE_URL=http://host.docker.internal:11434/v1
 ```
 
+Dropped connections resume: reconnecting within
+`THERAPY_RESUME_WINDOW_SECS` (default 15 min) continues the interrupted
+session — same transcript, same context — instead of starting a new one.
+Set it to `0` to make every connection a fresh session.
+
 The 2024 prototype lives at
 [`jsugg/TheraPy-legacy`](https://github.com/jsugg/TheraPy-legacy) (archived);
 no code was carried over.

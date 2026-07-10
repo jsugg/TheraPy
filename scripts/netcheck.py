@@ -110,7 +110,9 @@ async def main() -> None:
 
     async with httpx.AsyncClient() as client:
         response = await client.post(
-            f"{args.server}/api/offer",
+            # A connectivity probe must never resume (and re-finalize) a
+            # real conversation left within the resume window.
+            f"{args.server}/api/offer?new_session=1",
             json={"sdp": sdp, "type": pc.localDescription.type},
             timeout=60,
         )

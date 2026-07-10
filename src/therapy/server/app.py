@@ -90,14 +90,20 @@ def launch_bot(
 
 @app.post("/api/offer")
 async def offer(request: Request) -> dict[str, object]:
-    """SDP offer → answer; the new connection preempts the previous pipeline."""
+    """SDP offer → answer; the new connection preempts the previous pipeline.
+
+    `?new_session=1` skips reconnect-resume so the pipeline always opens a
+    fresh session — test scripts need isolated sessions; real clients
+    resume an interrupted one (SPEC §8).
+    """
     from pipecat.transports.smallwebrtc.request_handler import SmallWebRTCRequest
     from therapy.agent import run_bot
 
     body = await request.json()
+    new_session = request.query_params.get("new_session") == "1"
 
     async def on_connection(connection: object) -> None:
-        launch_bot(connection, run_bot)
+        launch_bot(connection, lambda conn: run_bot(conn, new_session=new_session))
 
     answer = await _handler().handle_web_request(
         SmallWebRTCRequest.from_dict(body), on_connection

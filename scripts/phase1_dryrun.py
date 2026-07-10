@@ -279,7 +279,9 @@ async def main() -> None:
 
     async with httpx.AsyncClient() as client:
         response = await client.post(
-            f"{SERVER}/api/offer",
+            # new_session=1: scenarios assume a fresh context — never resume
+            # whatever session a previous run or field test left behind.
+            f"{SERVER}/api/offer?new_session=1",
             json={"sdp": pc.localDescription.sdp, "type": pc.localDescription.type},
             timeout=60,
         )

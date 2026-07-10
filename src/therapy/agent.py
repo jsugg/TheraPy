@@ -83,7 +83,9 @@ from therapy.dialogue.policy import (
     continuity_note,
     language_pin_note,
     language_switch_note,
+    rehydrate_messages,
     reply_language_reminder,
+    resume_note,
 )
 from therapy.memory import MemoryStore, make_summarizer
 from therapy.memory.distill import distill_facts
@@ -100,6 +102,20 @@ LANGUAGE_ENUM = {"en": Language.EN, "es": Language.ES, "pt": Language.PT}
 
 # Shared across connections — see MultilingualWhisperSTTService._load.
 _whisper_model: Any = None
+
+# Reconnect-resume coordination (SPEC §8). A dropped connection schedules
+# finalization, but the same client usually reconnects seconds later — the
+# new pipeline must be able to cancel an in-flight finalize (_finalizers)
+# and, for one scheduled after it already resumed, make it a no-op
+# (_session_owners holds a token per session; only the current owner may
+# close it). Single event loop, so plain dicts need no locking.
+_finalizers: dict[str, asyncio.Task[None]] = {}
+_session_owners: dict[str, object] = {}
+
+
+def resume_window_secs() -> float:
+    """How long after its last activity a session is still resumable."""
+    return float(os.environ.get("THERAPY_RESUME_WINDOW_SECS", "900"))
 
 
 def vad_params() -> VADParams:
@@ -410,8 +426,14 @@ def make_llm_service():
     raise ValueError(f"Unknown THERAPY_LLM provider: {provider!r}")
 
 
-async def run_bot(webrtc_connection: Any) -> None:
-    """Build and run one conversation pipeline for a WebRTC connection."""
+async def run_bot(webrtc_connection: Any, *, new_session: bool = False) -> None:
+    """Build and run one conversation pipeline for a WebRTC connection.
+
+    Args:
+        webrtc_connection: The signaling-complete SmallWebRTC connection.
+        new_session: Skip reconnect-resume and always open a fresh session
+            (test scripts need isolated sessions; real clients resume).
+    """
     transport = SmallWebRTCTransport(
         webrtc_connection=webrtc_connection,
         params=TransportParams(
@@ -425,10 +447,35 @@ async def run_bot(webrtc_connection: Any) -> None:
     vad = VADProcessor(vad_analyzer=SileroVADAnalyzer(params=vad_params()))
 
     store = MemoryStore()
-    session_id = store.create_session()
+
+    # A dropped connection is not a session boundary: reconnecting within
+    # the resume window reopens the interrupted session instead of starting
+    # an amnesiac new one (field test: a 4-minute WebRTC drop made the bot
+    # deny the whole prior conversation).
+    resumed_turns: list[dict] = []
+    session_id = None if new_session else store.resume_candidate(resume_window_secs())
+    if session_id:
+        pending = _finalizers.pop(session_id, None)
+        if pending is not None:
+            pending.cancel()
+        store.reopen_session(session_id)
+        resumed_turns = store.session_turns(session_id)
+        logger.info(f"Resuming session {session_id} ({len(resumed_turns)} turns)")
+    else:
+        session_id = store.create_session()
+    owner = object()
+    _session_owners[session_id] = owner
+
+    # Language state survives the reconnect too — pick up where the user
+    # left off instead of snapping back to English.
+    initial_language = DEFAULT_LANGUAGE
+    for turn in reversed(resumed_turns):
+        if turn["role"] == "user":
+            initial_language = clamp_language(str(turn["language"]), DEFAULT_LANGUAGE)
+            break
 
     modality = ReplyModality()
-    reply_language = ReplyLanguage(initial=DEFAULT_LANGUAGE)
+    reply_language = ReplyLanguage(initial=initial_language)
 
     def record_user_voice(audio: bytes, text: str, language: str) -> None:
         store.add_turn(
@@ -445,21 +492,28 @@ async def run_bot(webrtc_connection: Any) -> None:
         )
 
     stt = MultilingualWhisperSTTService(recorder=record_user_voice)
+    stt.current_language = initial_language
     turn_relay = TurnRelay(modality, reply_language)
     tts = KokoroTTSService(
         settings=KokoroTTSSettings(
-            voice=voice_for(DEFAULT_LANGUAGE),
-            language=LANGUAGE_ENUM[DEFAULT_LANGUAGE],
+            voice=voice_for(initial_language),
+            language=LANGUAGE_ENUM[initial_language],
         )
     )
     llm = make_llm_service()
 
     # Continuity (SPEC §8): the current conversation goes verbatim; the past
-    # arrives only as distilled summaries + the user model.
+    # arrives only as distilled summaries + the user model. A resumed
+    # session IS the current conversation — its turns are rehydrated
+    # verbatim after the reconnect marker. (recent_summaries already
+    # excludes it: reopen_session cleared its ended_at.)
     messages = [{"role": "system", "content": build_system_prompt()}]
     memory_note = continuity_note(store.recent_summaries(), store.facts())
     if memory_note:
         messages.append({"role": "system", "content": memory_note})
+    if resumed_turns:
+        messages.append({"role": "system", "content": resume_note()})
+        messages.extend(rehydrate_messages(resumed_turns))
     context = LLMContext(messages=messages)
     aggregators = LLMContextAggregatorPair(context)
 
@@ -583,6 +637,12 @@ async def run_bot(webrtc_connection: Any) -> None:
         nonlocal finalized
         if finalized:
             return
+        # A reconnect may have resumed this session before this task ran
+        # (preemption schedules finalize during cancellation, possibly after
+        # the new pipeline already took ownership) — then it is no longer
+        # ours to close.
+        if _session_owners.get(session_id) is not owner:
+            return
         finalized = True
         turns = await asyncio.to_thread(store.session_turns, session_id)
         summary: str | None = None
@@ -596,14 +656,39 @@ async def run_bot(webrtc_connection: Any) -> None:
         for statement in facts:
             await asyncio.to_thread(store.upsert_fact, statement)
         await asyncio.to_thread(store.end_session, session_id, summary)
+        if _session_owners.get(session_id) is owner:
+            del _session_owners[session_id]
         logger.info(
             f"Session {session_id} closed "
             f"({len(turns)} turns, summary={bool(summary)}, facts={len(facts)})"
         )
 
+    finalize_task: asyncio.Task[None] | None = None
+
+    def schedule_finalize() -> None:
+        """Start finalization, registered so a resuming reconnect can cancel it.
+
+        Scheduled at most once: a normal disconnect reaches both call sites
+        (the event handler, then the runner's finally), and a duplicate
+        registration would shadow the real task in _finalizers — a resume
+        would then cancel the no-op while the original closed the session
+        out from under the new pipeline.
+        """
+        nonlocal finalize_task
+        if finalize_task is not None:
+            return
+        finalize_task = asyncio.create_task(finalize_session())
+        _finalizers[session_id] = finalize_task
+
+        def _forget(done: asyncio.Task[None]) -> None:
+            if _finalizers.get(session_id) is done:
+                del _finalizers[session_id]
+
+        finalize_task.add_done_callback(_forget)
+
     @transport.event_handler("on_client_disconnected")
     async def on_client_disconnected(transport: Any, connection: Any) -> None:
-        asyncio.create_task(finalize_session())
+        schedule_finalize()
         await task.cancel()
 
     runner = PipelineRunner(handle_sigint=False)
@@ -612,4 +697,4 @@ async def run_bot(webrtc_connection: Any) -> None:
     finally:
         # A preempted pipeline (new connection cancelled this one) never sees
         # on_client_disconnected — its session must still close and summarize.
-        asyncio.create_task(finalize_session())
+        schedule_finalize()
