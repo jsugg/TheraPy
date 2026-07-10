@@ -76,6 +76,14 @@ button.primary {
 }
 button.toggle[aria-pressed="false"] { opacity: .35; }
 #send { background: var(--accent); color: #fff; }
+#lang {
+  border: 0;
+  border-radius: .75rem;
+  padding: .55rem .5rem;
+  font-size: .9rem;
+  background: var(--card);
+  color: var(--ink);
+}
 input[type="text"] {
   flex: 1;
   min-width: 0;

@@ -89,3 +89,16 @@ def language_switch_note(language: str) -> str:
     """
     name = _LANGUAGE_NAMES.get(language, language)
     return f"The user is now speaking {name}. Reply entirely in {name} until they switch again."
+
+
+def language_pin_note(language: str) -> str:
+    """Reply-language pin instruction (SPEC §7: pinned mode).
+
+    The pin constrains replies only — the user may keep speaking any
+    language, so the note must override the standing follow-the-user rule.
+    """
+    name = _LANGUAGE_NAMES.get(language, language)
+    return (
+        f"The user asked you to reply only in {name} from now on, regardless of "
+        f"which language they speak or type. Reply entirely in {name} until told otherwise."
+    )

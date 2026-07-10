@@ -17,6 +17,24 @@ let channel = null;
 let micTrack = null;
 let speakerOverride = null; // null = auto (mirror modality), true/false = user override
 
+// Reply language (SPEC §7): "" = auto, or a pinned es/en/pt. Persists across
+// visits and is re-sent on every connect — the server holds the live state.
+const langSelect = $("lang");
+langSelect.value = localStorage.getItem("replyLanguage") || "";
+
+function sendReplyLanguage() {
+  if (!channel || channel.readyState !== "open") return;
+  channel.send(JSON.stringify({
+    type: "reply_language",
+    language: langSelect.value || null,
+  }));
+}
+
+langSelect.addEventListener("change", () => {
+  localStorage.setItem("replyLanguage", langSelect.value);
+  sendReplyLanguage();
+});
+
 function setStatus(text, state = "idle") {
   status.textContent = text;
   status.dataset.state = state;
@@ -59,6 +77,7 @@ async function connect() {
   pc.addTransceiver("audio", { direction: "recvonly" });
 
   channel = pc.createDataChannel("chat", { ordered: true });
+  channel.onopen = sendReplyLanguage; // replay the persisted pin (SPEC §7)
   channel.onmessage = (event) => {
     let msg;
     try { msg = JSON.parse(event.data); } catch { return; }
