@@ -34,6 +34,14 @@ def test_language_pin_note_overrides_follow_the_user() -> None:
     assert "regardless" in note
 
 
+def test_reply_language_reminder_is_short_and_names_language() -> None:
+    from therapy.dialogue.policy import reply_language_reminder
+
+    note = reply_language_reminder("es")
+    assert "Spanish" in note
+    assert len(note) < 100  # per-turn cost must stay negligible
+
+
 def test_continuity_note_empty_history_is_none() -> None:
     assert continuity_note([], []) is None
 

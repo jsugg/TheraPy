@@ -120,6 +120,18 @@ def language_switch_note(language: str) -> str:
     return f"The user is now speaking {name}. Reply entirely in {name} until they switch again."
 
 
+def reply_language_reminder(language: str) -> str:
+    """Per-turn reply-language nudge (SPEC §7 auto mode).
+
+    Small local models drift back to English over a long context even
+    without a switch — the tag and TTS voice stay right while the text
+    goes wrong. A short reminder adjacent to each user turn keeps the
+    generation anchored; large models simply ignore the redundancy.
+    """
+    name = _LANGUAGE_NAMES.get(language, language)
+    return f"Reply to the user's next message entirely in {name}."
+
+
 def language_pin_note(language: str) -> str:
     """Reply-language pin instruction (SPEC §7: pinned mode).
 

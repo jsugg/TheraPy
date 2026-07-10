@@ -60,3 +60,12 @@ def test_pin_rejects_unsupported_codes() -> None:
     choice = ReplyLanguage()
     with pytest.raises(ValueError):
         choice.set_pin("fr")
+
+
+def test_short_fragments_never_flip_the_language() -> None:
+    # A quoted foreign phrase or a VAD-clipped shard is not a switch.
+    choice = ReplyLanguage(initial="en")
+    assert choice.note_phrase("muriendo de sueño") == "en"
+    assert choice.note_phrase("Te sueño.") == "en"
+    # A full sentence still switches.
+    assert choice.note_phrase("Mejor sigamos hablando en español ahora.") == "es"

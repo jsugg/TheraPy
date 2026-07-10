@@ -86,11 +86,19 @@ class ReplyLanguage:
         self._pin = code
         return self.language
 
+    # A quoted foreign fragment ("what I said was 'muriendo de sueño'") or a
+    # VAD-clipped shard must not flip the conversation language. Phrases
+    # shorter than this keep the current language — deliberate switches are
+    # full sentences (both SPEC §7 normative examples are 6+ words).
+    MIN_WORDS_TO_SWITCH = 4
+
     def note_phrase(self, text: str) -> str:
         """Track a user phrase; returns the reply language for this turn.
 
         The auto choice updates even while pinned, so unpinning resumes
         from the user's actual current language, not a stale one.
         """
-        self._auto = dominant_language(text, self._auto)
+        counts = word_language_counts(text)
+        if sum(counts.values()) >= self.MIN_WORDS_TO_SWITCH:
+            self._auto = dominant_language(text, self._auto)
         return self.language

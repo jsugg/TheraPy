@@ -211,11 +211,15 @@ async function connect() {
 
   const offer = await pc.createOffer();
   await pc.setLocalDescription(offer);
-  // Wait for ICE gathering so a single POST carries all candidates.
+  // Gather candidates for a single POST, but bounded: with a TURN server
+  // configured, browsers can take many seconds to declare gathering
+  // "complete" (e.g. a slow tcp variant) — 3 s of candidates is enough.
   await new Promise((resolve) => {
-    if (pc.iceGatheringState === "complete") return resolve();
+    const timer = setTimeout(resolve, 3000);
+    const done = () => { clearTimeout(timer); resolve(); };
+    if (pc.iceGatheringState === "complete") return done();
     pc.addEventListener("icegatheringstatechange", () => {
-      if (pc.iceGatheringState === "complete") resolve();
+      if (pc.iceGatheringState === "complete") done();
     });
   });
 
@@ -244,9 +248,16 @@ function sendText() {
   applySpeaker(false); // typed turn → mirror to silent replies unless overridden
 }
 
-$("connect").addEventListener("click", () =>
-  connect().catch((err) => setStatus(`error: ${err.message}`))
-);
+$("connect").addEventListener("click", () => {
+  // Immediate feedback: the button yields to the status line right away;
+  // it only comes back if the connection attempt fails.
+  $("connect").hidden = true;
+  connect().catch((err) => {
+    setStatus(`error: ${err.message}`);
+    $("connect").hidden = false;
+    $("controls").hidden = true;
+  });
+});
 $("send").addEventListener("click", sendText);
 $("text").addEventListener("keydown", (e) => { if (e.key === "Enter") sendText(); });
 $("history").addEventListener("click", () => setHistoryVisible(historyView.hidden));

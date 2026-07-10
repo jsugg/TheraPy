@@ -83,6 +83,7 @@ from therapy.dialogue.policy import (
     continuity_note,
     language_pin_note,
     language_switch_note,
+    reply_language_reminder,
 )
 from therapy.memory import MemoryStore, make_summarizer
 from therapy.memory.distill import distill_facts
@@ -94,6 +95,25 @@ from therapy.perception.stt import (
 from therapy.speech.tts import voice_for
 
 LANGUAGE_ENUM = {"en": Language.EN, "es": Language.ES, "pt": Language.PT}
+
+# Shared across connections — see MultilingualWhisperSTTService._load.
+_whisper_model: Any = None
+
+
+def vad_params() -> VADParams:
+    """Speech-detection thresholds, env-tunable without a rebuild.
+
+    Pipecat's defaults (confidence .7, min_volume .6) were tuned for close,
+    clean microphones; real phone speech over opus sits quieter, and the
+    field test lost most of it. stop_secs=1.0 also keeps a phrase with a
+    natural mid-sentence pause in one utterance instead of three.
+    """
+    return VADParams(
+        confidence=float(os.environ.get("THERAPY_VAD_CONFIDENCE", "0.6")),
+        start_secs=0.2,
+        stop_secs=float(os.environ.get("THERAPY_VAD_STOP_SECS", "1.0")),
+        min_volume=float(os.environ.get("THERAPY_VAD_MIN_VOLUME", "0.3")),
+    )
 
 
 def tts_settings_for(language: str) -> TTSUpdateSettingsFrame:
@@ -124,6 +144,18 @@ class MultilingualWhisperSTTService(WhisperSTTService):
         # (audio, text, language) → persisted user turn; this is the one spot
         # where the raw utterance and its transcript exist together (SPEC §8).
         self._recorder = recorder
+
+    def _load(self) -> None:
+        # One faster-whisper instance per process, not per connection: loading
+        # takes tens of seconds on CPU (it blocked handshakes of connections
+        # racing the load) and each copy costs ~1 GB. Only one pipeline is
+        # live at a time (connection preemption), so sharing is safe.
+        global _whisper_model
+        if _whisper_model is None:
+            super()._load()
+            _whisper_model = self._model
+        else:
+            self._model = _whisper_model
 
     async def run_stt(self, audio: bytes):
         if not self._model:
@@ -174,6 +206,13 @@ class TurnRelay(FrameProcessor):
         self._language: str | None = None
         self._modality = modality
         self._reply_language = reply_language
+        self._last_note_at: float = 0.0
+
+    async def _note(self, content: str) -> None:
+        self._last_note_at = time.monotonic()
+        await self.push_frame(
+            LLMMessagesAppendFrame(messages=[{"role": "system", "content": content}])
+        )
 
     @property
     def language(self) -> str | None:
@@ -183,15 +222,13 @@ class TurnRelay(FrameProcessor):
         """Record a language change applied elsewhere (e.g. a typed turn)."""
         self._language = language
 
-    async def _maybe_switch(self, language: str) -> None:
-        if language != self._language:
-            self._language = language
-            await self.push_frame(tts_settings_for(language))
-            await self.push_frame(
-                LLMMessagesAppendFrame(
-                    messages=[{"role": "system", "content": language_switch_note(language)}]
-                )
-            )
+    async def _maybe_switch(self, language: str) -> bool:
+        if language == self._language:
+            return False
+        self._language = language
+        await self.push_frame(tts_settings_for(language))
+        await self._note(language_switch_note(language))
+        return True
 
     async def process_frame(self, frame: Frame, direction: FrameDirection) -> None:
         await super().process_frame(frame, direction)
@@ -201,17 +238,16 @@ class TurnRelay(FrameProcessor):
                 self._language or DEFAULT_LANGUAGE,
             )
             reply = self._reply_language.note_phrase(frame.text)
-            await self._maybe_switch(reply)
-            if self._reply_language.pinned and language != reply:
-                # Re-assert the pin right after the mismatched user message —
-                # small local models otherwise mirror the user's language.
-                await self.push_frame(
-                    LLMMessagesAppendFrame(
-                        messages=[
-                            {"role": "system", "content": language_pin_note(reply)}
-                        ]
-                    )
-                )
+            switched = await self._maybe_switch(reply)
+            # Anchor EVERY turn, not just switches: small local models drift
+            # back to English mid-conversation (field test 2026-07-10) while
+            # the tag and voice stay correct. Bursty fragments of one
+            # aggregated turn share a single note (4 s dedupe).
+            if not switched and time.monotonic() - self._last_note_at > 4.0:
+                if self._reply_language.pinned and language != reply:
+                    await self._note(language_pin_note(reply))
+                else:
+                    await self._note(reply_language_reminder(reply))
             # Spoken turn → spoken reply unless the user overrode the speaker.
             speak = self._modality.note_turn(VOICE)
             await self.push_frame(LLMConfigureOutputFrame(skip_tts=not speak))
@@ -357,7 +393,7 @@ async def run_bot(webrtc_connection: Any) -> None:
     # Pipecat ≥1.x: VAD is an explicit pipeline stage. `TransportParams`
     # still accepts a `vad_analyzer` but non-Daily transports ignore it —
     # without this processor no speech is ever detected.
-    vad = VADProcessor(vad_analyzer=SileroVADAnalyzer(params=VADParams(stop_secs=0.7)))
+    vad = VADProcessor(vad_analyzer=SileroVADAnalyzer(params=vad_params()))
 
     store = MemoryStore()
     session_id = store.create_session()
@@ -487,18 +523,15 @@ async def run_bot(webrtc_connection: Any) -> None:
         frames: list[Frame] = []
         if reply != turn_relay.language:
             frames.append(tts_settings_for(reply))
-            frames.append(
-                LLMMessagesAppendFrame(
-                    messages=[{"role": "system", "content": language_switch_note(reply)}]
-                )
-            )
+            note = language_switch_note(reply)
         elif reply_language.pinned and language != reply:
-            # Same pin re-assertion as voice turns (TurnRelay).
-            frames.append(
-                LLMMessagesAppendFrame(
-                    messages=[{"role": "system", "content": language_pin_note(reply)}]
-                )
-            )
+            note = language_pin_note(reply)
+        else:
+            # Per-turn anchor, mirroring TurnRelay (small-model drift).
+            note = reply_language_reminder(reply)
+        frames.append(
+            LLMMessagesAppendFrame(messages=[{"role": "system", "content": note}])
+        )
         stt.current_language = language
         turn_relay.note_language(reply)
         await asyncio.to_thread(store.add_turn, session_id, "user", TEXT, language, text)
