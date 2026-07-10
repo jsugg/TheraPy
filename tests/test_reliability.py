@@ -61,5 +61,13 @@ def test_compose_declares_reliability_and_turn() -> None:
     assert "--lt-cred-mech" in COMPOSE
 
 
+def test_compose_caps_memory_per_service() -> None:
+    # Uncapped containers exhaust the Docker VM under load; a wedged VM
+    # hangs the docker CLI and every port-forward (hypervisor stall,
+    # observed 2026-07-10). Caps convert that into a container OOM-kill
+    # that the restart policy recovers from. One cap per service.
+    assert COMPOSE.count("mem_limit:") == 2
+
+
 def test_dockerfile_runs_watchdog() -> None:
     assert "watchdog.py" in DOCKERFILE

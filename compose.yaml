@@ -30,6 +30,11 @@ services:
       retries: 3
       start_period: 180s
     stop_grace_period: 20s
+    # Hard cap so runaway memory OOM-kills THIS container (restart policy
+    # brings it back) instead of exhausting the Docker VM — an exhausted VM
+    # wedges at the hypervisor level and takes the docker CLI and every
+    # port-forward down with it (observed twice on 2026-07-10).
+    mem_limit: 5g
 
   # TURN relay for clients whose host candidates can't reach the pipeline
   # (the phone over Tailscale: the server only advertises container-internal
@@ -54,6 +59,7 @@ services:
     ports:
       - "3478:3478/udp"
       - "3478:3478/tcp"
+    mem_limit: 256m
 
 volumes:
   therapy-data:
