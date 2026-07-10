@@ -87,6 +87,25 @@ class TypedClient:
         if message.get("type") == "transcript":
             self.transcripts.append(message)
             self.event.set()
+        if message.get("type") == "session":
+            self.session_state = message
+            self.event.set()
+
+    async def request_session_state(self, timeout: float = 30.0) -> dict:
+        """Ask for the server-truth chat state, like the PWA on channel open."""
+        self.session_state: dict | None = None
+        self.channel.send(json.dumps({"type": "client_ready"}))
+        deadline = time.monotonic() + timeout
+        while self.session_state is None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                sys.exit(f"FAIL: no session state within {timeout}s")
+            self.event.clear()
+            try:
+                await asyncio.wait_for(self.event.wait(), remaining)
+            except asyncio.TimeoutError:
+                pass
+        return self.session_state
 
     async def connect(self, *, new_session: bool = True) -> None:
         # recvonly audio keeps the server's pipeline shape identical to the PWA.
@@ -192,6 +211,17 @@ async def main() -> None:
     before = await list_sessions()
     a2 = TypedClient()
     await a2.connect(new_session=False)
+    state = await a2.request_session_state()
+    replayed = (
+        state.get("resumed") is True
+        and state.get("session_id") == before[0]["id"]
+        and len(state.get("turns") or []) >= 4  # 2 user + 2 assistant from A
+    )
+    results.append(
+        "[replay] client received the resumed transcript ✓"
+        if replayed
+        else f"[replay] FAIL — {json.dumps(state)[:160]}"
+    )
     reply = await a2.ask("¿Sigues ahí? Se cortó la conexión un momento.")
     print(f"[resume] assistant: {reply[:100]!r}", flush=True)
     await a2.close()

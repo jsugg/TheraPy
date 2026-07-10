@@ -79,3 +79,33 @@ def test_session_detail_returns_404_for_unknown_id() -> None:
 
     assert response.status_code == 404
     assert response.json() == {"detail": "Session not found"}
+
+
+def test_delete_session_endpoint_removes_one_session(tmp_path: Path) -> None:
+    store = MemoryStore(tmp_path)
+    doomed = store.create_session()
+    store.add_turn(doomed, "user", "text", "en", "Erase this.")
+    kept = store.create_session()
+
+    with TestClient(app) as client:
+        response = client.delete(f"/api/sessions/{doomed}")
+        assert response.status_code == 200
+        assert response.json() == {"deleted": doomed}
+        remaining = client.get("/api/sessions").json()["sessions"]
+
+    assert [session["id"] for session in remaining] == [kept]
+    assert client.delete("/api/sessions/nope").status_code == 404
+
+
+def test_delete_session_refuses_while_pipeline_is_live(tmp_path: Path) -> None:
+    from therapy.server import live
+
+    store = MemoryStore(tmp_path)
+    session_id = store.create_session()
+    token = live.claim(session_id)
+    try:
+        with TestClient(app) as client:
+            assert client.delete(f"/api/sessions/{session_id}").status_code == 409
+    finally:
+        live.release(session_id, token)
+    assert store.has_session(session_id)

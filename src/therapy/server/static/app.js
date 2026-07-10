@@ -21,6 +21,7 @@ let pc = null;
 let channel = null;
 let micTrack = null;
 let speakerOverride = null; // null = auto (mirror modality), true/false = user override
+let viewingSessionId = null; // session open in the history detail view
 
 // Reply language (SPEC §7): "" = auto, or a pinned es/en/pt. Persists across
 // visits and is re-sent on every connect — the server holds the live state.
@@ -123,7 +124,7 @@ function renderSessionTurns(turns) {
 
 async function loadSessions() {
   sessionDetail.hidden = true;
-  sessionList.hidden = false;
+  $("session-list-view").hidden = false;
   sessionList.textContent = "Loading sessions…";
   const response = await fetch("/api/sessions");
   if (!response.ok) throw new Error("Could not load sessions");
@@ -135,8 +136,9 @@ async function loadSession(sessionId) {
   const response = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}`);
   if (!response.ok) throw new Error("Could not load session");
   const payload = await response.json();
+  viewingSessionId = sessionId;
   renderSessionTurns(payload.turns || []);
-  sessionList.hidden = true;
+  $("session-list-view").hidden = true;
   sessionDetail.hidden = false;
 }
 
@@ -178,8 +180,12 @@ async function iceServers() {
   }
 }
 
-async function connect() {
+async function connect(opts = {}) {
   setStatus("connecting…");
+  if (pc) {
+    try { pc.close(); } catch { /* already dead */ }
+    pc = null;
+  }
   const media = await navigator.mediaDevices.getUserMedia({
     audio: { echoCancellation: true, noiseSuppression: true },
   });
@@ -190,12 +196,24 @@ async function connect() {
   pc.addTransceiver("audio", { direction: "recvonly" });
 
   channel = pc.createDataChannel("chat", { ordered: true });
-  channel.onopen = sendReplyLanguage; // replay the persisted pin (SPEC §7)
+  channel.onopen = () => {
+    sendReplyLanguage(); // replay the persisted pin (SPEC §7)
+    // Ask for server-truth chat state — the reply re-renders the resumed
+    // transcript, so a drop or page reload doesn't show an empty pane.
+    channel.send(JSON.stringify({ type: "client_ready" }));
+  };
   channel.onmessage = (event) => {
     let msg;
     try { msg = JSON.parse(event.data); } catch { return; }
     if (msg.type === "transcript" && msg.text) {
       addMessage(msg.role, msg.text, msg.language);
+    }
+    if (msg.type === "session") {
+      chat.replaceChildren();
+      for (const turn of msg.turns || []) {
+        addMessage(turn.role, turn.text, turn.language);
+      }
+      if (msg.resumed) setStatus("resumed", "listening");
     }
   };
 
@@ -223,7 +241,12 @@ async function connect() {
     });
   });
 
-  const response = await fetch("/api/offer", {
+  // Default: the server resumes a recently interrupted session. Explicit
+  // choices from the history view override it in either direction.
+  let offerUrl = "/api/offer";
+  if (opts.sessionId) offerUrl += `?session=${encodeURIComponent(opts.sessionId)}`;
+  else if (opts.newSession) offerUrl += "?new_session=1";
+  const response = await fetch(offerUrl, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
@@ -248,22 +271,50 @@ function sendText() {
   applySpeaker(false); // typed turn → mirror to silent replies unless overridden
 }
 
-$("connect").addEventListener("click", () => {
+function startConversation(opts = {}) {
   // Immediate feedback: the button yields to the status line right away;
   // it only comes back if the connection attempt fails.
   $("connect").hidden = true;
-  connect().catch((err) => {
+  connect(opts).catch((err) => {
     setStatus(`error: ${err.message}`);
     $("connect").hidden = false;
     $("controls").hidden = true;
   });
-});
+}
+
+$("connect").addEventListener("click", () => startConversation());
 $("send").addEventListener("click", sendText);
 $("text").addEventListener("keydown", (e) => { if (e.key === "Enter") sendText(); });
 $("history").addEventListener("click", () => setHistoryVisible(historyView.hidden));
 $("history-back").addEventListener("click", () => {
   sessionDetail.hidden = true;
-  sessionList.hidden = false;
+  $("session-list-view").hidden = false;
+});
+
+// Session management: start fresh, continue a chosen session, or erase one.
+$("session-new").addEventListener("click", () => {
+  setHistoryVisible(false);
+  startConversation({ newSession: true });
+});
+$("session-resume").addEventListener("click", () => {
+  if (!viewingSessionId) return;
+  setHistoryVisible(false);
+  startConversation({ sessionId: viewingSessionId });
+});
+$("session-delete").addEventListener("click", async () => {
+  if (!viewingSessionId) return;
+  if (!window.confirm("Delete this conversation and its audio for good?")) return;
+  const response = await fetch(
+    `/api/sessions/${encodeURIComponent(viewingSessionId)}`,
+    { method: "DELETE" },
+  );
+  if (!response.ok) {
+    const detail = (await response.json().catch(() => ({}))).detail;
+    setStatus(`error: ${detail || "could not delete"}`);
+    return;
+  }
+  viewingSessionId = null;
+  loadSessions().catch((err) => setStatus(`error: ${err.message}`));
 });
 
 $("mic").addEventListener("click", () => {

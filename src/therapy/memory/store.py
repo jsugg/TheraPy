@@ -168,6 +168,28 @@ class MemoryStore:
             return session_id
         return None
 
+    def has_session(self, session_id: str) -> bool:
+        """Whether a session row exists (guards explicit-resume requests)."""
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT 1 FROM sessions WHERE id = ?", (session_id,)
+            ).fetchone()
+        return row is not None
+
+    def delete_session(self, session_id: str) -> bool:
+        """Delete one session, its turns (FK cascade), and its audio archive.
+
+        Returns:
+            True when a session row was deleted, False for an unknown id.
+        """
+        with self._connect() as connection:
+            with connection:
+                cursor = connection.execute(
+                    "DELETE FROM sessions WHERE id = ?", (session_id,)
+                )
+        shutil.rmtree(self._audio_dir / session_id, ignore_errors=True)
+        return cursor.rowcount > 0
+
     def reopen_session(self, session_id: str) -> None:
         """Clear finalization fields so an interrupted session can continue."""
         with self._connect() as connection:

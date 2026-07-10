@@ -14,6 +14,7 @@ from fastapi.staticfiles import StaticFiles
 
 from therapy import __version__
 from therapy.memory import MemoryStore
+from therapy.server import live
 
 STATIC_DIR = Path(__file__).parent / "static"
 
@@ -94,16 +95,23 @@ async def offer(request: Request) -> dict[str, object]:
 
     `?new_session=1` skips reconnect-resume so the pipeline always opens a
     fresh session — test scripts need isolated sessions; real clients
-    resume an interrupted one (SPEC §8).
+    resume an interrupted one (SPEC §8). `?session=<id>` continues that
+    specific session (the history browser's explicit choice).
     """
     from pipecat.transports.smallwebrtc.request_handler import SmallWebRTCRequest
     from therapy.agent import run_bot
 
     body = await request.json()
     new_session = request.query_params.get("new_session") == "1"
+    resume_session_id = request.query_params.get("session")
 
     async def on_connection(connection: object) -> None:
-        launch_bot(connection, lambda conn: run_bot(conn, new_session=new_session))
+        launch_bot(
+            connection,
+            lambda conn: run_bot(
+                conn, new_session=new_session, resume_session_id=resume_session_id
+            ),
+        )
 
     answer = await _handler().handle_web_request(
         SmallWebRTCRequest.from_dict(body), on_connection
@@ -150,6 +158,24 @@ def session_detail(session_id: str) -> dict[str, object]:
     if session is None:
         raise HTTPException(status_code=404, detail="Session not found")
     return {"session": session, "turns": store.session_turns(session_id)}
+
+
+@app.delete("/api/sessions/{session_id}")
+def delete_session(session_id: str) -> dict[str, str]:
+    """Delete one session (turns + archived audio) from the review UI.
+
+    Wholesale wipe stays a deliberate CLI act (`python -m therapy.memory
+    delete --yes`); this is the per-conversation eraser.
+    """
+    store = _store()
+    if not store.has_session(session_id):
+        raise HTTPException(status_code=404, detail="Session not found")
+    if live.is_active(session_id):
+        raise HTTPException(
+            status_code=409, detail="Session is live — disconnect first"
+        )
+    store.delete_session(session_id)
+    return {"deleted": session_id}
 
 
 @app.get("/")

@@ -96,6 +96,8 @@ from therapy.perception.stt import (
     plausible_segment,
     whisper_model,
 )
+from therapy.server import live
+from therapy.server.protocol import session_state_message
 from therapy.speech.tts import voice_for
 
 LANGUAGE_ENUM = {"en": Language.EN, "es": Language.ES, "pt": Language.PT}
@@ -107,10 +109,8 @@ _whisper_model: Any = None
 # finalization, but the same client usually reconnects seconds later — the
 # new pipeline must be able to cancel an in-flight finalize (_finalizers)
 # and, for one scheduled after it already resumed, make it a no-op
-# (_session_owners holds a token per session; only the current owner may
-# close it). Single event loop, so plain dicts need no locking.
+# (live.py ownership tokens; only the current owner may close a session).
 _finalizers: dict[str, asyncio.Task[None]] = {}
-_session_owners: dict[str, object] = {}
 
 
 def resume_window_secs() -> float:
@@ -426,13 +426,21 @@ def make_llm_service():
     raise ValueError(f"Unknown THERAPY_LLM provider: {provider!r}")
 
 
-async def run_bot(webrtc_connection: Any, *, new_session: bool = False) -> None:
+async def run_bot(
+    webrtc_connection: Any,
+    *,
+    new_session: bool = False,
+    resume_session_id: str | None = None,
+) -> None:
     """Build and run one conversation pipeline for a WebRTC connection.
 
     Args:
         webrtc_connection: The signaling-complete SmallWebRTC connection.
         new_session: Skip reconnect-resume and always open a fresh session
             (test scripts need isolated sessions; real clients resume).
+        resume_session_id: Continue this specific session (history browser's
+            explicit choice — no freshness window applies). Unknown ids fall
+            back to the default behavior. Wins over new_session.
     """
     transport = SmallWebRTCTransport(
         webrtc_connection=webrtc_connection,
@@ -453,7 +461,14 @@ async def run_bot(webrtc_connection: Any, *, new_session: bool = False) -> None:
     # an amnesiac new one (field test: a 4-minute WebRTC drop made the bot
     # deny the whole prior conversation).
     resumed_turns: list[dict] = []
-    session_id = None if new_session else store.resume_candidate(resume_window_secs())
+    session_id = None
+    if resume_session_id:
+        if store.has_session(resume_session_id):
+            session_id = resume_session_id
+        else:
+            logger.warning(f"Cannot resume unknown session {resume_session_id!r}")
+    if session_id is None and not new_session:
+        session_id = store.resume_candidate(resume_window_secs())
     if session_id:
         pending = _finalizers.pop(session_id, None)
         if pending is not None:
@@ -463,8 +478,7 @@ async def run_bot(webrtc_connection: Any, *, new_session: bool = False) -> None:
         logger.info(f"Resuming session {session_id} ({len(resumed_turns)} turns)")
     else:
         session_id = store.create_session()
-    owner = object()
-    _session_owners[session_id] = owner
+    owner = live.claim(session_id)
 
     # Language state survives the reconnect too — pick up where the user
     # left off instead of snapping back to English.
@@ -550,6 +564,15 @@ async def run_bot(webrtc_connection: Any, *, new_session: bool = False) -> None:
     @transport.event_handler("on_app_message")
     async def on_app_message(transport: Any, message: Any, sender: str) -> None:
         if not isinstance(message, dict):
+            return
+
+        # Client's channel just opened — send the server-truth chat state so
+        # a reconnect or page reload renders the resumed transcript.
+        if message.get("type") == "client_ready":
+            state = session_state_message(
+                session_id, bool(resumed_turns), resumed_turns
+            )
+            await task.queue_frames([OutputTransportMessageUrgentFrame(message=state)])
             return
 
         # Speaker override from the client: true/false, or null for auto.
@@ -641,7 +664,7 @@ async def run_bot(webrtc_connection: Any, *, new_session: bool = False) -> None:
         # (preemption schedules finalize during cancellation, possibly after
         # the new pipeline already took ownership) — then it is no longer
         # ours to close.
-        if _session_owners.get(session_id) is not owner:
+        if not live.owns(session_id, owner):
             return
         finalized = True
         turns = await asyncio.to_thread(store.session_turns, session_id)
@@ -656,8 +679,7 @@ async def run_bot(webrtc_connection: Any, *, new_session: bool = False) -> None:
         for statement in facts:
             await asyncio.to_thread(store.upsert_fact, statement)
         await asyncio.to_thread(store.end_session, session_id, summary)
-        if _session_owners.get(session_id) is owner:
-            del _session_owners[session_id]
+        live.release(session_id, owner)
         logger.info(
             f"Session {session_id} closed "
             f"({len(turns)} turns, summary={bool(summary)}, facts={len(facts)})"

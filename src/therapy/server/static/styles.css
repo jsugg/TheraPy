@@ -68,6 +68,15 @@ main {
   cursor: pointer;
 }
 .session-row .meta { font-size: .8rem; opacity: .6; }
+#session-new { display: block; width: 100%; margin-bottom: .75rem; }
+#session-actions {
+  display: flex;
+  gap: .4rem;
+  align-items: center;
+  margin-bottom: .5rem;
+}
+#session-resume { background: var(--accent); color: #fff; }
+#session-delete { margin-left: auto; }
 .msg {
   max-width: 85%;
   padding: .55rem .8rem;

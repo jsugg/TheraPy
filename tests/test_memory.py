@@ -237,3 +237,29 @@ def test_parse_facts_filters_noise() -> None:
     raw = "- Has a dog named Bruno.\n\n* Works as a nurse.\nNONE\n" + "x" * 250
     assert parse_facts(raw) == ["Has a dog named Bruno.", "Works as a nurse."]
     assert parse_facts("NONE") == []
+
+
+def test_delete_session_removes_rows_and_audio_only_for_that_session(
+    tmp_path: Path,
+) -> None:
+    store = MemoryStore(tmp_path)
+    doomed = store.create_session()
+    doomed_turn = store.add_turn(
+        doomed, "user", "voice", "es", "Bórrame.", audio=b"\x00\x00" * 160
+    )
+    kept = store.create_session()
+    store.add_turn(kept, "user", "text", "en", "Keep me.")
+
+    doomed_audio = tmp_path / "audio" / doomed
+    assert doomed_audio.exists()
+    assert store.has_session(doomed)
+
+    assert store.delete_session(doomed) is True
+    assert not store.has_session(doomed)
+    assert store.session_turns(doomed) == []
+    assert not doomed_audio.exists()
+    assert doomed_turn not in [turn["id"] for turn in store.session_turns(kept)]
+    assert store.has_session(kept)
+    assert len(store.session_turns(kept)) == 1
+
+    assert store.delete_session("nope") is False
