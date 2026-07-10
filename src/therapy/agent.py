@@ -90,6 +90,8 @@ from therapy.memory.distill import distill_facts
 from therapy.perception.stt import (
     DEFAULT_LANGUAGE,
     clamp_language,
+    is_supported,
+    plausible_segment,
     whisper_model,
 )
 from therapy.speech.tts import voice_for
@@ -111,7 +113,9 @@ def vad_params() -> VADParams:
     return VADParams(
         confidence=float(os.environ.get("THERAPY_VAD_CONFIDENCE", "0.6")),
         start_secs=0.2,
-        stop_secs=float(os.environ.get("THERAPY_VAD_STOP_SECS", "1.0")),
+        # 1.2 s: thinking pauses mid-sentence kept splitting real speech at
+        # 1.0 s (field test); the cost is turn-end latency, tune per taste.
+        stop_secs=float(os.environ.get("THERAPY_VAD_STOP_SECS", "1.2")),
         min_volume=float(os.environ.get("THERAPY_VAD_MIN_VOLUME", "0.3")),
     )
 
@@ -162,10 +166,30 @@ class MultilingualWhisperSTTService(WhisperSTTService):
             return
         await self.start_processing_metrics()
         audio_float = np.frombuffer(audio, dtype=np.int16).astype(np.float32) / 32768.0
+        # condition_on_previous_text=False: carrying decoder context across
+        # utterances compounds hallucinations on degraded audio.
         segments, info = await asyncio.to_thread(
-            self._model.transcribe, audio_float, language=None
+            self._model.transcribe,
+            audio_float,
+            language=None,
+            condition_on_previous_text=False,
         )
         detected = info.language if info.language_probability > 0.5 else None
+        if detected and not is_supported(detected):
+            # Whisper wandered into a language TheraPy doesn't speak —
+            # on this input that is a hallucination signature, not a user
+            # switching to Korean. Re-decode anchored to the conversation.
+            logger.debug(
+                f"Unsupported detection {detected!r}; re-decoding as "
+                f"{self.current_language}"
+            )
+            segments, info = await asyncio.to_thread(
+                self._model.transcribe,
+                audio_float,
+                language=self.current_language,
+                condition_on_previous_text=False,
+            )
+            detected = self.current_language
         language = clamp_language(detected, self.current_language)
         self.current_language = language
 
@@ -173,7 +197,12 @@ class MultilingualWhisperSTTService(WhisperSTTService):
         text = " ".join(
             segment.text.strip()
             for segment in segments
-            if not isinstance(threshold, float) or segment.no_speech_prob < threshold
+            if plausible_segment(
+                segment.no_speech_prob,
+                segment.avg_logprob,
+                segment.compression_ratio,
+                threshold if isinstance(threshold, float) else 0.6,
+            )
         ).strip()
         await self.stop_processing_metrics()
 
