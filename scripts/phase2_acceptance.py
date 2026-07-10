@@ -1,0 +1,240 @@
+"""Phase-2 acceptance (SPEC §9): continuity across sessions + data round-trip.
+
+Scripted client against the live server, typed turns only (memory is
+modality-agnostic, and text keeps the run fast on CPU):
+
+1. Session A states a distinctive personal fact and disconnects.
+2. Waits until the server has summarized and closed session A
+   (GET /api/sessions — summarization runs in the background).
+3. Session B (a fresh connection) asks about the fact and asserts the
+   assistant's reply references it — continuity via distilled summaries +
+   user-model facts, never verbatim history (SPEC §8).
+4. Export round-trip: `python -m therapy.memory export` contains the fact.
+5. Delete round-trip: `... delete --yes` leaves no sessions behind
+   (verified via a fresh export AND /api/sessions).
+
+Run inside the container:
+
+    docker compose exec therapy uv run --no-dev python scripts/phase2_acceptance.py
+"""
+
+import asyncio
+import json
+import subprocess
+import sys
+import time
+from fractions import Fraction
+
+import httpx
+import numpy as np
+from aiortc import RTCPeerConnection, RTCSessionDescription
+from aiortc.mediastreams import MediaStreamTrack
+from av import AudioFrame
+
+SERVER = "http://localhost:8000"
+RATE = 48_000
+FRAME_SAMPLES = RATE // 50  # 20 ms
+FACT_TOKEN = "Nebulosa"  # distinctive enough to be unambiguous in replies
+SESSION_A_TURNS = [
+    f"Hola, te quería contar algo: acabo de adoptar una perrita y le puse {FACT_TOKEN}.",
+    f"Sí, {FACT_TOKEN} es una cachorra mestiza, la encontré cerca del trabajo.",
+]
+SESSION_B_QUESTION = "¿Te acuerdas del nombre de mi perrita? ¿Cómo se llama?"
+
+
+class SilentMic(MediaStreamTrack):
+    """Paced silence — the PWA always sends a mic track, so this client does too."""
+
+    kind = "audio"
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._pts = 0
+        self._t0: float | None = None
+
+    async def recv(self) -> AudioFrame:
+        if self._t0 is None:
+            self._t0 = time.monotonic()
+        delay = self._t0 + self._pts / RATE - time.monotonic()
+        if delay > 0:
+            await asyncio.sleep(delay)
+        frame = AudioFrame.from_ndarray(
+            np.zeros((1, FRAME_SAMPLES), dtype=np.int16), format="s16", layout="mono"
+        )
+        frame.sample_rate = RATE
+        frame.pts = self._pts
+        frame.time_base = Fraction(1, RATE)
+        self._pts += FRAME_SAMPLES
+        return frame
+
+
+class TypedClient:
+    """Minimal typed-turn client: silent mic, data channel for conversation."""
+
+    def __init__(self) -> None:
+        self.pc = RTCPeerConnection()
+        self.pc.addTrack(SilentMic())
+        self.channel = self.pc.createDataChannel("chat", ordered=True)
+        self.transcripts: list[dict] = []
+        self.event = asyncio.Event()
+        self.channel.on("message", self._on_message)
+
+    def _on_message(self, raw: str) -> None:
+        try:
+            message = json.loads(raw)
+        except json.JSONDecodeError:
+            return
+        if message.get("type") == "transcript":
+            self.transcripts.append(message)
+            self.event.set()
+
+    async def connect(self) -> None:
+        # recvonly audio keeps the server's pipeline shape identical to the PWA.
+        self.pc.addTransceiver("audio", direction="recvonly")
+        await self.pc.setLocalDescription(await self.pc.createOffer())
+        while self.pc.iceGatheringState != "complete":
+            await asyncio.sleep(0.05)
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                f"{SERVER}/api/offer",
+                json={
+                    "sdp": self.pc.localDescription.sdp,
+                    "type": self.pc.localDescription.type,
+                },
+                timeout=60,
+            )
+            response.raise_for_status()
+            answer = response.json()
+        await self.pc.setRemoteDescription(
+            RTCSessionDescription(sdp=answer["sdp"], type=answer["type"])
+        )
+        for _ in range(1200):
+            if self.channel.readyState == "open":
+                return
+            await asyncio.sleep(0.05)
+        sys.exit("FAIL: data channel never opened")
+
+    async def ask(self, text: str, timeout: float = 180.0) -> str:
+        """Send a typed turn; return the assistant's reply text."""
+        seen = len(self.transcripts)
+        self.channel.send(json.dumps({"type": "user_text", "text": text}))
+        deadline = time.monotonic() + timeout
+        while True:
+            for message in self.transcripts[seen:]:
+                if message.get("role") == "assistant":
+                    return str(message.get("text", ""))
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                sys.exit(f"FAIL: no assistant reply within {timeout}s")
+            self.event.clear()
+            try:
+                await asyncio.wait_for(self.event.wait(), remaining)
+            except asyncio.TimeoutError:
+                pass
+
+    async def close(self) -> None:
+        await self.pc.close()
+
+
+async def wait_for_summary(deadline_s: float = 240.0) -> dict:
+    """Wait until the NEWEST session is ended and summarized.
+
+    Older summarized sessions (e.g. dry runs) may exist — only the session
+    that just disconnected counts, and it is first in the newest-first list.
+    """
+    deadline = time.monotonic() + deadline_s
+    async with httpx.AsyncClient() as client:
+        while time.monotonic() < deadline:
+            response = await client.get(f"{SERVER}/api/sessions", timeout=30)
+            response.raise_for_status()
+            sessions = response.json()["sessions"]
+            if sessions and sessions[0]["ended_at"] and sessions[0]["summary"]:
+                return sessions[0]
+            await asyncio.sleep(3.0)
+    sys.exit(f"FAIL: newest session not summarized within {deadline_s}s")
+
+
+def run_cli(*args: str) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        [sys.executable, "-m", "therapy.memory", *args],
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+
+
+async def main() -> None:
+    results: list[str] = []
+
+    # 1. Session A: state the fact, get an acknowledgement, disconnect.
+    a = TypedClient()
+    await a.connect()
+    for turn in SESSION_A_TURNS:
+        reply = await a.ask(turn)
+        print(f"[A] user: {turn!r}\n    assistant: {reply[:100]!r}", flush=True)
+    await a.close()
+    results.append("[session A] fact stated, replies received ✓")
+
+    # 2. Background summarization must finish before B connects — continuity
+    #    is injected at connect time.
+    summarized = await wait_for_summary()
+    print(f"[summary] {str(summarized['summary'])[:160]!r}", flush=True)
+    ok = FACT_TOKEN.lower() in str(summarized["summary"]).lower()
+    results.append(
+        f"[summary] session A summarized; fact token "
+        f"{'present ✓' if ok else 'MISSING (relying on facts table)'}"
+    )
+
+    # 3. Session B: fresh connection, ask about the fact.
+    b = TypedClient()
+    await b.connect()
+    reply = await b.ask(SESSION_B_QUESTION)
+    print(f"[B] assistant: {reply!r}", flush=True)
+    await b.close()
+    if FACT_TOKEN.lower() not in reply.lower():
+        results.append(f"[continuity] FAIL — reply does not mention {FACT_TOKEN!r}")
+    else:
+        results.append(f"[continuity] assistant recalled {FACT_TOKEN!r} across sessions ✓")
+
+    # Session B's own background finalization must land before the delete
+    # round-trip, or a late end_session/fact write races the wipe.
+    await wait_for_summary()
+
+    # 4. Export round-trip: the fact must be in the JSON snapshot.
+    export = run_cli("export")
+    if export.returncode != 0:
+        results.append(f"[export] FAIL — exit {export.returncode}: {export.stderr[:200]}")
+    else:
+        snapshot = json.loads(export.stdout)
+        n_sessions = len(snapshot["sessions"])
+        found = FACT_TOKEN.lower() in export.stdout.lower()
+        results.append(
+            f"[export] {n_sessions} session(s); fact "
+            f"{'present ✓' if found else 'MISSING — FAIL'}"
+        )
+
+    # 5. Delete round-trip: refuse without --yes, wipe with it, verify empty.
+    refused = run_cli("delete")
+    guarded = refused.returncode == 2
+    deleted = run_cli("delete", "--yes")
+    post = json.loads(run_cli("export").stdout)
+    async with httpx.AsyncClient() as client:
+        api_sessions = (await client.get(f"{SERVER}/api/sessions", timeout=30)).json()[
+            "sessions"
+        ]
+    empty = deleted.returncode == 0 and not post["sessions"] and not api_sessions
+    results.append(
+        f"[delete] guard {'✓' if guarded else 'FAIL'} | "
+        f"wipe {'verified empty ✓' if empty else 'FAIL — data remains'}"
+    )
+
+    print("\n=== Phase-2 acceptance summary ===")
+    for line in results:
+        print(line)
+    if any("FAIL" in line for line in results):
+        sys.exit("\nFAIL — phase-2 acceptance not green.")
+    print("\nPASS — continuity, export, and delete all verified.")
+
+
+if __name__ == "__main__":
+    asyncio.run(main())

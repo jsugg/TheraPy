@@ -12,15 +12,20 @@ that compound into longitudinal self-insight.
 
 ## Status
 
-Phase 0 done (framework spike: Pipecat, see
+Phases 0–2 engineering complete (framework spike: Pipecat, see
 [`docs/framework-spike.md`](docs/framework-spike.md)). Phase 1 — the
-trilingual voice+text loop (es/en/pt) — is implemented and awaiting its
-acceptance run. One PWA serves both interfaces: a **web interface** in any
-desktop browser and an installable **mobile interface** on the phone. Speak
-or type in the same conversation, switch mid-turn, barge-in supported.
-Per-utterance language detection picks the reply voice; time-to-first-audio
-is instrumented. See [`docs/SPEC.md`](docs/SPEC.md) for the full
-specification and roadmap.
+trilingual voice+text loop (es/en/pt) — is implemented and dry-run green;
+only the human acceptance conversation remains. One PWA serves both
+interfaces: a **web interface** in any desktop browser and an installable
+**mobile interface** on the phone. Speak or type in the same conversation,
+switch mid-turn, barge-in supported. The reply language is user-selectable
+(Auto · ES · EN · PT): auto follows the word-level dominant language of your
+last phrase, a pin constrains replies only (SPEC §7). Phase 2 adds local
+memory: every session is stored in SQLite under the data dir (transcripts +
+raw utterance audio, never leaving the host), summarized at disconnect, and
+distilled into user-model facts — new conversations open knowing the prior
+context, and a 📖 history view in the PWA browses past transcripts. See
+[`docs/SPEC.md`](docs/SPEC.md) for the full specification and roadmap.
 
 ## Configuration
 
@@ -66,12 +71,27 @@ docker compose exec therapy uv run --no-dev python scripts/phase1_dryrun.py
 docker compose logs therapy | grep TTFA   # server-side numbers (risk R1)
 ```
 
-Latest dry-run result (2026-07-10, free-tier dev LLM): es/en/pt each
-detected and answered in-language on one connection; typed turn replied
-silently (server-side modality mirroring); barge-in stopped reply audio.
-TTFA 3.3–15.5 s server-side (8.3–22.6 s client-side incl. the 0.7 s VAD
-stop window) across two clean runs — dominated by dev-LLM latency, to be
-re-measured with the target provider during the acceptance run.
+Latest dry-run result (2026-07-10, fully-local gemma3:4b): all ten
+scenarios green — trilingual turns, typed-turn silence, barge-in, both
+SPEC §7 normative code-switched phrases, pin/unpin. Client-side TTFA
+7.9–50.5 s (first turn pays cold model loading; whisper, Kokoro, and the
+LLM share this CPU) — to be re-measured with the target provider during
+the acceptance run.
+
+Phase-2 acceptance (continuity + data round-trip; runs a scripted
+two-session conversation against the live server, then exercises
+export/delete — **the delete step wipes the data volume**):
+
+```sh
+docker compose exec therapy uv run --no-dev python scripts/phase2_acceptance.py
+```
+
+Personal data is local-first (SPEC §8) and yours to inspect or destroy:
+
+```sh
+docker compose exec therapy uv run --no-dev python -m therapy.memory export > therapy-data.json
+docker compose exec therapy uv run --no-dev python -m therapy.memory delete --yes
+```
 
 **Web interface (desktop):** open `http://localhost:8000` in any browser —
 localhost is a secure context, so the microphone works out of the box.
