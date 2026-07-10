@@ -1,7 +1,8 @@
 """FastAPI backend: WebRTC signaling + PWA static serving (SPEC §5)."""
 
 import asyncio
-from collections.abc import Awaitable, Callable
+import os
+from collections.abc import Awaitable, Callable, Coroutine
 from contextlib import asynccontextmanager
 from functools import lru_cache
 from pathlib import Path
@@ -68,23 +69,56 @@ def health() -> dict[str, str]:
     return {"status": "ok", "version": __version__}
 
 
+def launch_bot(
+    connection: object,
+    bot: Callable[[object], Coroutine[object, object, None]],
+) -> asyncio.Task[None]:
+    """Start a pipeline for a connection, preempting any existing one.
+
+    v1 is single-user (SPEC §2): a second live pipeline is never a second
+    user, only a reconnect — and every pipeline loads its own STT/TTS
+    models, so letting them stack is how the container runs out of memory.
+    The newest connection always wins.
+    """
+    for task in list(_bot_tasks):
+        task.cancel()
+    task = asyncio.create_task(bot(connection))
+    _bot_tasks.add(task)
+    task.add_done_callback(_bot_tasks.discard)
+    return task
+
+
 @app.post("/api/offer")
 async def offer(request: Request) -> dict[str, object]:
-    """SDP offer → answer; each new connection gets its own pipeline."""
+    """SDP offer → answer; the new connection preempts the previous pipeline."""
     from pipecat.transports.smallwebrtc.request_handler import SmallWebRTCRequest
     from therapy.agent import run_bot
 
     body = await request.json()
 
     async def on_connection(connection: object) -> None:
-        task = asyncio.create_task(run_bot(connection))
-        _bot_tasks.add(task)
-        task.add_done_callback(_bot_tasks.discard)
+        launch_bot(connection, run_bot)
 
     answer = await _handler().handle_web_request(
         SmallWebRTCRequest.from_dict(body), on_connection
     )
     return answer or {}
+
+
+@app.get("/api/ice-config")
+def ice_config() -> dict[str, object]:
+    """TURN credentials for the compose relay (SPEC §5 clients).
+
+    The client builds the URL itself from the page's hostname —
+    `turn:<host>:<port>` — so the same config works on localhost, LAN,
+    and the tailnet. Credentials are static (tailnet-only exposure; the
+    VPN identity is the auth boundary for the MVP, SPEC §8).
+    """
+    return {
+        "username": os.environ.get("THERAPY_TURN_USER", "therapy"),
+        "credential": os.environ.get("THERAPY_TURN_PASSWORD", "therapy-local"),
+        "port": int(os.environ.get("THERAPY_TURN_PORT", "3478")),
+    }
 
 
 @app.get("/api/sessions")

@@ -115,6 +115,25 @@ tailscale serve --bg 8000       # https://<machine>.<tailnet>.ts.net → :8000
 Then install Tailscale on the phone, sign into the same tailnet, and open
 the `https://…ts.net` URL — secure context, so the mic works.
 
+**Phone voice path (TURN):** the pipeline runs inside Docker and only
+advertises container-internal WebRTC candidates, which a phone can never
+reach — so the compose stack ships a `turn` relay (coturn) and the PWA
+allocates a relay at `turn:<page-host>:3478` automatically. Verify the
+relay path from any client machine (this simulates the phone by offering
+only relay candidates):
+
+```sh
+python scripts/netcheck.py --relay-only        # against http://localhost:8000
+python scripts/netcheck.py --server http://<host>:8000 --relay-only
+```
+
+**Reliability:** both services restart automatically (`unless-stopped`);
+the app container runs uvicorn under a watchdog that restarts it if the
+event loop hangs (health probe failures), and a compose healthcheck
+surfaces liveness in `docker compose ps`. A new WebRTC connection preempts
+the previous pipeline — v1 is single-user, and stacked pipelines are how
+the container used to run out of memory.
+
 Note for Intel Macs: `onnxruntime` (via `kokoro-onnx`) no longer publishes
 macOS x86_64 wheels, so `uv sync` fails there — use `docker compose up`
 instead (Linux wheels are available).

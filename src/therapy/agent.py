@@ -514,8 +514,14 @@ async def run_bot(webrtc_connection: Any) -> None:
         # transport's event task directly.
         await task.queue_frames(frames)
 
+    finalized = False
+
     async def finalize_session() -> None:
         """Summarize, distill, and close the session (SPEC §8) off the pipeline path."""
+        nonlocal finalized
+        if finalized:
+            return
+        finalized = True
         turns = await asyncio.to_thread(store.session_turns, session_id)
         summary: str | None = None
         facts: list[str] = []
@@ -539,4 +545,9 @@ async def run_bot(webrtc_connection: Any) -> None:
         await task.cancel()
 
     runner = PipelineRunner(handle_sigint=False)
-    await runner.run(task)
+    try:
+        await runner.run(task)
+    finally:
+        # A preempted pipeline (new connection cancelled this one) never sees
+        # on_client_disconnected — its session must still close and summarize.
+        asyncio.create_task(finalize_session())
