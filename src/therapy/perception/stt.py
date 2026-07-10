@@ -32,6 +32,18 @@ def is_supported(code: str | None) -> bool:
     return bool(code) and code.lower().split("-")[0] in SUPPORTED_LANGUAGES
 
 
+def genuine_foreign_speech(detected: str | None, text: str) -> bool:
+    """Plausible decode in an unsupported language = real speech, not noise.
+
+    Hallucinated decodes die in the plausibility filter (their text comes
+    back empty); what survives in an unsupported language is the user
+    actually speaking it. Present it verbatim with its real tag — anchoring
+    the re-decode to a supported language makes whisper silently translate
+    (field test: German shown as English, tagged en).
+    """
+    return bool(text) and bool(detected) and not is_supported(detected)
+
+
 def plausible_segment(
     no_speech_prob: float,
     avg_logprob: float,

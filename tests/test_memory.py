@@ -263,3 +263,51 @@ def test_delete_session_removes_rows_and_audio_only_for_that_session(
     assert len(store.session_turns(kept)) == 1
 
     assert store.delete_session("nope") is False
+
+
+def test_titles_set_ensure_and_legacy_migration(tmp_path: Path) -> None:
+    import sqlite3
+
+    # A database created before titles existed must gain the column.
+    legacy = tmp_path / "therapy.db"
+    with sqlite3.connect(legacy) as connection:
+        connection.executescript(
+            """
+            CREATE TABLE sessions (
+                id TEXT PRIMARY KEY,
+                started_at TEXT NOT NULL,
+                ended_at TEXT,
+                summary TEXT
+            );
+            INSERT INTO sessions (id, started_at) VALUES ('old', '2026-07-09T10:00:00+00:00');
+            """
+        )
+
+    store = MemoryStore(tmp_path)
+    assert store.sessions()[0]["title"] is None  # migrated, not crashed
+
+    # ensure_title fills only the blank; a rename (set_title) always wins.
+    store.ensure_title("old", "Generated title")
+    assert store.sessions()[0]["title"] == "Generated title"
+    store.ensure_title("old", "Second generation")
+    assert store.sessions()[0]["title"] == "Generated title"
+    assert store.set_title("old", "My own name") is True
+    assert store.sessions()[0]["title"] == "My own name"
+    assert store.set_title("nope", "x") is False
+
+
+def test_clean_title_and_dominant_turn_language() -> None:
+    from therapy.memory.summarizer import clean_title, dominant_turn_language
+
+    assert clean_title('"Ansiedad por el trabajo."\nExtra line') == "Ansiedad por el trabajo"
+    assert clean_title("   ") is None
+    assert clean_title("x" * 200) == "x" * 80
+
+    turns = [
+        {"role": "user", "language": "es", "text": "Hola"},
+        {"role": "assistant", "language": "en", "text": "Hi"},
+        {"role": "user", "language": "es", "text": "Sigo"},
+        {"role": "user", "language": "en", "text": "ok"},
+    ]
+    assert dominant_turn_language(turns) == "es"
+    assert dominant_turn_language([]) == "en"

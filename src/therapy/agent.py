@@ -89,9 +89,12 @@ from therapy.dialogue.policy import (
 )
 from therapy.memory import MemoryStore, make_summarizer
 from therapy.memory.distill import distill_facts
+from therapy.memory.store import resume_window_secs
+from therapy.memory.summarizer import entitle
 from therapy.perception.stt import (
     DEFAULT_LANGUAGE,
     clamp_language,
+    genuine_foreign_speech,
     is_supported,
     plausible_segment,
     whisper_model,
@@ -111,11 +114,6 @@ _whisper_model: Any = None
 # and, for one scheduled after it already resumed, make it a no-op
 # (live.py ownership tokens; only the current owner may close a session).
 _finalizers: dict[str, asyncio.Task[None]] = {}
-
-
-def resume_window_secs() -> float:
-    """How long after its last activity a session is still resumable."""
-    return float(os.environ.get("THERAPY_RESUME_WINDOW_SECS", "900"))
 
 
 def vad_params() -> VADParams:
@@ -144,6 +142,41 @@ def tts_settings_for(language: str) -> TTSUpdateSettingsFrame:
             language=LANGUAGE_ENUM[language],
         )
     )
+
+
+def _transcribe_utterance(
+    model: Any,
+    audio_float: Any,
+    language: str | None,
+    no_speech_threshold: float,
+) -> tuple[str, str | None, float]:
+    """Decode one utterance fully inside the calling (worker) thread.
+
+    faster-whisper's transcribe() is lazy — the heavy decode runs where the
+    segments generator is consumed. Consuming it on the event loop blocked
+    the loop for the length of the decode; on a long utterance that starved
+    WebRTC keepalives and dropped the connection mid-turn (field test
+    2026-07-10, confirmed by a watchdog health-probe failure at that
+    moment). Everything whisper-bound stays in this function.
+    """
+    segments, info = model.transcribe(
+        audio_float,
+        language=language,
+        # Carrying decoder context across utterances compounds
+        # hallucinations on degraded audio.
+        condition_on_previous_text=False,
+    )
+    text = " ".join(
+        segment.text.strip()
+        for segment in segments
+        if plausible_segment(
+            segment.no_speech_prob,
+            segment.avg_logprob,
+            segment.compression_ratio,
+            no_speech_threshold,
+        )
+    ).strip()
+    return text, info.language, info.language_probability
 
 
 class MultilingualWhisperSTTService(WhisperSTTService):
@@ -182,55 +215,55 @@ class MultilingualWhisperSTTService(WhisperSTTService):
             return
         await self.start_processing_metrics()
         audio_float = np.frombuffer(audio, dtype=np.int16).astype(np.float32) / 32768.0
-        # condition_on_previous_text=False: carrying decoder context across
-        # utterances compounds hallucinations on degraded audio.
-        segments, info = await asyncio.to_thread(
-            self._model.transcribe,
-            audio_float,
-            language=None,
-            condition_on_previous_text=False,
-        )
-        detected = info.language if info.language_probability > 0.5 else None
-        if detected and not is_supported(detected):
-            # Whisper wandered into a language TheraPy doesn't speak —
-            # on this input that is a hallucination signature, not a user
-            # switching to Korean. Re-decode anchored to the conversation.
-            logger.debug(
-                f"Unsupported detection {detected!r}; re-decoding as "
-                f"{self.current_language}"
-            )
-            segments, info = await asyncio.to_thread(
-                self._model.transcribe,
-                audio_float,
-                language=self.current_language,
-                condition_on_previous_text=False,
-            )
-            detected = self.current_language
-        language = clamp_language(detected, self.current_language)
-        self.current_language = language
-
         threshold = self._settings.no_speech_prob
-        text = " ".join(
-            segment.text.strip()
-            for segment in segments
-            if plausible_segment(
-                segment.no_speech_prob,
-                segment.avg_logprob,
-                segment.compression_ratio,
-                threshold if isinstance(threshold, float) else 0.6,
-            )
-        ).strip()
+        no_speech = threshold if isinstance(threshold, float) else 0.6
+
+        text, detected, probability = await asyncio.to_thread(
+            _transcribe_utterance, self._model, audio_float, None, no_speech
+        )
+        if probability <= 0.5:
+            detected = None
+        if genuine_foreign_speech(detected, text):
+            # The user really is speaking a language TheraPy doesn't (the
+            # decode survived the plausibility filter) — transcribe it
+            # honestly under its own tag. The conversation language and
+            # reply choice stay put (TurnRelay skips unsupported turns).
+            language = str(detected).lower().split("-")[0]
+        else:
+            if detected and not is_supported(detected):
+                # Unsupported detection whose decode died in the filter —
+                # a hallucination signature (repeated Korean stock phrases
+                # in field testing), not a user switching languages.
+                # Re-decode anchored to the conversation to recover it.
+                logger.debug(
+                    f"Unsupported detection {detected!r}; re-decoding as "
+                    f"{self.current_language}"
+                )
+                text, _, _ = await asyncio.to_thread(
+                    _transcribe_utterance,
+                    self._model,
+                    audio_float,
+                    self.current_language,
+                    no_speech,
+                )
+                detected = self.current_language
+            language = clamp_language(detected, self.current_language)
+            self.current_language = language
         await self.stop_processing_metrics()
 
         if text:
             logger.debug(f"Transcription [{language}]: {text}")
             if self._recorder:
                 await asyncio.to_thread(self._recorder, audio, text, language)
+            try:
+                frame_language = Language(language)
+            except ValueError:
+                frame_language = None
             yield TranscriptionFrame(
                 text=text,
                 user_id=self._user_id,
                 timestamp=time_now_iso8601(),
-                language=LANGUAGE_ENUM[language],
+                language=frame_language,
             )
 
 
@@ -278,11 +311,18 @@ class TurnRelay(FrameProcessor):
     async def process_frame(self, frame: Frame, direction: FrameDirection) -> None:
         await super().process_frame(frame, direction)
         if isinstance(frame, TranscriptionFrame) and direction == FrameDirection.DOWNSTREAM:
-            language = clamp_language(
-                frame.language.value if frame.language else None,
-                self._language or DEFAULT_LANGUAGE,
-            )
-            reply = self._reply_language.note_phrase(frame.text)
+            raw = frame.language.value if frame.language else None
+            base = raw.lower().split("-")[0] if raw else None
+            if base and not is_supported(base):
+                # Genuine speech in a language TheraPy doesn't speak: the
+                # transcript keeps its honest tag, but it must not steer
+                # the reply language — lingua only knows es/en/pt and
+                # would misread German words as one of them.
+                language = base
+                reply = self._reply_language.language
+            else:
+                language = clamp_language(base, self._language or DEFAULT_LANGUAGE)
+                reply = self._reply_language.note_phrase(frame.text)
             switched = await self._maybe_switch(reply)
             # Anchor EVERY turn, not just switches: small local models drift
             # back to English mid-conversation (field test 2026-07-10) while
@@ -489,7 +529,11 @@ async def run_bot(
             break
 
     modality = ReplyModality()
-    reply_language = ReplyLanguage(initial=initial_language)
+    # established: only a resumed session has real history behind `initial`
+    # — a fresh one must adopt the user's first phrase (greeting) outright.
+    reply_language = ReplyLanguage(
+        initial=initial_language, established=bool(resumed_turns)
+    )
 
     def record_user_voice(audio: bytes, text: str, language: str) -> None:
         store.add_turn(
@@ -670,14 +714,19 @@ async def run_bot(
         turns = await asyncio.to_thread(store.session_turns, session_id)
         summary: str | None = None
         facts: list[str] = []
+        title: str | None = None
         if turns:
             try:
                 summary = (await make_summarizer().summarize(turns)).strip() or None
                 facts = await distill_facts(turns)
+                title = await entitle(turns)
             except Exception as exc:  # LLM down ≠ lost session; keep the turns.
                 logger.warning(f"Session distillation failed for {session_id}: {exc}")
         for statement in facts:
             await asyncio.to_thread(store.upsert_fact, statement)
+        if title:
+            # Fill-only: a user's rename (or an earlier generation) wins.
+            await asyncio.to_thread(store.ensure_title, session_id, title)
         await asyncio.to_thread(store.end_session, session_id, summary)
         live.release(session_id, owner)
         logger.info(

@@ -46,6 +46,17 @@ function setStatus(text, state = "idle") {
   status.dataset.state = state;
 }
 
+// Resuming must not look like starting fresh — label the button by what
+// connecting will actually do (the server decides via the resume window).
+async function refreshConnectLabel() {
+  try {
+    const state = await (await fetch("/api/resumable")).json();
+    $("connect").textContent = state.session_id
+      ? "Resume conversation"
+      : "Start conversation";
+  } catch { /* server unreachable — leave the current label */ }
+}
+
 function addMessage(role, text, language) {
   const div = document.createElement("div");
   div.className = `msg ${role}`;
@@ -58,10 +69,6 @@ function addMessage(role, text, language) {
   div.appendChild(document.createTextNode(text));
   chat.appendChild(div);
   chat.scrollTop = chat.scrollHeight;
-}
-
-function firstLine(text) {
-  return (text || "").split("\n")[0];
 }
 
 function sessionDate(value) {
@@ -84,23 +91,22 @@ function renderSessionList(sessions) {
     row.type = "button";
     row.className = "session-row";
 
+    // Title first (auto-generated topic, or the date until one exists);
+    // the full summary lives in the detail view, not the list.
     const title = document.createElement("div");
-    title.textContent = sessionDate(session.started_at);
+    title.className = "title";
+    title.textContent = session.title || sessionDate(session.started_at);
     if (session.ended_at === null) {
       title.appendChild(document.createTextNode(" (active)"));
     }
 
     const meta = document.createElement("div");
     meta.className = "meta";
-    meta.textContent = `${session.turn_count || 0} turns`;
+    meta.textContent =
+      `${sessionDate(session.started_at)} · ${session.turn_count || 0} turns`;
 
     row.appendChild(title);
     row.appendChild(meta);
-    if (session.summary) {
-      const summary = document.createElement("div");
-      summary.textContent = firstLine(session.summary);
-      row.appendChild(summary);
-    }
 
     row.addEventListener("click", () => loadSession(session.id));
     sessionList.appendChild(row);
@@ -137,6 +143,9 @@ async function loadSession(sessionId) {
   if (!response.ok) throw new Error("Could not load session");
   const payload = await response.json();
   viewingSessionId = sessionId;
+  const session = payload.session || {};
+  $("session-title").textContent =
+    session.title || sessionDate(session.started_at);
   renderSessionTurns(payload.turns || []);
   $("session-list-view").hidden = true;
   sessionDetail.hidden = false;
@@ -224,6 +233,7 @@ async function connect(opts = {}) {
       setStatus("disconnected");
       $("connect").hidden = false;
       $("controls").hidden = true;
+      refreshConnectLabel(); // a drop usually makes the next connect a resume
     }
   };
 
@@ -301,6 +311,26 @@ $("session-resume").addEventListener("click", () => {
   setHistoryVisible(false);
   startConversation({ sessionId: viewingSessionId });
 });
+$("session-rename").addEventListener("click", async () => {
+  if (!viewingSessionId) return;
+  const current = $("session-title").textContent;
+  const title = window.prompt("Session title", current);
+  if (!title || !title.trim() || title.trim() === current) return;
+  const response = await fetch(
+    `/api/sessions/${encodeURIComponent(viewingSessionId)}`,
+    {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ title: title.trim() }),
+    },
+  );
+  if (!response.ok) {
+    setStatus("error: could not rename");
+    return;
+  }
+  $("session-title").textContent = (await response.json()).title;
+});
+
 $("session-delete").addEventListener("click", async () => {
   if (!viewingSessionId) return;
   if (!window.confirm("Delete this conversation and its audio for good?")) return;
@@ -335,3 +365,5 @@ $("speaker").addEventListener("click", () => {
 if ("serviceWorker" in navigator) {
   navigator.serviceWorker.register("/sw.js");
 }
+
+refreshConnectLabel();

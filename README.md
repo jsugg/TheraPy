@@ -51,7 +51,8 @@ session — same transcript, same context — instead of starting a new one.
 Set it to `0` to make every connection a fresh session. The chat view
 re-renders the resumed transcript on connect (server truth), and the 📖
 history browser can start a fresh conversation, continue any past
-session, or delete one (turns + archived audio) outright.
+session, rename it (titles are auto-generated from the topic at session
+end), or delete one (turns + archived audio) outright.
 
 The 2024 prototype lives at
 [`jsugg/TheraPy-legacy`](https://github.com/jsugg/TheraPy-legacy) (archived);

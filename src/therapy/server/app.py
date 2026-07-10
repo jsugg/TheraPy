@@ -14,6 +14,7 @@ from fastapi.staticfiles import StaticFiles
 
 from therapy import __version__
 from therapy.memory import MemoryStore
+from therapy.memory.store import resume_window_secs
 from therapy.server import live
 
 STATIC_DIR = Path(__file__).parent / "static"
@@ -135,6 +136,17 @@ def ice_config() -> dict[str, object]:
     }
 
 
+@app.get("/api/resumable")
+def resumable() -> dict[str, object]:
+    """Whether connecting now would resume a session (SPEC §8).
+
+    The client labels its connect button accordingly — "Resume" must not
+    look like "Start", or a user expecting a fresh conversation lands in
+    an old one unawares.
+    """
+    return {"session_id": _store().resume_candidate(resume_window_secs())}
+
+
 @app.get("/api/sessions")
 def sessions() -> dict[str, list[dict[str, object]]]:
     """Return session summaries with turn counts for the review UI."""
@@ -158,6 +170,18 @@ def session_detail(session_id: str) -> dict[str, object]:
     if session is None:
         raise HTTPException(status_code=404, detail="Session not found")
     return {"session": session, "turns": store.session_turns(session_id)}
+
+
+@app.patch("/api/sessions/{session_id}")
+async def rename_session(session_id: str, request: Request) -> dict[str, str]:
+    """Rename a session (user edit of the auto-generated title)."""
+    body = await request.json()
+    title = str(body.get("title", "")).strip()[:80]
+    if not title:
+        raise HTTPException(status_code=400, detail="Title must not be empty")
+    if not _store().set_title(session_id, title):
+        raise HTTPException(status_code=404, detail="Session not found")
+    return {"id": session_id, "title": title}
 
 
 @app.delete("/api/sessions/{session_id}")

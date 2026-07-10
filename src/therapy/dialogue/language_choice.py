@@ -66,9 +66,16 @@ def dominant_language(text: str, current: str) -> str:
 class ReplyLanguage:
     """Server-authoritative reply-language state: auto tracking + user pin."""
 
-    def __init__(self, initial: str = DEFAULT_LANGUAGE) -> None:
+    def __init__(self, initial: str = DEFAULT_LANGUAGE, established: bool = False) -> None:
+        """Args:
+        initial: Reply language before the user has said anything.
+        established: Whether `initial` reflects actual conversation history
+            (a resumed session) rather than a cold default — an established
+            language only yields to the full switch-hysteresis rule.
+        """
         self._auto = initial
         self._pin: str | None = None
+        self._established = established
 
     @property
     def language(self) -> str:
@@ -97,8 +104,15 @@ class ReplyLanguage:
 
         The auto choice updates even while pinned, so unpinning resumes
         from the user's actual current language, not a stale one.
+
+        Switch hysteresis only applies once a language is established: a
+        conversation-opening "¡Hola! ¿Cómo estás?" is three words — the
+        cold-start default must yield to the first detectable phrase, or
+        the greeting gets answered in English (field test 2026-07-10).
         """
         counts = word_language_counts(text)
-        if sum(counts.values()) >= self.MIN_WORDS_TO_SWITCH:
+        total = sum(counts.values())
+        if total and (not self._established or total >= self.MIN_WORDS_TO_SWITCH):
             self._auto = dominant_language(text, self._auto)
+            self._established = True
         return self.language

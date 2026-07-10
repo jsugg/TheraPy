@@ -46,8 +46,11 @@ def test_crisis_resources_env_override(monkeypatch) -> None:
     assert "Línea 135" in build_system_prompt()
 
 
-def test_language_switch_note_names_the_language() -> None:
-    assert "Portuguese" in language_switch_note("pt")
+def test_language_switch_note_is_written_in_the_target_language() -> None:
+    # The note is instruction AND language prime: an English note in the
+    # context is itself English evidence pulling a small model to English.
+    assert "português" in language_switch_note("pt")
+    assert "español" in language_switch_note("es")
     assert "English" in language_switch_note("en")
     # Unknown codes degrade to the code itself rather than raising.
     assert "fr" in language_switch_note("fr")
@@ -55,15 +58,16 @@ def test_language_switch_note_names_the_language() -> None:
 
 def test_language_pin_note_overrides_follow_the_user() -> None:
     note = language_pin_note("pt")
-    assert "Portuguese" in note
-    assert "regardless" in note
+    assert "português" in note
+    assert "não importa" in note  # overrides follow-the-user, in Portuguese
+    assert "regardless" in language_pin_note("en")
 
 
-def test_reply_language_reminder_is_short_and_names_language() -> None:
+def test_reply_language_reminder_is_short_and_in_target_language() -> None:
     from therapy.dialogue.policy import reply_language_reminder
 
     note = reply_language_reminder("es")
-    assert "Spanish" in note
+    assert "español" in note
     assert len(note) < 100  # per-turn cost must stay negligible
 
 

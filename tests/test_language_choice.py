@@ -62,10 +62,22 @@ def test_pin_rejects_unsupported_codes() -> None:
         choice.set_pin("fr")
 
 
-def test_short_fragments_never_flip_the_language() -> None:
+def test_short_fragments_never_flip_an_established_language() -> None:
     # A quoted foreign phrase or a VAD-clipped shard is not a switch.
-    choice = ReplyLanguage(initial="en")
+    # established=True: mid-conversation state (or a resumed session).
+    choice = ReplyLanguage(initial="en", established=True)
     assert choice.note_phrase("muriendo de sueño") == "en"
     assert choice.note_phrase("Te sueño.") == "en"
     # A full sentence still switches.
     assert choice.note_phrase("Mejor sigamos hablando en español ahora.") == "es"
+
+
+def test_first_phrase_adopts_the_greeting_language() -> None:
+    # Cold start: "¡Hola! ¿Cómo estás?" is only three words — the hysteresis
+    # must not glue the session to the English default (field test: Spanish
+    # greeting answered in English).
+    choice = ReplyLanguage(initial="en")
+    assert choice.note_phrase("¡Hola! ¿Cómo estás?") == "es"
+    # From then on the hysteresis applies as usual.
+    assert choice.note_phrase("Te sueño.") == "es"
+    assert choice.note_phrase("Actually, let me switch to English now.") == "en"

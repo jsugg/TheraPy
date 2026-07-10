@@ -109,3 +109,30 @@ def test_delete_session_refuses_while_pipeline_is_live(tmp_path: Path) -> None:
     finally:
         live.release(session_id, token)
     assert store.has_session(session_id)
+
+
+def test_resumable_reflects_the_newest_session_freshness(tmp_path: Path) -> None:
+    with TestClient(app) as client:
+        assert client.get("/api/resumable").json() == {"session_id": None}
+
+    store = MemoryStore(tmp_path)
+    session_id = store.create_session()
+    store.add_turn(session_id, "user", "text", "es", "Hola.")
+    store.end_session(session_id, "Greeted.")
+
+    with TestClient(app) as client:
+        assert client.get("/api/resumable").json() == {"session_id": session_id}
+
+
+def test_rename_session_endpoint(tmp_path: Path) -> None:
+    store = MemoryStore(tmp_path)
+    session_id = store.create_session()
+
+    with TestClient(app) as client:
+        ok = client.patch(f"/api/sessions/{session_id}", json={"title": "  Sueño y traba jo  "})
+        assert ok.status_code == 200
+        assert ok.json()["title"] == "Sueño y traba jo"
+        assert client.patch(f"/api/sessions/{session_id}", json={"title": "  "}).status_code == 400
+        assert client.patch("/api/sessions/nope", json={"title": "x"}).status_code == 404
+
+    assert store.sessions()[0]["title"] == "Sueño y traba jo"

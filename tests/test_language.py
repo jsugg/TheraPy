@@ -30,3 +30,16 @@ def test_voice_map_covers_all_languages(monkeypatch) -> None:
         assert voice_for(lang)
     monkeypatch.setenv("THERAPY_VOICE_ES", "em_alex")
     assert voice_for("es") == "em_alex"
+
+
+def test_genuine_foreign_speech_vs_hallucination() -> None:
+    from therapy.perception.stt import genuine_foreign_speech
+
+    # Plausible German decode: the user really speaks German — transcribe
+    # honestly, never silently re-decode (whisper would translate it).
+    assert genuine_foreign_speech("de", "Hallo, wie geht's dir?")
+    # Unsupported detection whose decode died in the filter: hallucination.
+    assert not genuine_foreign_speech("ko", "")
+    # Supported languages take the normal path.
+    assert not genuine_foreign_speech("es", "Hola, ¿cómo estás?")
+    assert not genuine_foreign_speech(None, "whatever")

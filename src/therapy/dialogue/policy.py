@@ -134,7 +134,39 @@ def rehydrate_messages(turns: list[dict], limit: int = 40) -> list[dict]:
     ]
 
 
-_LANGUAGE_NAMES = {"en": "English", "es": "Spanish", "pt": "Portuguese"}
+# The anchors are written IN the target language: for a small model every
+# English system note in the context is itself English evidence pulling
+# generation back toward English (field test: replies tagged es came out
+# in English despite the anchor). In the target language the note is both
+# the instruction and a language prime.
+_SWITCH_NOTES = {
+    "en": "The user is now speaking English. Reply entirely in English until they switch again.",
+    "es": "El usuario ahora está hablando en español. Responde íntegramente en español hasta que cambie de idioma.",
+    "pt": "O usuário agora está falando em português. Responda inteiramente em português até que ele mude de idioma.",
+}
+
+_REMINDERS = {
+    "en": "Reply to the user's next message entirely in English.",
+    "es": "Responde al próximo mensaje del usuario completamente en español.",
+    "pt": "Responda à próxima mensagem do usuário inteiramente em português.",
+}
+
+_PIN_NOTES = {
+    "en": (
+        "The user asked you to reply only in English from now on, regardless of "
+        "which language they speak or type. Reply entirely in English until told otherwise."
+    ),
+    "es": (
+        "El usuario pidió que respondas solo en español de ahora en adelante, sin "
+        "importar en qué idioma hable o escriba. Responde íntegramente en español "
+        "hasta nuevo aviso."
+    ),
+    "pt": (
+        "O usuário pediu que você responda apenas em português de agora em diante, "
+        "não importa em que idioma ele fale ou escreva. Responda inteiramente em "
+        "português até novo aviso."
+    ),
+}
 
 
 def language_switch_note(language: str) -> str:
@@ -145,8 +177,10 @@ def language_switch_note(language: str) -> str:
     dominant language after the user switches; an explicit note at the
     switch point fixes adherence at negligible context cost.
     """
-    name = _LANGUAGE_NAMES.get(language, language)
-    return f"The user is now speaking {name}. Reply entirely in {name} until they switch again."
+    return _SWITCH_NOTES.get(language) or (
+        f"The user is now speaking {language}. "
+        f"Reply entirely in {language} until they switch again."
+    )
 
 
 def reply_language_reminder(language: str) -> str:
@@ -157,8 +191,9 @@ def reply_language_reminder(language: str) -> str:
     goes wrong. A short reminder adjacent to each user turn keeps the
     generation anchored; large models simply ignore the redundancy.
     """
-    name = _LANGUAGE_NAMES.get(language, language)
-    return f"Reply to the user's next message entirely in {name}."
+    return _REMINDERS.get(language) or (
+        f"Reply to the user's next message entirely in {language}."
+    )
 
 
 def language_pin_note(language: str) -> str:
@@ -167,8 +202,8 @@ def language_pin_note(language: str) -> str:
     The pin constrains replies only — the user may keep speaking any
     language, so the note must override the standing follow-the-user rule.
     """
-    name = _LANGUAGE_NAMES.get(language, language)
-    return (
-        f"The user asked you to reply only in {name} from now on, regardless of "
-        f"which language they speak or type. Reply entirely in {name} until told otherwise."
+    return _PIN_NOTES.get(language) or (
+        f"The user asked you to reply only in {language} from now on, regardless "
+        f"of which language they speak or type. Reply entirely in {language} "
+        f"until told otherwise."
     )
