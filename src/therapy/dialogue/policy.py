@@ -76,6 +76,35 @@ def build_system_prompt() -> str:
     return _SYSTEM_PROMPT_TEMPLATE.format(crisis_resources=crisis_resources())
 
 
+def continuity_note(summaries: list[dict], facts: list[dict]) -> str | None:
+    """Prior-session context for a new conversation (SPEC §8).
+
+    Older history reaches the LLM only as distilled summaries plus the
+    structured user model — never verbatim transcripts. Returns None when
+    there is no history yet, so first sessions carry no empty scaffolding.
+    """
+    if not summaries and not facts:
+        return None
+    parts = ["# What you remember"]
+    if facts:
+        parts.append(
+            "About the user (accumulated across conversations):\n"
+            + "\n".join(f"- {fact['statement']}" for fact in facts)
+        )
+    if summaries:
+        rendered = "\n".join(
+            f"- [{summary['started_at'][:10]}] {summary['summary']}"
+            for summary in summaries
+        )
+        parts.append("Previous conversations, oldest first:\n" + rendered)
+    parts.append(
+        "Use this memory naturally — refer back to what the user told you "
+        "when it is relevant, without reciting it. If the user contradicts "
+        "something you remember, believe the user."
+    )
+    return "\n\n".join(parts)
+
+
 _LANGUAGE_NAMES = {"en": "English", "es": "Spanish", "pt": "Portuguese"}
 
 

@@ -10,6 +10,11 @@
 const $ = (id) => document.getElementById(id);
 const chat = $("chat");
 const status = $("status");
+const historyButton = $("history");
+const historyView = $("history-view");
+const sessionList = $("session-list");
+const sessionDetail = $("session-detail");
+const sessionTurns = $("session-turns");
 const botAudio = $("bot-audio");
 
 let pc = null;
@@ -52,6 +57,94 @@ function addMessage(role, text, language) {
   div.appendChild(document.createTextNode(text));
   chat.appendChild(div);
   chat.scrollTop = chat.scrollHeight;
+}
+
+function firstLine(text) {
+  return (text || "").split("\n")[0];
+}
+
+function sessionDate(value) {
+  if (!value) return "Unknown date";
+  return new Date(value).toLocaleString();
+}
+
+function renderSessionList(sessions) {
+  sessionList.replaceChildren();
+  if (!sessions.length) {
+    const empty = document.createElement("div");
+    empty.className = "session-row";
+    empty.textContent = "No sessions yet.";
+    sessionList.appendChild(empty);
+    return;
+  }
+
+  for (const session of sessions) {
+    const row = document.createElement("button");
+    row.type = "button";
+    row.className = "session-row";
+
+    const title = document.createElement("div");
+    title.textContent = sessionDate(session.started_at);
+    if (session.ended_at === null) {
+      title.appendChild(document.createTextNode(" (active)"));
+    }
+
+    const meta = document.createElement("div");
+    meta.className = "meta";
+    meta.textContent = `${session.turn_count || 0} turns`;
+
+    row.appendChild(title);
+    row.appendChild(meta);
+    if (session.summary) {
+      const summary = document.createElement("div");
+      summary.textContent = firstLine(session.summary);
+      row.appendChild(summary);
+    }
+
+    row.addEventListener("click", () => loadSession(session.id));
+    sessionList.appendChild(row);
+  }
+}
+
+function renderSessionTurns(turns) {
+  sessionTurns.replaceChildren();
+  for (const turn of turns) {
+    const div = document.createElement("div");
+    div.className = `msg ${turn.role}`;
+
+    const tag = document.createElement("span");
+    tag.className = "lang";
+    tag.textContent = [turn.language, turn.modality].filter(Boolean).join(" · ");
+    div.appendChild(tag);
+    div.appendChild(document.createTextNode(turn.text));
+    sessionTurns.appendChild(div);
+  }
+}
+
+async function loadSessions() {
+  sessionDetail.hidden = true;
+  sessionList.hidden = false;
+  sessionList.textContent = "Loading sessions…";
+  const response = await fetch("/api/sessions");
+  if (!response.ok) throw new Error("Could not load sessions");
+  const payload = await response.json();
+  renderSessionList(payload.sessions || []);
+}
+
+async function loadSession(sessionId) {
+  const response = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}`);
+  if (!response.ok) throw new Error("Could not load session");
+  const payload = await response.json();
+  renderSessionTurns(payload.turns || []);
+  sessionList.hidden = true;
+  sessionDetail.hidden = false;
+}
+
+function setHistoryVisible(open) {
+  historyView.hidden = !open;
+  chat.hidden = open;
+  historyButton.setAttribute("aria-pressed", String(open));
+  if (open) loadSessions().catch((err) => setStatus(`error: ${err.message}`));
 }
 
 function applySpeaker(defaultOn) {
@@ -136,6 +229,11 @@ $("connect").addEventListener("click", () =>
 );
 $("send").addEventListener("click", sendText);
 $("text").addEventListener("keydown", (e) => { if (e.key === "Enter") sendText(); });
+$("history").addEventListener("click", () => setHistoryVisible(historyView.hidden));
+$("history-back").addEventListener("click", () => {
+  sessionDetail.hidden = true;
+  sessionList.hidden = false;
+});
 
 $("mic").addEventListener("click", () => {
   if (!micTrack) return;

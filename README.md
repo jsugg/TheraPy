@@ -54,9 +54,11 @@ docker compose up  # containerized
 ```
 
 Phase-1 instrumented dry run (no microphone needed — a scripted WebRTC
-client speaks synthesized es/en/pt utterances at the live server, checks
-language detection, typed-turn silence, and barge-in, and reports
-client-side time-to-first-audio):
+client speaks synthesized es/en/pt utterances at the live server and checks
+language detection, reply-language choice per SPEC §7 (both normative
+code-switched phrases spoken, plus pin/unpin over the data channel),
+typed-turn silence, and barge-in, reporting client-side time-to-first-audio;
+exits non-zero if any scenario fails):
 
 ```sh
 docker compose up -d
