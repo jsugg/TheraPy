@@ -98,6 +98,18 @@ export/delete — **the delete step wipes the data volume**):
 docker compose exec therapy uv run --no-dev python scripts/phase2_acceptance.py
 ```
 
+PWA browser end-to-end (Playwright + headless Chromium — the only tests that
+load the real app in a browser): audits installability (active service
+worker, well-formed manifest, PNG icons that decode at their true sizes) and
+drives connect → typed turn → transcript render → Start/Resume label with a
+fake mic. Opt-in (slow) and runs against an isolated server, so it never
+touches the data volume:
+
+```sh
+docker compose exec therapy uv run playwright install chromium   # one-time
+docker compose exec therapy uv run pytest -m e2e
+```
+
 Personal data is local-first (SPEC §8) and yours to inspect or destroy:
 
 ```sh
@@ -113,6 +125,13 @@ localhost is a secure context, so the microphone works out of the box.
 Note: browsers require a secure context for microphone access on non-localhost
 origins; enable Tailscale HTTPS (`tailscale serve`) or add the origin to the
 browser's insecure-origin allowlist for the tailnet hostname.
+
+Install it in **Chrome** — the browser E2E confirms the app meets Chrome's
+installability criteria. Two gotchas: DuckDuckGo has no PWA-install support at
+all, and after you *uninstall* a PWA, Chrome suppresses the automatic install
+banner for that origin for a while — the app is still installable via the ⋮
+menu → **Install app** (or the omnibox install icon), just not re-prompted
+automatically.
 
 One-time Tailscale setup on the host (interactive — needs the owner):
 
