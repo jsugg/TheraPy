@@ -76,7 +76,11 @@ from pipecat.transports.base_transport import TransportParams
 from pipecat.transports.smallwebrtc.transport import SmallWebRTCTransport
 from pipecat.utils.time import time_now_iso8601
 
-from therapy.dialogue.language_choice import ReplyLanguage, dominant_language
+from therapy.dialogue.language_choice import (
+    ReplyLanguage,
+    dominant_language,
+    reply_language_override_effect,
+)
 from therapy.dialogue.modality import TEXT, VOICE, ReplyModality
 from therapy.dialogue.policy import (
     build_system_prompt,
@@ -635,29 +639,24 @@ async def run_bot(
             except ValueError:
                 logger.warning(f"Ignoring unsupported reply_language: {code!r}")
                 return
-            if reply != turn_relay.language:
-                note = language_pin_note(reply) if code else language_switch_note(reply)
-                turn_relay.note_language(reply)
-                await task.queue_frames(
-                    [
-                        tts_settings_for(reply),
-                        LLMMessagesAppendFrame(
-                            messages=[{"role": "system", "content": note}]
-                        ),
-                    ]
+            # Auto asserts nothing on replay; only a pin anchors (the effect
+            # helper carries the reasoning). Otherwise the fresh-connect auto
+            # default (en) primes the model to English before the user speaks.
+            voice_language, note = reply_language_override_effect(
+                code if isinstance(code, str) else None, reply, turn_relay.language
+            )
+            frames: list[Frame] = []
+            if voice_language:
+                turn_relay.note_language(voice_language)
+                frames.append(tts_settings_for(voice_language))
+            if note:
+                frames.append(
+                    LLMMessagesAppendFrame(
+                        messages=[{"role": "system", "content": note}]
+                    )
                 )
-            elif code:
-                # Same language, but now a pin — the LLM must hold it even
-                # if the user switches.
-                await task.queue_frames(
-                    [
-                        LLMMessagesAppendFrame(
-                            messages=[
-                                {"role": "system", "content": language_pin_note(reply)}
-                            ]
-                        )
-                    ]
-                )
+            if frames:
+                await task.queue_frames(frames)
             return
 
         # Typed turn from the data channel — same conversation, text modality.

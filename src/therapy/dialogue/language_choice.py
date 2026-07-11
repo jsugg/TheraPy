@@ -17,6 +17,7 @@ and lives here as server-authoritative state.
 
 from lingua import Language, LanguageDetectorBuilder
 
+from therapy.dialogue.policy import language_pin_note
 from therapy.perception.stt import DEFAULT_LANGUAGE, SUPPORTED_LANGUAGES
 
 _LINGUA_TO_CODE = {
@@ -116,3 +117,25 @@ class ReplyLanguage:
             self._auto = dominant_language(text, self._auto)
             self._established = True
         return self.language
+
+
+def reply_language_override_effect(
+    code: str | None, reply: str, relay_language: str | None
+) -> tuple[str | None, str | None]:
+    """Effect of a client `reply_language` override (SPEC §7) on the pipeline.
+
+    The PWA replays its selector on every connect and on every change. This
+    returns `(tts_language, note)`: re-voice the TTS to `tts_language` when it
+    is not None, and append `note` to the LLM context when it is not None.
+
+    Auto mode (`code` falsy) follows the user and must assert **nothing**. On
+    a fresh connect the relay language is still unset while auto defaults to
+    English, so asserting the auto choice injected an English "the user is now
+    speaking English" anchor ahead of the first turn — a small model then
+    answered a Spanish greeting in English (field test 2026-07-11). Only an
+    explicit pin anchors the reply language; auto is handled per turn as the
+    user actually speaks.
+    """
+    if not code:
+        return None, None
+    return (reply if reply != relay_language else None), language_pin_note(reply)

@@ -2,7 +2,11 @@
 
 import pytest
 
-from therapy.dialogue.language_choice import ReplyLanguage, dominant_language
+from therapy.dialogue.language_choice import (
+    ReplyLanguage,
+    dominant_language,
+    reply_language_override_effect,
+)
 
 
 # --- dominant_language: word-level majority ---------------------------------
@@ -81,3 +85,30 @@ def test_first_phrase_adopts_the_greeting_language() -> None:
     # From then on the hysteresis applies as usual.
     assert choice.note_phrase("Te sueño.") == "es"
     assert choice.note_phrase("Actually, let me switch to English now.") == "en"
+
+
+# --- reply_language_override_effect: connect/change replay ------------------
+
+
+def test_auto_override_asserts_no_language() -> None:
+    # The bug: a fresh connect replays "auto" while the relay language is
+    # still unset and auto defaults to English, so the old code injected an
+    # English "user is now speaking English" anchor ahead of a Spanish first
+    # turn — gemma then answered the greeting in English (field test
+    # 2026-07-11). Auto must produce no voice change and no anchor.
+    assert reply_language_override_effect(None, "en", None) == (None, None)
+    assert reply_language_override_effect(None, "es", "es") == (None, None)
+
+
+def test_pin_override_switches_voice_and_anchors_when_language_changes() -> None:
+    voice, note = reply_language_override_effect("pt", "pt", None)
+    assert voice == "pt"
+    assert note is not None and "português" in note.lower()
+
+
+def test_pin_override_anchors_without_revoicing_when_language_matches() -> None:
+    # Pinning the language already in use must still assert the pin (so the
+    # model holds it if the user switches) but need not re-voice the TTS.
+    voice, note = reply_language_override_effect("es", "es", "es")
+    assert voice is None
+    assert note is not None and "español" in note.lower()
