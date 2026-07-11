@@ -79,6 +79,7 @@ from pipecat.utils.time import time_now_iso8601
 from therapy.dialogue.language_choice import (
     ReplyLanguage,
     dominant_language,
+    label_language,
     reply_language_override_effect,
 )
 from therapy.dialogue.modality import TEXT, VOICE, ReplyModality
@@ -227,6 +228,13 @@ class MultilingualWhisperSTTService(WhisperSTTService):
         )
         if probability <= 0.5:
             detected = None
+        # Whisper's coarse language ID hears out-of-scope speech (e.g. German)
+        # as es/en/pt inconsistently. A text detector names it correctly for
+        # the tag; supported detections are left to Whisper. An out-of-scope
+        # tag then keeps the reply in the conversation's language (below).
+        label = label_language(text, fallback="")
+        if label and not is_supported(label):
+            detected = label
         if genuine_foreign_speech(detected, text):
             # The user really is speaking a language TheraPy doesn't (the
             # decode survived the plausibility filter) — transcribe it
@@ -528,7 +536,9 @@ async def run_bot(
     # left off instead of snapping back to English.
     initial_language = DEFAULT_LANGUAGE
     for turn in reversed(resumed_turns):
-        if turn["role"] == "user":
+        # Skip out-of-scope turns (e.g. a German aside tagged "de"): the reply
+        # language resumes from the last turn actually in a supported language.
+        if turn["role"] == "user" and is_supported(str(turn["language"])):
             initial_language = clamp_language(str(turn["language"]), DEFAULT_LANGUAGE)
             break
 
@@ -665,11 +675,26 @@ async def run_bot(
         text = str(message.get("text", "")).strip()
         if not text:
             return
-        # No audio to detect from: lingua's word-level majority both tags the
-        # turn and (unless pinned) picks the reply language.
+        # No audio to detect from: lingua's word-level majority picks the reply
+        # language (es/en/pt); label_language names the turn honestly for the
+        # shown/stored tag (German stays "de", not forced onto Portuguese).
         language = dominant_language(text, current=stt.current_language)
+        label = label_language(text, fallback=language)
         reply = reply_language.note_phrase(text)
-        frames: list[Frame] = []
+        # Echo the typed turn as a transcript so it renders with its label the
+        # same way live as on replay — the client no longer draws it locally
+        # (which left typed turns unlabeled).
+        frames: list[Frame] = [
+            OutputTransportMessageUrgentFrame(
+                message={
+                    "type": "transcript",
+                    "role": "user",
+                    "modality": "text",
+                    "language": label,
+                    "text": text,
+                }
+            )
+        ]
         if reply != turn_relay.language:
             frames.append(tts_settings_for(reply))
             note = language_switch_note(reply)
@@ -683,7 +708,7 @@ async def run_bot(
         )
         stt.current_language = language
         turn_relay.note_language(reply)
-        await asyncio.to_thread(store.add_turn, session_id, "user", TEXT, language, text)
+        await asyncio.to_thread(store.add_turn, session_id, "user", TEXT, label, text)
         # Typed turn → silent reply unless the user overrode the speaker.
         speak = modality.note_turn(TEXT)
         frames.append(LLMConfigureOutputFrame(skip_tts=not speak))

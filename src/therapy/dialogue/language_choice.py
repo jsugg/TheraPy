@@ -139,3 +139,49 @@ def reply_language_override_effect(
     if not code:
         return None, None
     return (reply if reply != relay_language else None), language_pin_note(reply)
+
+
+# Reply language is es/en/pt (above). The DISPLAY tag, though, should name a
+# turn's language honestly even when it is out of scope — German shown as "de",
+# not forced onto Portuguese (field test 2026-07-11). This broader detector
+# backs only the shown/stored tag; it never changes which language a reply is
+# written in (an out-of-scope tag keeps the reply in the conversation's
+# language). Kept to languages a user of this app might plausibly speak.
+_LABEL_TO_CODE = {
+    Language.ENGLISH: "en",
+    Language.SPANISH: "es",
+    Language.PORTUGUESE: "pt",
+    Language.GERMAN: "de",
+    Language.FRENCH: "fr",
+    Language.ITALIAN: "it",
+}
+
+_label_detector = None
+
+
+def _label_detector_instance():
+    global _label_detector
+    if _label_detector is None:
+        _label_detector = LanguageDetectorBuilder.from_languages(*_LABEL_TO_CODE).build()
+    return _label_detector
+
+
+def label_language(text: str, fallback: str, min_confidence: float = 0.70) -> str:
+    """Honest display/storage tag for a user turn's text (may be out of scope).
+
+    Whisper's per-utterance language ID and the es/en/pt reply detector both
+    mislabel out-of-scope speech (German heard as `pt`, or unlabeled). A
+    broader detector over the transcript names it correctly for the tag only.
+    Short or low-confidence text keeps `fallback`, so labels don't flap on a
+    stray word; the reply language is never affected.
+    """
+    stripped = text.strip() if text else ""
+    if not stripped:
+        return fallback
+    confidences = _label_detector_instance().compute_language_confidence_values(stripped)
+    if confidences:
+        best = confidences[0]
+        code = _LABEL_TO_CODE.get(best.language)
+        if code and best.value >= min_confidence:
+            return code
+    return fallback

@@ -291,7 +291,8 @@ function sendText() {
   const text = input.value.trim();
   if (!text || !channel || channel.readyState !== "open") return;
   channel.send(JSON.stringify({ type: "user_text", text }));
-  addMessage("user", text);
+  // The server echoes the turn back as a transcript (with its language label),
+  // which renders it — so a typed turn looks the same live as on replay.
   input.value = "";
   applySpeaker(false); // typed turn → mirror to silent replies unless overridden
 }
