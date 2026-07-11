@@ -299,6 +299,17 @@ async def main() -> None:
         sys.exit("Data channel never opened")
     print("Connected. Running trilingual spoken turns…", flush=True)
 
+    # Mirror the PWA, which replays its reply-language selector on connect
+    # (sendReplyLanguage). Auto (null) must NOT anchor a language before the
+    # user has spoken — asserting it injected an English "user is now speaking
+    # English" note that answered a Spanish first turn in English (field test
+    # 2026-07-11). Sending it here is the end-to-end regression for that fix:
+    # the es turn below comes back English without it. The script diverged
+    # from the real client by skipping this, which is how the bug reached the
+    # field despite a green dry run.
+    channel.send(json.dumps({"type": "reply_language", "language": None}))
+    await asyncio.sleep(0.5)
+
     # 1. One spoken turn per language, same connection (language switching).
     for label, voice, lang, text in UTTERANCES:
         await spoken_turn(
