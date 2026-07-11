@@ -23,6 +23,7 @@ let micTrack = null;
 let speakerOverride = null; // null = auto (mirror modality), true/false = user override
 let viewingSessionId = null; // session open in the history detail view
 let historyLoaded = false; // initial transcript rendered for the current connection
+let pushToTalk = false; // push-to-talk: mic gated until the Hold button is held
 
 // Reply language (SPEC §7): "" = auto, or a pinned es/en/pt. Persists across
 // visits and is re-sent on every connect — the server holds the live state.
@@ -136,6 +137,14 @@ function renderSessionTurns(turns) {
     tag.textContent = [turn.language, turn.modality].filter(Boolean).join(" · ");
     div.appendChild(tag);
     div.appendChild(document.createTextNode(turn.text));
+    // Own voice turns are replayable from the archive (SPEC §8): companion.js
+    // renders the control, the server streams the WAV by turn id.
+    if (turn.has_audio && window.Companion) {
+      Companion.addPlayButton(
+        div,
+        `/api/sessions/${encodeURIComponent(viewingSessionId)}/turns/${turn.id}/audio`,
+      );
+    }
     sessionTurns.appendChild(div);
   }
 }
@@ -213,6 +222,10 @@ async function connect(opts = {}) {
     audio: { echoCancellation: true, noiseSuppression: true },
   });
   micTrack = media.getAudioTracks()[0];
+  // Honor the persisted mic mode for this fresh track — push mode starts muted
+  // until the user holds Talk (companion.js reflects the mode on #mic-mode).
+  pushToTalk = $("mic-mode")?.getAttribute("aria-pressed") === "true";
+  applyMicMode();
 
   pc = new RTCPeerConnection({ iceServers: await iceServers() });
   pc.addTrack(micTrack, media);
@@ -377,6 +390,22 @@ $("speaker").addEventListener("click", () => {
   applySpeaker(speakerOverride);
   sendSpeakerOverride();
 });
+
+// Push-to-talk wiring. companion.js renders the Hold button + mode toggle and
+// fires these callbacks; the mic track lives here, so the gating does too.
+function micToggleOn() {
+  return $("mic").getAttribute("aria-pressed") !== "false";
+}
+function applyMicMode() {
+  if (!micTrack) return;
+  // Open mode leaves the mic under the 🎙️ toggle; push mode mutes it until Hold.
+  micTrack.enabled = pushToTalk ? false : micToggleOn();
+}
+if (window.Companion) {
+  Companion.onMicMode = (mode) => { pushToTalk = mode === "push"; applyMicMode(); };
+  Companion.onHoldStart = () => { if (micTrack && pushToTalk) micTrack.enabled = true; };
+  Companion.onHoldEnd = () => { if (micTrack && pushToTalk) micTrack.enabled = false; };
+}
 
 if ("serviceWorker" in navigator) {
   navigator.serviceWorker.register("/sw.js");

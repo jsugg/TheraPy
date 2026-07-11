@@ -9,6 +9,8 @@ Run: `docker compose exec therapy uv run pytest -m e2e`
 (a one-time `uv run playwright install chromium` populates the cache volume).
 """
 
+import re
+
 import pytest
 from playwright.sync_api import Page, expect
 
@@ -100,6 +102,24 @@ def test_2_connect_typed_turn_transcript_and_resume_label(
     # cold model load and gemma runs on CPU.
     expect(page.locator("#chat .msg.assistant").last).to_be_visible(timeout=120_000)
 
+    # Companion presence layer is live and driven off the machine status: the
+    # pill left "offline" once connected, and the assistant bubble is decorated
+    # with the avatar's name (companion.js observing #status and #chat).
+    expect(page.locator("#presence")).to_have_attribute(
+        "data-presence", re.compile(r"listening|speaking|thinking")
+    )
+    expect(page.locator("#chat .msg.assistant .assistant-name").last).to_have_text(
+        "Rowan"
+    )
+
+    # Push-to-talk is an opt-in mic mode: toggling it reveals the Hold button
+    # (the mic-track gating itself is unit-covered; here we prove the UI wiring).
+    expect(page.locator("#talk")).to_be_hidden()
+    page.locator("#mic-mode").click()
+    expect(page.locator("#talk")).to_be_visible()
+    page.locator("#mic-mode").click()
+    expect(page.locator("#talk")).to_be_hidden()
+
     # A session with real turns now exists, so reconnecting would resume it:
     # the landing button must say so (the empty-probe guard, Hardening 9).
     page.goto(f"{e2e_server}/")
@@ -111,3 +131,34 @@ def test_2_connect_typed_turn_transcript_and_resume_label(
     expect(page.locator("#chat .msg.user").first).to_contain_text(
         "Hello from the browser test.", timeout=60_000
     )
+
+
+def test_3_companion_avatar_renders_and_swaps(page: Page, e2e_server: str) -> None:
+    # No WebRTC needed — the companion presence is header chrome, always on.
+    page.goto(f"{e2e_server}/")
+
+    # The default portrait actually decodes (a 404/mislabel would show 0).
+    loaded = page.evaluate(
+        """() => {
+            const img = document.getElementById('avatar');
+            return { w: img.naturalWidth, src: img.currentSrc || img.src };
+        }"""
+    )
+    assert loaded["w"] > 0, "avatar portrait did not decode"
+    assert "/avatars/rowan/" in loaded["src"], loaded["src"]
+
+    # The picker lists both shipped skins; choosing one swaps the portrait and
+    # persists the choice (localStorage, same pattern as the reply-language pin).
+    page.locator("#avatar-pick").click()
+    expect(page.locator("#avatar-picker")).to_be_visible()
+    expect(page.locator("#avatar-picker .avatar-option")).to_have_count(2)
+
+    page.locator('#avatar-picker .avatar-option[data-avatar-id="luna"]').click()
+    page.wait_for_function(
+        """() => {
+            const img = document.getElementById('avatar');
+            return (img.currentSrc || img.src).includes('/avatars/luna/');
+        }""",
+        timeout=10_000,
+    )
+    assert page.evaluate("() => localStorage.getItem('avatar')") == "luna"

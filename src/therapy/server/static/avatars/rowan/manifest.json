@@ -1,0 +1,7 @@
+{
+  "id": "rowan",
+  "name": "Rowan",
+  "tagline": "Your wise companion",
+  "light": { "accent": "#1b4332", "accentSoft": "#d8e8dd" },
+  "dark":  { "accent": "#74c69d", "accentSoft": "#24352b" }
+}

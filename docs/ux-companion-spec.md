@@ -1,8 +1,9 @@
 # UX spec — companion presence & swappable avatars
 
-**Status:** draft v1 (2026-07-10), from the owner's concept exploration (four
-concept boards: eight input-mode layouts + avatar art, working name "Rowan").
-Scoped as the next UI iteration after phases 1–2; no pipeline changes required.
+**Status:** phases A + B **implemented** (2026-07-11); C remains (see §4). From
+the owner's concept exploration (four concept boards: eight input-mode layouts +
+avatar art, working name "Rowan"). Scoped as the next UI iteration after phases
+1–2; no pipeline changes were required (agent.py/dialogue policy untouched).
 
 ## 1. Direction
 
@@ -61,11 +62,18 @@ history view can offer playback of one's own turns without new capture work.
 
 ## 4. Phasing
 
-- **A (small):** avatar packs + picker; presence pill + portrait in header
-  (Minimal Toggle restyle); palette from manifest. Pure static/client work.
-- **B:** push-to-talk option; voice-bubble playback in the transcript
-  browser (serve archived WAVs via an authenticated-by-tailnet endpoint).
-- **C:** fullscreen focus mode; server-pushed presence states; avatar
+- **A — done (2026-07-11):** avatar packs (`avatars/{rowan,luna}/`, webp +
+  manifest) + picker; presence pill + portrait in the header (Minimal Toggle
+  restyle); per-scheme palette from the manifest; presence states derived
+  client-side (`companion.js` observes `#status`, `#chat` and the bot audio —
+  offline·connecting·listening·thinking·speaking). Pure static/client;
+  `app.js` is only wired, never restructured (all ids/behaviour preserved).
+- **B — done (2026-07-11):** push-to-talk mic mode (Hold-to-talk gates the mic
+  track; open-mic default) and voice-bubble playback in the transcript browser
+  — `GET /api/sessions/{id}/turns/{turn}/audio` streams the archived WAV,
+  resolved by ids so no client path touches the filesystem; `/api/sessions/{id}`
+  now flags `has_audio` per turn instead of leaking the host path.
+- **C — future:** fullscreen focus mode; server-pushed presence states; avatar
   reactions to register shifts (ser integration era, phase 3+).
 
 Accessibility throughout: status changes announced via the existing

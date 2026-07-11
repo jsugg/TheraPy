@@ -1,0 +1,7 @@
+{
+  "id": "luna",
+  "name": "Luna",
+  "tagline": "Your wise companion",
+  "light": { "accent": "#2f5d62", "accentSoft": "#d6e6e4" },
+  "dark":  { "accent": "#7fc6c0", "accentSoft": "#20302f" }
+}
