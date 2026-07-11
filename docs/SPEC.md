@@ -240,6 +240,7 @@ A second knowledge store, deliberately separate from the user model: the user mo
 
 **Settled (2026-07-11):**
 - Test layers: fast `pytest` (unit + API via TestClient) is the default gate; the headless `aiortc` phase scripts cover the server pipeline; a Playwright + headless-Chromium suite (`-m e2e`, opt-in) covers the real browser surface (installability, connect/transcript/resume) the others structurally cannot. Browser E2E runs against an isolated server instance so it never mutates real data — a lesson from field-test verification runs contaminating the owner's store (Hardening 7–9).
+- Reply audio is the speaker toggle's job, not the input modality's: a typed turn getting an audio reply is fine (owner). Modality still mirrors by default (typed → silent, "no wasted synthesis"), but the dry run gates only on the typed turn's **text** reply arriving, not on silence.
 
 - Reply language is user-selectable (Auto · ES · EN · PT) with **Auto = dominant language of the last phrase**, word-level majority via **lingua-py** (new dependency, phase-1-gated in pyproject); ties/low confidence keep the current language; a pin constrains replies only (STT stays auto); selection persists client-side (§7).
 
