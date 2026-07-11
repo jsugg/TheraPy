@@ -15,7 +15,10 @@ that compound into longitudinal self-insight.
 Phases 0–2 engineering complete (framework spike: Pipecat, see
 [`docs/framework-spike.md`](docs/framework-spike.md)). Phase 1 — the
 trilingual voice+text loop (es/en/pt) — is implemented and dry-run green;
-only the human acceptance conversation remains. One PWA serves both
+phone field tests surfaced two defects (a resumed transcript not rendering
+over a slow mobile data channel, and a Spanish turn answered in English),
+both fixed and regression-tested (SPEC §9 Hardening 7–8). The clean human
+acceptance conversation is the remaining gate. One PWA serves both
 interfaces: a **web interface** in any desktop browser and an installable
 **mobile interface** on the phone. Speak or type in the same conversation,
 switch mid-turn, barge-in supported. The reply language is user-selectable
