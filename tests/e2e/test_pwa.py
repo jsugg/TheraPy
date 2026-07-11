@@ -29,6 +29,16 @@ def test_1_pwa_is_installable(page: Page, e2e_server: str) -> None:
     page.wait_for_function(
         "navigator.serviceWorker.ready.then(r => !!r.active)", timeout=20_000
     )
+    # The worker must actually CONTROL the page (skipWaiting + clients.claim);
+    # a worker that never takes over is a known way to lose the install option.
+    page.wait_for_function("!!navigator.serviceWorker.controller", timeout=10_000)
+
+    # Chrome's own verdict — the check the earlier structural test skipped, so
+    # it wrongly reported the app installable. Empty means Chrome would offer
+    # install (the headless build just never fires the banner event).
+    cdp = page.context.new_cdp_session(page)
+    errors = cdp.send("Page.getInstallabilityErrors")["installabilityErrors"]
+    assert errors == [], f"Chrome reports installability blockers: {errors}"
 
     manifest = page.evaluate(
         """async () => {
@@ -94,3 +104,10 @@ def test_2_connect_typed_turn_transcript_and_resume_label(
     # the landing button must say so (the empty-probe guard, Hardening 9).
     page.goto(f"{e2e_server}/")
     expect(page.locator("#connect")).to_have_text("Resume conversation", timeout=15_000)
+
+    # Resuming renders the prior transcript synchronously from the offer answer
+    # (the raceless path that replaced the async fetch — review 2026-07-11).
+    page.locator("#connect").click()
+    expect(page.locator("#chat .msg.user").first).to_contain_text(
+        "Hello from the browser test.", timeout=60_000
+    )
