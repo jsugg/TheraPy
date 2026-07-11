@@ -22,6 +22,7 @@ let channel = null;
 let micTrack = null;
 let speakerOverride = null; // null = auto (mirror modality), true/false = user override
 let viewingSessionId = null; // session open in the history detail view
+let historyLoaded = false; // initial transcript rendered for the current connection
 
 // Reply language (SPEC §7): "" = auto, or a pinned es/en/pt. Persists across
 // visits and is re-sent on every connect — the server holds the live state.
@@ -69,6 +70,31 @@ function addMessage(role, text, language) {
   div.appendChild(document.createTextNode(text));
   chat.appendChild(div);
   chat.scrollTop = chat.scrollHeight;
+}
+
+// Render the resumed transcript once per connection. Whichever path resolves
+// first wins — the HTTP fetch below, or the data-channel `session` replay as a
+// fallback — so a live transcript that already arrived is never wiped.
+function renderHistoryOnce(turns, resumed) {
+  if (historyLoaded) return;
+  historyLoaded = true;
+  for (const turn of turns) addMessage(turn.role, turn.text, turn.language);
+  if (resumed) setStatus("resumed", "listening");
+}
+
+// The reliable initial-transcript path: fetch over HTTP rather than depend on
+// the data-channel `session` push, which pipecat drops when the channel is
+// slow to open on mobile over the TURN relay (field test 2026-07-10).
+async function loadConnectHistory(sessionId, resumed) {
+  if (historyLoaded || !sessionId) return;
+  try {
+    const res = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}`);
+    if (!res.ok) return; // leave the data-channel replay as the fallback
+    const turns = ((await res.json()).turns || [])
+      .filter((t) => t.text)
+      .slice(-40); // match the data-channel replay's cap (protocol.py)
+    renderHistoryOnce(turns, resumed);
+  } catch { /* offline — the data-channel replay may still arrive */ }
 }
 
 function sessionDate(value) {
@@ -191,6 +217,8 @@ async function iceServers() {
 
 async function connect(opts = {}) {
   setStatus("connecting…");
+  historyLoaded = false;
+  chat.replaceChildren(); // history reloads below (HTTP) or via the replay
   if (pc) {
     try { pc.close(); } catch { /* already dead */ }
     pc = null;
@@ -207,8 +235,8 @@ async function connect(opts = {}) {
   channel = pc.createDataChannel("chat", { ordered: true });
   channel.onopen = () => {
     sendReplyLanguage(); // replay the persisted pin (SPEC §7)
-    // Ask for server-truth chat state — the reply re-renders the resumed
-    // transcript, so a drop or page reload doesn't show an empty pane.
+    // Fallback server-truth chat state, in case the HTTP load in connect()
+    // didn't render (the primary path). renderHistoryOnce dedupes the two.
     channel.send(JSON.stringify({ type: "client_ready" }));
   };
   channel.onmessage = (event) => {
@@ -218,11 +246,8 @@ async function connect(opts = {}) {
       addMessage(msg.role, msg.text, msg.language);
     }
     if (msg.type === "session") {
-      chat.replaceChildren();
-      for (const turn of msg.turns || []) {
-        addMessage(turn.role, turn.text, turn.language);
-      }
-      if (msg.resumed) setStatus("resumed", "listening");
+      // Fallback: the HTTP load in connect() is the primary path.
+      renderHistoryOnce(msg.turns || [], msg.resumed);
     }
   };
 
@@ -264,11 +289,14 @@ async function connect(opts = {}) {
       type: pc.localDescription.type,
     }),
   });
-  await pc.setRemoteDescription(await response.json());
+  const answer = await response.json();
+  await pc.setRemoteDescription(answer);
 
   $("connect").hidden = true;
   $("controls").hidden = false;
   applySpeaker(true);
+  // Reliable initial render, independent of the data channel's timing.
+  loadConnectHistory(answer.session_id, answer.resumed);
 }
 
 function sendText() {

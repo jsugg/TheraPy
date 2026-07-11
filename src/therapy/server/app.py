@@ -90,6 +90,30 @@ def launch_bot(
     return task
 
 
+def _resolve_session(
+    store: MemoryStore, *, new_session: bool, explicit: str | None
+) -> tuple[str | None, bool]:
+    """Resolve which stored session a new connection will land in.
+
+    Mirrors run_bot's resume logic so the offer response can tell the client
+    up front which session it is joining. The client then loads that
+    transcript over HTTP instead of waiting for the data-channel `session`
+    replay — pipecat clears its outbound queue and disables it if the data
+    channel is slow to open (10 s), which is exactly what happens on the
+    phone over the TURN relay, so the replay was silently dropped and the
+    resumed transcript never rendered (field test 2026-07-10).
+
+    Returns the resolved session id (None for a fresh session) and whether
+    connecting resumes it.
+    """
+    if explicit:
+        return (explicit, True) if store.has_session(explicit) else (None, False)
+    if new_session:
+        return None, False
+    resumed = store.resume_candidate(resume_window_secs())
+    return resumed, resumed is not None
+
+
 @app.post("/api/offer")
 async def offer(request: Request) -> dict[str, object]:
     """SDP offer → answer; the new connection preempts the previous pipeline.
@@ -98,26 +122,34 @@ async def offer(request: Request) -> dict[str, object]:
     fresh session — test scripts need isolated sessions; real clients
     resume an interrupted one (SPEC §8). `?session=<id>` continues that
     specific session (the history browser's explicit choice).
+
+    The answer carries `session_id`/`resumed` so the client can load the
+    transcript over HTTP; the resolved id is also what run_bot joins, so the
+    two never disagree.
     """
     from pipecat.transports.smallwebrtc.request_handler import SmallWebRTCRequest
     from therapy.agent import run_bot
 
     body = await request.json()
     new_session = request.query_params.get("new_session") == "1"
-    resume_session_id = request.query_params.get("session")
+    resolved, resumed = _resolve_session(
+        _store(),
+        new_session=new_session,
+        explicit=request.query_params.get("session"),
+    )
 
     async def on_connection(connection: object) -> None:
         launch_bot(
             connection,
             lambda conn: run_bot(
-                conn, new_session=new_session, resume_session_id=resume_session_id
+                conn, new_session=new_session, resume_session_id=resolved
             ),
         )
 
     answer = await _handler().handle_web_request(
         SmallWebRTCRequest.from_dict(body), on_connection
     )
-    return answer or {}
+    return {**(answer or {}), "session_id": resolved, "resumed": resumed}
 
 
 @app.get("/api/ice-config")
