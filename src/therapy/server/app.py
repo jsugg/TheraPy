@@ -2,7 +2,7 @@
 
 import asyncio
 import os
-from collections.abc import Awaitable, Callable, Coroutine
+from collections.abc import Awaitable, Callable, Coroutine, Sequence
 from contextlib import asynccontextmanager
 from functools import lru_cache
 from pathlib import Path
@@ -14,7 +14,7 @@ from fastapi.staticfiles import StaticFiles
 
 from therapy import __version__
 from therapy.memory import MemoryStore
-from therapy.memory.store import resume_window_secs
+from therapy.memory.store import RowDict, resume_window_secs
 from therapy.server import live
 from therapy.server.protocol import session_state_message
 
@@ -207,6 +207,22 @@ def sessions() -> dict[str, list[dict[str, object]]]:
     return {"sessions": session_rows}
 
 
+def _client_turns(turns: Sequence[RowDict]) -> list[dict[str, object]]:
+    """Shape stored turns for the review UI.
+
+    Exposes whether a turn has archived audio (so the client can offer a
+    playback control) without leaking the host filesystem path the store
+    keeps internally.
+    """
+    fields = ("id", "session_id", "ts", "role", "modality", "language", "text")
+    shaped: list[dict[str, object]] = []
+    for turn in turns:
+        row: dict[str, object] = {key: turn[key] for key in fields}
+        row["has_audio"] = bool(turn.get("audio_path"))
+        shaped.append(row)
+    return shaped
+
+
 @app.get("/api/sessions/{session_id}")
 def session_detail(session_id: str) -> dict[str, object]:
     """Return one session and its ordered transcript turns."""
@@ -217,7 +233,22 @@ def session_detail(session_id: str) -> dict[str, object]:
     )
     if session is None:
         raise HTTPException(status_code=404, detail="Session not found")
-    return {"session": session, "turns": store.session_turns(session_id)}
+    return {"session": session, "turns": _client_turns(store.session_turns(session_id))}
+
+
+@app.get("/api/sessions/{session_id}/turns/{turn_id}/audio")
+def turn_audio(session_id: str, turn_id: int) -> FileResponse:
+    """Serve a turn's archived voice WAV for in-transcript playback (SPEC §8).
+
+    The client asks by session + turn id; the store resolves the path from
+    its own record, so no client-supplied path reaches the filesystem. Raw
+    utterance audio stays on the host, within the tailnet the whole app is
+    already scoped to.
+    """
+    path = _store().turn_audio_path(session_id, turn_id)
+    if path is None:
+        raise HTTPException(status_code=404, detail="No audio for this turn")
+    return FileResponse(path, media_type="audio/wav")
 
 
 @app.patch("/api/sessions/{session_id}")
