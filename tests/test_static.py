@@ -53,14 +53,16 @@ def test_manifest_declares_installable_png_icons() -> None:
         assert _png_size(path) == want, f"{icon['src']} is not {sizes}"
 
 
-def test_client_loads_resumed_transcript_over_http() -> None:
-    # The resumed transcript must render from an HTTP fetch on connect, not
-    # only the data-channel `session` replay — pipecat drops that replay when
-    # the channel is slow to open on mobile over the TURN relay, leaving the
-    # pane empty (field test 2026-07-10).
+def test_client_renders_resumed_transcript_from_offer_answer() -> None:
+    # The resumed transcript rides on the /api/offer answer and is rendered
+    # synchronously on connect. It must not depend on the data-channel replay
+    # (pipecat drops it when the channel is slow to open on mobile), nor on an
+    # async fetch (that raced reconnects and live turns — review 2026-07-11).
     app_js = (STATIC_DIR / "app.js").read_text(encoding="utf-8")
 
-    assert "loadConnectHistory" in app_js
-    assert re.search(r"fetch\(`/api/sessions/\$\{[^}]+\}`\)", app_js), (
-        "connect must fetch the resumed session transcript over HTTP"
+    assert "renderHistoryOnce(answer.turns" in app_js, (
+        "connect must render the resumed transcript from the offer answer"
+    )
+    assert "loadConnectHistory" not in app_js, (
+        "the racy async history fetch must be gone"
     )
