@@ -175,6 +175,9 @@ async function loadSession(sessionId) {
 function setHistoryVisible(open) {
   historyView.hidden = !open;
   chat.hidden = open;
+  // The history view has its own "New conversation" action, so hide the footer
+  // composer/CTA while browsing — no duplicate "start" button on screen.
+  $("composer").hidden = open;
   historyButton.setAttribute("aria-pressed", String(open));
   if (open) loadSessions().catch((err) => setStatus(`error: ${err.message}`));
 }

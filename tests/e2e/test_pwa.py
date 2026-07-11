@@ -162,3 +162,21 @@ def test_3_companion_avatar_renders_and_swaps(page: Page, e2e_server: str) -> No
         timeout=10_000,
     )
     assert page.evaluate("() => localStorage.getItem('avatar')") == "luna"
+
+
+def test_4_history_view_hides_the_start_cta(page: Page, e2e_server: str) -> None:
+    # Landing shows the composer CTA; opening history must not leave a second
+    # "start" button alongside its own "New conversation" (field report
+    # 2026-07-11 — two buttons doing the same thing).
+    page.goto(f"{e2e_server}/")
+    expect(page.locator("#connect")).to_be_visible()
+
+    page.locator("#history").click()
+    expect(page.locator("#session-new")).to_be_visible()
+    expect(page.locator("#composer")).to_be_hidden()
+    expect(page.locator("#connect")).to_be_hidden()
+
+    # Closing history restores the single landing CTA.
+    page.locator("#history").click()
+    expect(page.locator("#composer")).to_be_visible()
+    expect(page.locator("#connect")).to_be_visible()

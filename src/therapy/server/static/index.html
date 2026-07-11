@@ -29,15 +29,6 @@
       </div>
 
       <div id="header-controls">
-        <label class="lang-chip" aria-label="Reply language">
-          <span aria-hidden="true">🌐</span>
-          <select id="lang" title="Reply language">
-            <option value="">Auto</option>
-            <option value="es">ES</option>
-            <option value="en">EN</option>
-            <option value="pt">PT</option>
-          </select>
-        </label>
         <button id="avatar-pick" class="icon-button" type="button"
                 aria-label="Choose companion" aria-haspopup="menu"
                 aria-expanded="false" title="Choose companion">🐾</button>
@@ -78,7 +69,7 @@
       <main id="chat" aria-live="polite" aria-label="Conversation"></main>
     </div>
 
-    <footer class="composer" aria-label="Message composer">
+    <footer id="composer" class="composer" aria-label="Message composer">
       <button id="connect" class="primary" type="button">Start conversation</button>
       <div id="controls" hidden>
         <div class="composer-row">
@@ -92,10 +83,21 @@
                   aria-label="Voice replies" aria-pressed="true" title="Voice replies">🔊</button>
         </div>
         <div class="voice-row">
-          <button id="talk" class="hold-button" type="button"
-                  aria-label="Hold to talk" aria-pressed="false" hidden>Hold to talk</button>
-          <button id="mic-mode" class="mode-button" type="button"
-                  aria-label="Switch microphone mode" aria-pressed="false">Open mic</button>
+          <label class="lang-chip" aria-label="Reply language">
+            <span aria-hidden="true">🌐</span>
+            <select id="lang" title="Reply language">
+              <option value="">Auto</option>
+              <option value="es">ES</option>
+              <option value="en">EN</option>
+              <option value="pt">PT</option>
+            </select>
+          </label>
+          <span class="voice-row-actions">
+            <button id="talk" class="hold-button" type="button"
+                    aria-label="Hold to talk" aria-pressed="false" hidden>Hold to talk</button>
+            <button id="mic-mode" class="mode-button" type="button"
+                    aria-label="Switch microphone mode" aria-pressed="false">Open mic</button>
+          </span>
         </div>
       </div>
     </footer>

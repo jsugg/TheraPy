@@ -385,7 +385,13 @@ body {
   display: flex;
   gap: 0.5rem;
   align-items: center;
-  justify-content: flex-end;
+  justify-content: space-between;
+}
+
+.voice-row-actions {
+  display: flex;
+  gap: 0.5rem;
+  align-items: center;
 }
 
 button {
