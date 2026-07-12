@@ -37,8 +37,12 @@ New companion ids: #avatar, #presence, #presence-label, #presence-dot,
     avatarId: DEFAULT_MANIFEST.id,
     avatarSm: avatarUrl(DEFAULT_MANIFEST.id, "portrait-sm.webp"),
     presence: "offline",
+    serverDriven: false, // the pipeline has pushed authoritative presence
+    serverPresence: null, // last state it pushed (re-applied after a local mute)
+    micOff: false, // local mic mute — client-owned, wins over server presence
     micMode: "open",
     holding: false,
+    focusReturn: null, // element to restore focus to when focus mode closes
     schemeQuery: null,
     playbackAudio: null,
     activePlayButton: null,
@@ -47,6 +51,7 @@ New companion ids: #avatar, #presence, #presence-label, #presence-dot,
   const api = {
     init,
     setPresence,
+    setServerPresence,
     avatarSmUrl: () => state.avatarSm,
     decorateAssistant,
     addPlayButton,
@@ -89,6 +94,7 @@ New companion ids: #avatar, #presence, #presence-label, #presence-dot,
     setupStatusObserver();
     setupMessageObservers();
     setupAudioPresence();
+    setupFocusMode();
 
     state.initPromise = (async () => {
       const index = await loadAvatarIndex();
@@ -203,6 +209,7 @@ New companion ids: #avatar, #presence, #presence-label, #presence-dot,
     };
     delete img.dataset.smallFallback;
     img.src = large;
+    updateFocusPortrait();
   }
 
   function updateCompanionText() {
@@ -215,8 +222,48 @@ New companion ids: #avatar, #presence, #presence-label, #presence-dot,
     }
   }
 
+  // Presence has two drivers. The client *infers* it from #status, the mic
+  // toggle and the bot-audio element (the observers below) via setPresence.
+  // Once the pipeline pushes authoritative presence (phase C), inference yields
+  // to it — but the offline floor and a local mic mute stay client-owned (the
+  // server witnesses neither). If the server never pushes, inference stays in
+  // charge exactly as before.
   function setPresence(next) {
-    const presence = Object.hasOwn(PRESENCE_LABELS, next) ? next : "offline";
+    const presence = normalizePresence(next);
+    if (presence === "offline") {
+      // The floor. It also releases the server latch, so the next connection
+      // can be inferred again if its pipeline stays quiet.
+      state.serverDriven = false;
+      state.serverPresence = null;
+      state.micOff = false;
+      applyPresence("offline");
+      return;
+    }
+    if (presence === "mic-off") {
+      state.micOff = true;
+      applyPresence("mic-off");
+      return;
+    }
+    state.micOff = false;
+    applyPresence(state.serverDriven ? state.serverPresence || presence : presence);
+  }
+
+  function setServerPresence(next) {
+    if (!Object.hasOwn(PRESENCE_LABELS, next)) return;
+    state.serverDriven = true;
+    state.serverPresence = next;
+    // A local mute indicator wins until the mic returns — the server can't see
+    // that the client muted its own track, only that no audio is arriving.
+    if (state.micOff) return;
+    applyPresence(next);
+  }
+
+  function normalizePresence(next) {
+    return Object.hasOwn(PRESENCE_LABELS, next) ? next : "offline";
+  }
+
+  function applyPresence(next) {
+    const presence = normalizePresence(next);
     state.presence = presence;
 
     const label = byId("presence-label");
@@ -230,6 +277,81 @@ New companion ids: #avatar, #presence, #presence-label, #presence-dot,
       frame.dataset.presence = presence;
       frame.classList.toggle("is-pulsing", presence === "listening" || presence === "speaking");
     }
+    mirrorFocusPresence(presence);
+  }
+
+  // ---- Fullscreen focus mode (phase C) ---------------------------------
+  // An immersive, voice-first view entered by tapping the portrait. Voice and
+  // barge-in behave exactly as in the base view (speak to interrupt — SPEC §3);
+  // this only enlarges the companion and foregrounds its presence. It is a
+  // separate overlay, not a reflow of the header, so the base layout — and
+  // every id the WebRTC path and E2E depend on — is left untouched. All hooks
+  // no-op if the overlay markup is absent.
+
+  function setupFocusMode() {
+    const opener = byId("avatar-frame");
+    if (opener) {
+      opener.addEventListener("click", enterFocus);
+      opener.addEventListener("keydown", (event) => {
+        if (event.key === "Enter" || event.key === " ") {
+          event.preventDefault();
+          enterFocus();
+        }
+      });
+    }
+    byId("focus-exit")?.addEventListener("click", exitFocus);
+    document.addEventListener("keydown", (event) => {
+      if (event.key === "Escape" && isFocusOpen()) exitFocus();
+    });
+    updateFocusPortrait();
+    mirrorFocusPresence(state.presence);
+  }
+
+  function isFocusOpen() {
+    const overlay = byId("focus-mode");
+    return Boolean(overlay && !overlay.hidden);
+  }
+
+  function enterFocus() {
+    const overlay = byId("focus-mode");
+    if (!overlay || isFocusOpen()) return;
+    updateFocusPortrait();
+    mirrorFocusPresence(state.presence);
+    overlay.hidden = false;
+    overlay.setAttribute("aria-hidden", "false");
+    root.classList.add("focus-active");
+    state.focusReturn = document.activeElement;
+    byId("focus-exit")?.focus();
+  }
+
+  function exitFocus() {
+    const overlay = byId("focus-mode");
+    if (!overlay || !isFocusOpen()) return;
+    overlay.hidden = true;
+    overlay.setAttribute("aria-hidden", "true");
+    root.classList.remove("focus-active");
+    const back = state.focusReturn instanceof HTMLElement ? state.focusReturn : byId("avatar-frame");
+    back?.focus?.();
+  }
+
+  function mirrorFocusPresence(presence) {
+    const label = byId("focus-presence");
+    if (label) label.textContent = PRESENCE_LABELS[presence] || PRESENCE_LABELS.offline;
+    const frame = byId("focus-avatar-frame");
+    if (frame) {
+      frame.dataset.presence = presence;
+      frame.classList.toggle("is-pulsing", presence === "listening" || presence === "speaking");
+    }
+  }
+
+  function updateFocusPortrait() {
+    const img = byId("focus-avatar");
+    if (!img) return;
+    const large = avatarUrl(state.avatarId, "portrait.webp");
+    img.alt = `${state.manifest.name} companion portrait`;
+    img.sizes = "(max-width: 520px) 68vw, 22rem";
+    img.srcset = `${state.avatarSm} 96w, ${large} 512w`;
+    img.src = large;
   }
 
   function setupSchemeListener() {

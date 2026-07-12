@@ -81,6 +81,21 @@ def test_1_pwa_is_installable(page: Page, e2e_server: str) -> None:
 def test_2_connect_typed_turn_transcript_and_resume_label(
     page: Page, e2e_server: str
 ) -> None:
+    # Prove presence is *server-pushed*, not merely inferred (phase C): tap the
+    # chat data channel and record every message the client receives on it.
+    page.add_init_script(
+        """
+        window.__dcMessages = [];
+        const origCreate = RTCPeerConnection.prototype.createDataChannel;
+        RTCPeerConnection.prototype.createDataChannel = function (...args) {
+          const channel = origCreate.apply(this, args);
+          channel.addEventListener('message', (event) => {
+            try { window.__dcMessages.push(JSON.parse(event.data)); } catch (e) {}
+          });
+          return channel;
+        };
+        """
+    )
     # Fresh isolated store → nothing to resume yet.
     page.goto(f"{e2e_server}/")
     expect(page.locator("#connect")).to_have_text("Start conversation", timeout=15_000)
@@ -111,6 +126,17 @@ def test_2_connect_typed_turn_transcript_and_resume_label(
     expect(page.locator("#chat .msg.assistant .assistant-name").last).to_have_text(
         "Rowan"
     )
+
+    # The pipeline actually pushed authoritative presence over the data channel:
+    # the typed turn drives thinking→listening server-side, so at least one
+    # presence message with a server-witnessable state must have arrived. This
+    # is what distinguishes the pushed path from the client-side inference.
+    pushed_states = page.evaluate(
+        "() => (window.__dcMessages || [])"
+        ".filter((m) => m && m.type === 'presence').map((m) => m.state)"
+    )
+    assert pushed_states, "no server-pushed presence message arrived"
+    assert set(pushed_states) <= {"listening", "thinking", "speaking"}, pushed_states
 
     # Push-to-talk is an opt-in mic mode: toggling it reveals the Hold button
     # (the mic-track gating itself is unit-covered; here we prove the UI wiring).
@@ -162,6 +188,49 @@ def test_3_companion_avatar_renders_and_swaps(page: Page, e2e_server: str) -> No
         timeout=10_000,
     )
     assert page.evaluate("() => localStorage.getItem('avatar')") == "luna"
+
+
+def test_5_focus_mode_opens_decodes_and_closes(page: Page, e2e_server: str) -> None:
+    # Tapping the portrait enters the immersive, voice-first fullscreen view
+    # (phase C). No WebRTC needed — it's presentation over the always-on
+    # companion; barge-in still works by speaking, so there is no interrupt
+    # control to assert. Here we prove the overlay opens, decodes, scroll-locks
+    # the page behind, and closes on Escape.
+    page.goto(f"{e2e_server}/")
+
+    overlay = page.locator("#focus-mode")
+    expect(overlay).to_be_hidden()
+
+    page.locator("#avatar-frame").click()
+    expect(overlay).to_be_visible()
+    expect(page.locator("#focus-exit")).to_be_visible()
+
+    # The big portrait actually decodes and mirrors the current avatar.
+    focus_avatar = page.evaluate(
+        """() => {
+            const i = document.getElementById('focus-avatar');
+            return { w: i.naturalWidth, src: i.currentSrc || i.src };
+        }"""
+    )
+    assert focus_avatar["w"] > 0, "focus portrait did not decode"
+    assert "/avatars/rowan/" in focus_avatar["src"], focus_avatar["src"]
+
+    label = page.evaluate(
+        "() => document.getElementById('focus-presence').textContent.trim()"
+    )
+    assert label, "focus presence label is empty"
+
+    # The page behind is scroll-locked while focus mode is open.
+    assert page.evaluate(
+        "() => document.documentElement.classList.contains('focus-active')"
+    )
+
+    # Escape leaves focus mode and releases the scroll lock.
+    page.keyboard.press("Escape")
+    expect(overlay).to_be_hidden()
+    assert not page.evaluate(
+        "() => document.documentElement.classList.contains('focus-active')"
+    )
 
 
 def test_4_history_view_hides_the_start_cta(page: Page, e2e_server: str) -> None:

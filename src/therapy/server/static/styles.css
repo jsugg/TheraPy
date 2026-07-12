@@ -660,3 +660,155 @@ input::placeholder { color: var(--muted); }
     min-width: 6.2rem;
   }
 }
+
+/* ---- Fullscreen focus mode (phase C) --------------------------------------
+   An immersive, voice-first overlay entered by tapping the portrait. Hidden by
+   the global [hidden] rule until companion.js reveals it; scroll-locks the page
+   behind via html.focus-active. Colors follow the runtime-swapped avatar accent
+   tokens; only the amber/olive/terracotta presence hues (shared with the header
+   pill) are fixed. */
+html.focus-active {
+  overflow: hidden;
+}
+
+#avatar-frame[role="button"] {
+  cursor: pointer;
+  touch-action: manipulation;
+}
+
+#avatar-frame[role="button"]:focus-visible {
+  outline: 3px solid var(--accent);
+  outline-offset: 0.65rem;
+}
+
+.focus-mode {
+  position: fixed;
+  inset: 0;
+  z-index: 100;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding:
+    calc(1.25rem + env(safe-area-inset-top, 0px))
+    calc(1.25rem + env(safe-area-inset-right, 0px))
+    calc(1.25rem + env(safe-area-inset-bottom, 0px))
+    calc(1.25rem + env(safe-area-inset-left, 0px));
+  color: var(--ink);
+  background:
+    radial-gradient(circle at 50% 44%, var(--accent-soft) 0, var(--bg) 68%);
+  isolation: isolate;
+}
+
+.focus-mode__content {
+  display: grid;
+  align-content: center;
+  justify-items: center;
+  width: min(100%, 32rem);
+  min-height: 100%;
+  margin: 0 auto;
+  padding-block: 3.5rem 1rem;
+  gap: 1.35rem;
+  text-align: center;
+}
+
+#focus-exit {
+  position: absolute;
+  z-index: 2;
+  top: calc(0.75rem + env(safe-area-inset-top, 0px));
+  right: calc(0.75rem + env(safe-area-inset-right, 0px));
+  display: grid;
+  place-items: center;
+  width: 2.75rem;
+  height: 2.75rem;
+  padding: 0;
+  border-radius: 50%;
+  font-size: 1.25rem;
+  line-height: 1;
+  box-shadow: var(--shadow);
+}
+
+#focus-avatar-frame {
+  --focus-ring-color: var(--muted);
+
+  position: relative;
+  display: grid;
+  place-items: center;
+  width: clamp(12.5rem, 68vmin, 22rem);
+  aspect-ratio: 1;
+  border-radius: 50%;
+}
+
+#focus-avatar-frame::before {
+  content: "";
+  position: absolute;
+  inset: -0.75rem;
+  border: 3px solid var(--focus-ring-color);
+  border-radius: 50%;
+  opacity: 0.46;
+  box-shadow: 0 0 0 0.65rem var(--accent-soft);
+  pointer-events: none;
+}
+
+#focus-avatar-frame.is-pulsing::before {
+  animation: companion-ring 2.6s ease-in-out infinite;
+}
+
+#focus-avatar-frame[data-presence="connecting"] {
+  --focus-ring-color: #c28b2c;
+}
+
+#focus-avatar-frame[data-presence="listening"],
+#focus-avatar-frame[data-presence="speaking"] {
+  --focus-ring-color: var(--accent);
+}
+
+#focus-avatar-frame[data-presence="thinking"] {
+  --focus-ring-color: #8f6f36;
+}
+
+#focus-avatar-frame[data-presence="mic-off"] {
+  --focus-ring-color: #b35d4b;
+}
+
+#focus-avatar {
+  position: relative;
+  z-index: 1;
+  display: block;
+  width: 100%;
+  height: 100%;
+  border-radius: 50%;
+  object-fit: cover;
+  background: var(--accent-soft);
+  box-shadow: var(--shadow);
+}
+
+#focus-presence {
+  margin: 0.5rem 0 0;
+  color: var(--accent);
+  font-family: var(--serif);
+  font-size: clamp(2rem, 8vw, 3.25rem);
+  font-weight: 600;
+  line-height: 1.08;
+  letter-spacing: 0.015em;
+}
+
+#focus-hint {
+  max-width: 32ch;
+  margin: 0;
+  color: var(--muted);
+  line-height: 1.5;
+}
+
+@media (prefers-color-scheme: dark) {
+  .focus-mode {
+    background:
+      radial-gradient(circle at 50% 44%, var(--accent-soft) 0, var(--bg) 60%);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  #focus-avatar-frame.is-pulsing::before {
+    animation: none;
+    opacity: 0.62;
+    transform: none;
+  }
+}

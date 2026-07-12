@@ -251,6 +251,12 @@ async function connect(opts = {}) {
       // Fallback: the HTTP load in connect() is the primary path.
       renderHistoryOnce(msg.turns || [], msg.resumed);
     }
+    // Authoritative presence from the pipeline (phase C): the companion latches
+    // onto it and stops inferring. A dropped message is harmless — inference
+    // stays in charge until the next one arrives.
+    if (msg.type === "presence" && window.Companion) {
+      Companion.setServerPresence(msg.state);
+    }
   };
 
   pc.ontrack = (event) => { botAudio.srcObject = event.streams[0]; };

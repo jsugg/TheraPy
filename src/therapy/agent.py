@@ -50,6 +50,8 @@ from loguru import logger
 from pipecat.audio.vad.silero import SileroVADAnalyzer
 from pipecat.audio.vad.vad_analyzer import VADParams
 from pipecat.frames.frames import (
+    BotStartedSpeakingFrame,
+    BotStoppedSpeakingFrame,
     Frame,
     InputAudioRawFrame,
     LLMConfigureOutputFrame,
@@ -60,6 +62,7 @@ from pipecat.frames.frames import (
     TranscriptionFrame,
     TTSAudioRawFrame,
     TTSUpdateSettingsFrame,
+    UserStartedSpeakingFrame,
     UserStoppedSpeakingFrame,
 )
 from pipecat.pipeline.pipeline import Pipeline
@@ -105,7 +108,7 @@ from therapy.perception.stt import (
     whisper_model,
 )
 from therapy.server import live
-from therapy.server.protocol import session_state_message
+from therapy.server.protocol import presence_message, session_state_message
 from therapy.speech.tts import voice_for
 
 LANGUAGE_ENUM = {"en": Language.EN, "es": Language.ES, "pt": Language.PT}
@@ -441,6 +444,62 @@ class TTFAMonitor(FrameProcessor):
         await self.push_frame(frame, direction)
 
 
+class PresenceRelay(FrameProcessor):
+    """Pushes authoritative companion presence to the client (SPEC phase C).
+
+    companion.js can *infer* presence, but the pipeline witnesses it exactly:
+    the VAD opens and closes each user turn, and the output transport reports
+    when the bot's audio starts and stops. Emitting it here makes the avatar
+    track the real machine — above all 'thinking', the user-stopped→reply gap
+    the client could only guess at.
+
+    Placed just above ``transport.output()``: user speaking frames pass through
+    on their way down, and the bot speaking frames the output emits travel back
+    up through here. Emissions are deduped, and a dropped message self-heals on
+    the next transition (the client falls back to inference if none arrive).
+    """
+
+    def __init__(self, modality: ReplyModality) -> None:
+        super().__init__()
+        self._modality = modality
+        self._state: str | None = None
+
+    async def _emit(self, state: str) -> None:
+        if state == self._state:
+            return
+        self._state = state
+        await self.push_frame(
+            OutputTransportMessageUrgentFrame(message=presence_message(state))
+        )
+
+    async def process_frame(self, frame: Frame, direction: FrameDirection) -> None:
+        await super().process_frame(frame, direction)
+        if isinstance(frame, UserStartedSpeakingFrame):
+            # The user (re)took the floor — barge-in included: back to listening.
+            await self._emit("listening")
+        elif isinstance(frame, UserStoppedSpeakingFrame):
+            await self._emit("thinking")
+        elif isinstance(frame, BotStartedSpeakingFrame):
+            await self._emit("speaking")
+        elif isinstance(frame, BotStoppedSpeakingFrame):
+            await self._emit("listening")
+        elif isinstance(frame, LLMFullResponseEndFrame) and not self._modality.speak:
+            # A silent (typed→text) reply produces no bot audio, so no
+            # BotStopped will bring us back — return to listening here.
+            await self._emit("listening")
+        elif (
+            isinstance(frame, OutputTransportMessageUrgentFrame)
+            and isinstance(frame.message, dict)
+            and frame.message.get("type") == "transcript"
+            and frame.message.get("role") == "user"
+            and frame.message.get("modality") == "text"
+        ):
+            # A typed turn has no VAD frames; mark 'thinking' as its echoed
+            # transcript passes on the way to the client.
+            await self._emit("thinking")
+        await self.push_frame(frame, direction)
+
+
 def make_llm_service():
     """Provider-agnostic LLM factory (SPEC §5): claude first, swappable.
 
@@ -606,6 +665,7 @@ async def run_bot(
             ),
             tts,
             TTFAMonitor(),
+            PresenceRelay(modality),
             transport.output(),
             aggregators.assistant(),
         ]

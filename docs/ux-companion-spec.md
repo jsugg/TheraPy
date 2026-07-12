@@ -1,9 +1,11 @@
 # UX spec — companion presence & swappable avatars
 
-**Status:** phases A + B **implemented** (2026-07-11); C remains (see §4). From
-the owner's concept exploration (four concept boards: eight input-mode layouts +
-avatar art, working name "Rowan"). Scoped as the next UI iteration after phases
-1–2; no pipeline changes were required (agent.py/dialogue policy untouched).
+**Status:** phases A + B + C **implemented** (A/B 2026-07-11, C 2026-07-12); only
+avatar reactions to register shifts remain, deferred to the ser era (phase 3+).
+From the owner's concept exploration (four concept boards: eight input-mode
+layouts + avatar art, working name "Rowan"). The dialogue policy and prompts are
+untouched throughout; phase C adds a single read-only pipeline stage (presence
+relay) and one data-channel message — no policy or prompt changes.
 
 ## 1. Direction
 
@@ -73,8 +75,14 @@ history view can offer playback of one's own turns without new capture work.
   — `GET /api/sessions/{id}/turns/{turn}/audio` streams the archived WAV,
   resolved by ids so no client path touches the filesystem; `/api/sessions/{id}`
   now flags `has_audio` per turn instead of leaking the host path.
-- **C — future:** fullscreen focus mode; server-pushed presence states; avatar
-  reactions to register shifts (ser integration era, phase 3+).
+- **C — done (2026-07-12):** fullscreen focus mode (tap the portrait for an
+  immersive, voice-first overlay; barge-in unchanged — speak to interrupt;
+  Escape or × exits; the page behind scroll-locks) and server-pushed presence —
+  a `PresenceRelay` stage maps the VAD and bot-audio frames to authoritative
+  `listening`/`thinking`/`speaking` over the data channel
+  (`protocol.presence_message`); the client latches onto it and falls back to
+  inference if none arrive. Avatar reactions to register shifts remain deferred
+  to the ser era (phase 3+).
 
 Accessibility throughout: status changes announced via the existing
 `aria-live` region; ring pulse honors `prefers-reduced-motion`; hit targets

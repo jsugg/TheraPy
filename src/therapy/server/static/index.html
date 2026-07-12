@@ -37,7 +37,8 @@
     </header>
 
     <section class="companion-portrait" aria-label="Companion presence">
-      <div id="avatar-frame" class="avatar-frame" data-presence="offline">
+      <div id="avatar-frame" class="avatar-frame" data-presence="offline"
+           role="button" tabindex="0" aria-label="Open focus mode">
         <img id="avatar" src="/avatars/rowan/portrait.webp"
              srcset="/avatars/rowan/portrait-sm.webp 96w, /avatars/rowan/portrait.webp 512w"
              sizes="(max-width: 520px) 136px, 150px"
@@ -102,6 +103,22 @@
       </div>
     </footer>
   </div>
+
+  <section id="focus-mode" class="focus-mode" hidden aria-hidden="true"
+           role="dialog" aria-modal="true" aria-label="Focus mode"
+           aria-describedby="focus-hint">
+    <button id="focus-exit" type="button" aria-label="Exit focus mode">
+      <span aria-hidden="true">×</span>
+    </button>
+    <div class="focus-mode__content">
+      <div id="focus-avatar-frame" data-presence="offline">
+        <img id="focus-avatar" src="/avatars/rowan/portrait.webp"
+             alt="Rowan companion portrait" decoding="async">
+      </div>
+      <p id="focus-presence" aria-live="polite" aria-atomic="true">Offline</p>
+      <p id="focus-hint">Just speak to talk — tap × to leave focus</p>
+    </div>
+  </section>
 
   <audio id="bot-audio" autoplay playsinline></audio>
   <script src="/companion.js"></script>

@@ -14,14 +14,17 @@ that compound into longitudinal self-insight.
 
 Phases 0–2 engineering complete (framework spike: Pipecat, see
 [`docs/framework-spike.md`](docs/framework-spike.md)). Phase 1 — the
-trilingual voice+text loop (es/en/pt) — is implemented and dry-run green;
-phone field tests surfaced two defects (a resumed transcript not rendering
-over a slow mobile data channel, and a Spanish turn answered in English),
-both fixed and regression-tested (SPEC §9 Hardening 7–8). The clean human
-acceptance conversation is the remaining gate. One PWA serves both
+trilingual voice+text loop (es/en/pt) — is implemented and **human-accepted**:
+the owner held 5-min mixed voice/text conversations in each language from the
+phone over Tailscale and confirmed on-device install. Many phone field tests
+were folded back as fixes along the way (SPEC §9 Hardening 7–11); latency
+tuning against the target LLM provider (risk R1) is deferred to a later pass.
+One PWA serves both
 interfaces: a **web interface** in any desktop browser and an installable
 **mobile interface** on the phone. Speak or type in the same conversation,
-switch mid-turn, barge-in supported. The reply language is user-selectable
+switch mid-turn, barge-in supported. A persistent companion avatar ("Rowan",
+swappable) shows live presence — listening, thinking, speaking, pushed from the
+pipeline — with an optional fullscreen focus mode and push-to-talk. The reply language is user-selectable
 (Auto · ES · EN · PT): auto follows the word-level dominant language of your
 last phrase, a pin constrains replies only (SPEC §7). Phase 2 adds local
 memory: every session is stored in SQLite under the data dir (transcripts +
