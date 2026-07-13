@@ -16,6 +16,7 @@ from therapy import __version__
 from therapy.memory import MemoryStore
 from therapy.memory.store import resume_window_secs
 from therapy.server import live
+from therapy.server.protocol import session_state_message
 
 STATIC_DIR = Path(__file__).parent / "static"
 
@@ -131,25 +132,40 @@ async def offer(request: Request) -> dict[str, object]:
     from therapy.agent import run_bot
 
     body = await request.json()
+    store = _store()
     new_session = request.query_params.get("new_session") == "1"
     resolved, resumed = _resolve_session(
-        _store(),
+        store,
         new_session=new_session,
         explicit=request.query_params.get("session"),
+    )
+    # Carry the resumed transcript in the answer so the client renders it
+    # synchronously on connect — an async fetch after connect raced a reconnect
+    # (rendering the wrong session) and live turns (duplicating/mis-ordering).
+    state = session_state_message(
+        resolved or "", resumed, store.session_turns(resolved) if resolved else []
     )
 
     async def on_connection(connection: object) -> None:
         launch_bot(
             connection,
+            # run_bot joins exactly `resolved`: a real id resumes it, None opens
+            # a fresh session. new_session=(resolved is None) stops run_bot from
+            # picking its own resume candidate and disagreeing with this answer.
             lambda conn: run_bot(
-                conn, new_session=new_session, resume_session_id=resolved
+                conn, new_session=resolved is None, resume_session_id=resolved
             ),
         )
 
     answer = await _handler().handle_web_request(
         SmallWebRTCRequest.from_dict(body), on_connection
     )
-    return {**(answer or {}), "session_id": resolved, "resumed": resumed}
+    return {
+        **(answer or {}),
+        "session_id": resolved,
+        "resumed": state["resumed"],
+        "turns": state["turns"],
+    }
 
 
 @app.get("/api/ice-config")

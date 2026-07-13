@@ -142,6 +142,12 @@ class MemoryStore:
 
         This backs reconnect-resume: a dropped WebRTC connection should not
         split one conversation into two sessions.
+
+        Only sessions with at least one turn are candidates. A connectivity
+        probe, a `netcheck` run, or a connect that dropped before the user
+        said anything creates an empty session; offering it as resumable put
+        a "Resume conversation" button in front of the user with nothing to
+        resume (field test 2026-07-11).
         """
         if window_secs <= 0:
             return None
@@ -153,6 +159,9 @@ class MemoryStore:
                 """
                 SELECT id, started_at, ended_at
                 FROM sessions
+                WHERE EXISTS (
+                    SELECT 1 FROM turns WHERE turns.session_id = sessions.id
+                )
                 ORDER BY started_at DESC, rowid DESC
                 LIMIT 1
                 """

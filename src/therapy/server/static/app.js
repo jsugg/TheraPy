@@ -72,29 +72,15 @@ function addMessage(role, text, language) {
   chat.scrollTop = chat.scrollHeight;
 }
 
-// Render the resumed transcript once per connection. Whichever path resolves
-// first wins — the HTTP fetch below, or the data-channel `session` replay as a
-// fallback — so a live transcript that already arrived is never wiped.
+// Render the resumed transcript once per connection. The offer answer carries
+// it (rendered synchronously on connect, below); the data-channel `session`
+// replay is a deduped fallback. `historyLoaded` guards against the fallback
+// re-rendering, and rendering before any live turn keeps ordering correct.
 function renderHistoryOnce(turns, resumed) {
   if (historyLoaded) return;
   historyLoaded = true;
   for (const turn of turns) addMessage(turn.role, turn.text, turn.language);
   if (resumed) setStatus("resumed", "listening");
-}
-
-// The reliable initial-transcript path: fetch over HTTP rather than depend on
-// the data-channel `session` push, which pipecat drops when the channel is
-// slow to open on mobile over the TURN relay (field test 2026-07-10).
-async function loadConnectHistory(sessionId, resumed) {
-  if (historyLoaded || !sessionId) return;
-  try {
-    const res = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}`);
-    if (!res.ok) return; // leave the data-channel replay as the fallback
-    const turns = ((await res.json()).turns || [])
-      .filter((t) => t.text)
-      .slice(-40); // match the data-channel replay's cap (protocol.py)
-    renderHistoryOnce(turns, resumed);
-  } catch { /* offline — the data-channel replay may still arrive */ }
 }
 
 function sessionDate(value) {
@@ -290,13 +276,14 @@ async function connect(opts = {}) {
     }),
   });
   const answer = await response.json();
+  // Render the resumed transcript now, synchronously, before the data channel
+  // can open and deliver a live turn — no async fetch to race a reconnect.
+  renderHistoryOnce(answer.turns || [], answer.resumed);
   await pc.setRemoteDescription(answer);
 
   $("connect").hidden = true;
   $("controls").hidden = false;
   applySpeaker(true);
-  // Reliable initial render, independent of the data channel's timing.
-  loadConnectHistory(answer.session_id, answer.resumed);
 }
 
 function sendText() {

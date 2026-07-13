@@ -27,6 +27,7 @@ dev = [
   "pytest>=8,<9",
   "httpx>=0.27,<1.0",
   "ruff>=0.6",
+  "pytest-playwright>=0.5",  # phase-1 PWA browser E2E (install + connect/transcript)
 ]
 
 [build-system]
@@ -38,6 +39,10 @@ packages = ["src/therapy"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# Browser E2E is slow (real Chromium + a live server + model loading) and opt-in.
+# The default gate stays fast: `pytest` skips it, `pytest -m e2e` runs only it.
+addopts = ["-m", "not e2e"]
+markers = ["e2e: full browser end-to-end tests (Playwright)"]
 
 [tool.ruff]
 target-version = "py312"

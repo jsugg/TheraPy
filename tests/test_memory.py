@@ -98,6 +98,29 @@ def test_resume_candidate_zero_window_returns_none_for_fresh_session(
     assert store.resume_candidate(0.0) is None
 
 
+def test_resume_candidate_ignores_empty_session(tmp_path: Path) -> None:
+    # A connectivity probe (netcheck), or a connect that dropped before the
+    # user said anything, creates a session with no turns. It is not a
+    # conversation to resume — offering it put a "Resume conversation" button
+    # in front of the user with nothing behind it (field test 2026-07-11).
+    store = MemoryStore(tmp_path)
+    store.create_session()  # no turns
+
+    assert store.resume_candidate(900.0) is None
+
+
+def test_resume_candidate_skips_empty_session_for_the_real_one(
+    tmp_path: Path,
+) -> None:
+    store = MemoryStore(tmp_path)
+    real = store.create_session()
+    store.add_turn(real, "user", "text", "en", "Hello.")
+    store.end_session(real)
+    store.create_session()  # a newer empty probe must not hide the real one
+
+    assert store.resume_candidate(900.0) == real
+
+
 def test_reopen_session_clears_finalization_and_summary_history(
     tmp_path: Path,
 ) -> None:
