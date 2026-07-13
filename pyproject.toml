@@ -24,7 +24,7 @@ dependencies = [
 
 [dependency-groups]
 dev = [
-  "pytest>=8,<9",
+  "pytest>=8,<10",
   "httpx>=0.27,<1.0",
   "ruff>=0.6",
   "pytest-playwright>=0.5",  # phase-1 PWA browser E2E (install + connect/transcript)
@@ -38,12 +38,28 @@ build-backend = "hatchling.build"
 packages = ["src/therapy"]
 
 [tool.pytest.ini_options]
-testpaths = ["tests"]
-# Browser E2E is slow (real Chromium + a live server + model loading) and opt-in.
-# The default gate stays fast: `pytest` skips it, `pytest -m e2e` runs only it.
+testpaths = ["tests/suites"]
+# Suites live under tests/suites/{unit,integration,e2e} and are auto-marked by
+# folder (tests/conftest.py). Browser E2E is slow (real Chromium + a live server
+# + model loading) and opt-in: the default gate skips it, `pytest -m e2e` runs
+# only it, and `pytest -m e2e -k <name>` iterates on a subset.
 addopts = ["-m", "not e2e"]
-markers = ["e2e: full browser end-to-end tests (Playwright)"]
+markers = [
+    "unit: fast single-module tests, no external I/O (framework-free)",
+    "integration: wire the app/DB/HTTP/CLI across components",
+    "e2e: full browser end-to-end tests (Playwright)",
+]
 
 [tool.ruff]
 target-version = "py312"
 line-length = 88
+
+[tool.ruff.lint]
+# `extend-select` keeps ruff's defaults (E4/E7/E9 + F) and adds import-sorting
+# (I), pyupgrade (UP), bugbear (B), and pytest-style (PT). Deliberately NOT the
+# full `E` set — E501 line-length is left unenforced to avoid reflowing prose.
+extend-select = ["I", "UP", "B", "PT"]
+
+[tool.ruff.lint.per-file-ignores]
+# pytest-style rules target the test suites, not the standalone phase scripts.
+"scripts/**" = ["PT"]

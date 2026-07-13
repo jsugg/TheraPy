@@ -10,11 +10,36 @@ Run: `docker compose exec therapy uv run pytest -m e2e`
 """
 
 import re
+from typing import TYPE_CHECKING
 
 import pytest
-from playwright.sync_api import Page, expect
 
-pytestmark = pytest.mark.e2e
+# Playwright ships only in the container test bed. Where it (and the realtime
+# stack these E2E exercise) isn't installed, keep the module importable and skip
+# each test at runtime — so `pytest -m e2e` still *collects* these items and
+# exits 0 (all skipped) rather than returning "no tests collected". The fallback
+# stays behind `TYPE_CHECKING` so the type checker only ever sees the real
+# Playwright types.
+if TYPE_CHECKING:
+    from playwright.sync_api import Page, expect
+
+    _HAS_PLAYWRIGHT = True
+else:
+    try:
+        from playwright.sync_api import Page, expect
+
+        _HAS_PLAYWRIGHT = True
+    except ImportError:
+        _HAS_PLAYWRIGHT = False
+        Page = object
+
+        def expect(*args, **kwargs):
+            raise RuntimeError("playwright is not installed")
+
+
+# The `e2e` marker is applied automatically by folder (tests/conftest.py); only
+# the runtime skip when Playwright is absent needs declaring here.
+pytestmark = pytest.mark.skipif(not _HAS_PLAYWRIGHT, reason="playwright not installed")
 
 
 def test_1_pwa_is_installable(page: Page, e2e_server: str) -> None:
@@ -55,7 +80,8 @@ def test_1_pwa_is_installable(page: Page, e2e_server: str) -> None:
 
     icons = manifest["body"]["icons"]
     png = {i["sizes"]: i for i in icons if i.get("type") == "image/png"}
-    assert "192x192" in png and "512x512" in png, "Chrome needs 192 and 512 PNGs"
+    assert "192x192" in png, "Chrome needs a 192px PNG"
+    assert "512x512" in png, "Chrome needs a 512px PNG"
     assert any(i.get("purpose") == "maskable" for i in icons), "need a maskable icon"
 
     # Every declared PNG must actually decode in the browser at its true size —
@@ -139,7 +165,8 @@ def test_2_connect_typed_turn_transcript_and_resume_label(
     assert set(pushed_states) <= {"listening", "thinking", "speaking"}, pushed_states
 
     # Push-to-talk is an opt-in mic mode: toggling it reveals the Hold button
-    # (the mic-track gating itself is unit-covered; here we prove the UI wiring).
+    # (the deep hold/long-press behaviour is covered by test_6; here we only
+    # prove the reveal/hide wiring inside a live connection).
     expect(page.locator("#talk")).to_be_hidden()
     page.locator("#mic-mode").click()
     expect(page.locator("#talk")).to_be_visible()
@@ -249,3 +276,79 @@ def test_4_history_view_hides_the_start_cta(page: Page, e2e_server: str) -> None
     page.locator("#history").click()
     expect(page.locator("#composer")).to_be_visible()
     expect(page.locator("#connect")).to_be_visible()
+
+
+def test_6_hold_to_talk_survives_longpress_and_multitouch(
+    page: Page, e2e_server: str
+) -> None:
+    # The field bug: on a phone, press-and-hold pops the native selection menu
+    # ("Copy / Select all / Share"), which cancels the touch → pointercancel →
+    # endHold, so "listening" stops the instant the menu appears. A browser can't
+    # render that OS menu, but it CAN lock in the DOM/CSS contract that prevents
+    # it, plus the hold state machine. No WebRTC/model needed — the hold logic is
+    # independent of the pipeline, so we reveal the controls and drive it directly.
+    page.goto(f"{e2e_server}/")
+    expect(page.locator("#mic-mode")).to_have_text("Open mic", timeout=15_000)
+    # The controls row is hidden until a live connection; reveal it to exercise
+    # the button without connecting.
+    page.evaluate("() => { document.getElementById('controls').hidden = false; }")
+    page.locator("#mic-mode").click()  # → push mode reveals the Hold button
+    talk = page.locator("#talk")
+    expect(talk).to_be_visible()
+
+    # 1) Gesture-claiming opt-out: default `touch-action: manipulation` (inherited
+    # from button) lets a slight drift become a scroll → pointercancel. `none`
+    # keeps the pointer with the button for the whole hold.
+    assert talk.evaluate("el => getComputedStyle(el).touchAction") == "none"
+    # 2) Text is not selectable (the long-press selection that pops the menu).
+    assert talk.evaluate("el => getComputedStyle(el).userSelect") in (
+        "none",
+        "-webkit-none",
+    )
+    # 3) The menu triggers via contextmenu (Android) / selectstart — both cancelled.
+    assert talk.evaluate(
+        "el => !el.dispatchEvent("
+        "new MouseEvent('contextmenu', {bubbles: true, cancelable: true}))"
+    ), "contextmenu must be prevented on the hold button"
+    assert talk.evaluate(
+        "el => !el.dispatchEvent("
+        "new Event('selectstart', {bubbles: true, cancelable: true}))"
+    ), "selectstart must be prevented on the hold button"
+
+    primary = {"pointerId": 1, "isPrimary": True, "button": 0}
+
+    # Hold state machine: press holds, release releases.
+    talk.dispatch_event("pointerdown", primary)
+    expect(talk).to_have_attribute("aria-pressed", "true")
+    assert "is-holding" in (talk.get_attribute("class") or "")
+    talk.dispatch_event("pointerup", {"pointerId": 1})
+    expect(talk).to_have_attribute("aria-pressed", "false")
+
+    # Multi-touch: a SECOND finger's release must not end the first finger's hold.
+    talk.dispatch_event("pointerdown", primary)
+    expect(talk).to_have_attribute("aria-pressed", "true")
+    talk.dispatch_event("pointerdown", {"pointerId": 2, "isPrimary": False, "button": 0})
+    talk.dispatch_event("pointerup", {"pointerId": 2})
+    expect(talk).to_have_attribute("aria-pressed", "true")  # still held
+    talk.dispatch_event("pointerup", {"pointerId": 1})
+    expect(talk).to_have_attribute("aria-pressed", "false")
+
+    # A genuinely cancelled gesture must fail safe by ending the hold (mute).
+    talk.dispatch_event("pointerdown", primary)
+    expect(talk).to_have_attribute("aria-pressed", "true")
+    talk.dispatch_event("pointercancel", {"pointerId": 1})
+    expect(talk).to_have_attribute("aria-pressed", "false")
+
+    # A non-primary contact / secondary mouse button must never start a hold.
+    talk.dispatch_event("pointerdown", {"pointerId": 3, "isPrimary": True, "button": 2})
+    expect(talk).to_have_attribute("aria-pressed", "false")
+
+
+def test_7_composer_footer_is_frozen(page: Page, e2e_server: str) -> None:
+    # The composer (buttons + text input) must stay pinned to the bottom, mirroring
+    # the sticky header — field report: the footer scrolled away.
+    page.goto(f"{e2e_server}/")
+    composer = page.locator("#composer")
+    expect(composer).to_be_visible()
+    assert composer.evaluate("el => getComputedStyle(el).position") == "sticky"
+    assert composer.evaluate("el => getComputedStyle(el).bottom") == "0px"

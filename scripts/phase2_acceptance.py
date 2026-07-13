@@ -103,7 +103,7 @@ class TypedClient:
             self.event.clear()
             try:
                 await asyncio.wait_for(self.event.wait(), remaining)
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 pass
         return self.session_state
 
@@ -150,7 +150,7 @@ class TypedClient:
             self.event.clear()
             try:
                 await asyncio.wait_for(self.event.wait(), remaining)
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 pass
 
     async def close(self) -> None:

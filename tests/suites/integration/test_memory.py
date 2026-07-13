@@ -1,8 +1,8 @@
 import asyncio
 import json
+import wave
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-import wave
 
 from therapy.memory import MemoryStore
 from therapy.memory.summarizer import LLMSummarizer, render_transcript

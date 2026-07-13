@@ -10,7 +10,8 @@ def test_clamp_language() -> None:
 
 
 def test_is_supported() -> None:
-    assert is_supported("es") and is_supported("pt-BR")
+    assert is_supported("es")
+    assert is_supported("pt-BR")
     assert not is_supported("ko")
     assert not is_supported(None)
 

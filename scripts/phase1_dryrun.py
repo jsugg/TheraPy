@@ -41,7 +41,6 @@ from aiortc import RTCPeerConnection, RTCSessionDescription
 from aiortc.mediastreams import MediaStreamTrack
 from av import AudioFrame
 from kokoro_onnx import Kokoro
-
 from pipecat.services.kokoro.tts import KOKORO_CACHE_DIR
 
 SERVER = "http://localhost:8000"
@@ -145,7 +144,7 @@ class Observations:
             self.transcript_event.clear()
             try:
                 await asyncio.wait_for(self.transcript_event.wait(), remaining)
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 pass
 
 

@@ -9,7 +9,6 @@ from therapy.dialogue.language_choice import (
     reply_language_override_effect,
 )
 
-
 # --- dominant_language: word-level majority ---------------------------------
 
 
@@ -63,7 +62,7 @@ def test_unpin_restores_auto_from_latest_phrase() -> None:
 
 def test_pin_rejects_unsupported_codes() -> None:
     choice = ReplyLanguage()
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="Unsupported reply language"):
         choice.set_pin("fr")
 
 
@@ -104,7 +103,8 @@ def test_auto_override_asserts_no_language() -> None:
 def test_pin_override_switches_voice_and_anchors_when_language_changes() -> None:
     voice, note = reply_language_override_effect("pt", "pt", None)
     assert voice == "pt"
-    assert note is not None and "português" in note.lower()
+    assert note is not None
+    assert "português" in note.lower()
 
 
 def test_pin_override_anchors_without_revoicing_when_language_matches() -> None:
@@ -112,7 +112,8 @@ def test_pin_override_anchors_without_revoicing_when_language_matches() -> None:
     # model holds it if the user switches) but need not re-voice the TTS.
     voice, note = reply_language_override_effect("es", "es", "es")
     assert voice is None
-    assert note is not None and "español" in note.lower()
+    assert note is not None
+    assert "español" in note.lower()
 
 
 # --- label_language: honest display tag (broader than the reply set) --------

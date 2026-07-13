@@ -4,41 +4,8 @@ import os
 import socket
 import sys
 import threading
-import time
-from collections.abc import Callable
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from pathlib import Path
 
-# scripts/ is not a package; make it importable regardless of how pytest
-# was launched (`python -m pytest` adds the CWD, plain `pytest` does not).
-sys.path.insert(0, str(Path(__file__).parents[1]))
-
-from scripts.watchdog import Watchdog, probe  # noqa: E402
-
-
-class _OkHandler(BaseHTTPRequestHandler):
-    def do_GET(self) -> None:
-        self.send_response(200)
-        self.end_headers()
-        self.wfile.write(b"ok")
-
-    def log_message(self, _format: str, *_args: object) -> None:
-        return
-
-
-def _wait_until(predicate: Callable[[], bool], timeout: float = 3.0) -> None:
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        if predicate():
-            return
-        time.sleep(0.02)
-    raise AssertionError("condition was not met before timeout")
-
-
-def _free_port() -> int:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        sock.bind(("127.0.0.1", 0))
-        return int(sock.getsockname()[1])
+from scripts.watchdog import Watchdog, probe
 
 
 def _pid_is_alive(pid: int) -> bool:
@@ -49,21 +16,12 @@ def _pid_is_alive(pid: int) -> bool:
     return True
 
 
-def test_probe_returns_true_for_local_http_200() -> None:
-    server = ThreadingHTTPServer(("127.0.0.1", 0), _OkHandler)
-    port = int(server.server_address[1])
-    thread = threading.Thread(target=server.serve_forever)
-    thread.start()
-    try:
-        assert probe(f"http://127.0.0.1:{port}/health", timeout=1.0) is True
-    finally:
-        server.shutdown()
-        server.server_close()
-        thread.join(timeout=1.0)
+def test_probe_returns_true_for_local_http_200(ok_server) -> None:
+    assert probe(f"{ok_server}/health", timeout=1.0) is True
 
 
-def test_probe_returns_false_for_closed_port() -> None:
-    port = _free_port()
+def test_probe_returns_false_for_closed_port(free_port) -> None:
+    port = free_port()
 
     assert probe(f"http://127.0.0.1:{port}/health", timeout=0.2) is False
 
@@ -102,7 +60,7 @@ def test_probe_returns_false_on_timeout() -> None:
             thread.join(timeout=1.0)
 
 
-def test_watchdog_restarts_crashed_child_until_requested_stop() -> None:
+def test_watchdog_restarts_crashed_child_until_requested_stop(wait_until) -> None:
     watchdog = Watchdog(
         cmd=[sys.executable, "-c", "import time; time.sleep(0.2)"],
         url="http://127.0.0.1:9/health",
@@ -114,7 +72,7 @@ def test_watchdog_restarts_crashed_child_until_requested_stop() -> None:
     thread = threading.Thread(target=watchdog.run_forever)
     thread.start()
     try:
-        _wait_until(lambda: watchdog.restart_count >= 2)
+        wait_until(lambda: watchdog.restart_count >= 2)
     finally:
         watchdog.request_stop()
         thread.join(timeout=2.0)
@@ -123,8 +81,10 @@ def test_watchdog_restarts_crashed_child_until_requested_stop() -> None:
     assert not thread.is_alive()
 
 
-def test_watchdog_restarts_hung_child_and_kills_original_pid() -> None:
-    port = _free_port()
+def test_watchdog_restarts_hung_child_and_kills_original_pid(
+    free_port, wait_until
+) -> None:
+    port = free_port()
     child_code = (
         "import socket\n"
         f"port = {port}\n"
@@ -148,12 +108,12 @@ def test_watchdog_restarts_hung_child_and_kills_original_pid() -> None:
     thread = threading.Thread(target=watchdog.run_forever)
     thread.start()
     try:
-        _wait_until(lambda: watchdog.child is not None)
+        wait_until(lambda: watchdog.child is not None)
         original_child = watchdog.child
         assert original_child is not None
         original_pid = original_child.pid
 
-        _wait_until(
+        wait_until(
             lambda: watchdog.restart_count >= 1
             and watchdog.child is not None
             and watchdog.child.pid != original_pid,

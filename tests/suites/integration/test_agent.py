@@ -1,5 +1,11 @@
 import pytest
 
+# agent.py is the only module that imports Pipecat (SPEC dependency boundary);
+# on hosts without the realtime stack (e.g. the Intel-Mac dev box, where
+# onnxruntime/kokoro have no wheels) collection would fail. Skip cleanly there —
+# the container test bed has the full stack.
+pytest.importorskip("pipecat")
+
 from therapy.agent import LANGUAGE_ENUM, make_llm_service
 from therapy.perception.stt import SUPPORTED_LANGUAGES
 
