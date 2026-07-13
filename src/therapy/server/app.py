@@ -6,7 +6,11 @@ from collections.abc import Awaitable, Callable, Coroutine, Sequence
 from contextlib import asynccontextmanager
 from functools import lru_cache
 from pathlib import Path
-from typing import Protocol
+from typing import TYPE_CHECKING, Protocol
+
+if TYPE_CHECKING:
+    from therapy.knowledge.research import ResearchKB
+    from therapy.knowledge.user_model import UserModel
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse
@@ -53,6 +57,26 @@ app = FastAPI(title="TheraPy", version=__version__, lifespan=lifespan)
 def _store() -> MemoryStore:
     """Return the lazily initialized local memory store."""
     return MemoryStore()
+
+
+@lru_cache(maxsize=1)
+def _model() -> "UserModel":
+    """Return the lazily initialized property-graph user model.
+
+    Shares the store's data directory (both open `therapy.db`), so the review
+    UI reads and edits the same graph the conversation writes.
+    """
+    from therapy.knowledge.user_model import UserModel
+
+    return UserModel()
+
+
+@lru_cache(maxsize=1)
+def _research() -> "ResearchKB":
+    """Return the lazily initialized curated research knowledge base."""
+    from therapy.knowledge.research import ResearchKB
+
+    return ResearchKB()
 
 
 def _handler() -> _WebRTCHandler:
@@ -129,6 +153,7 @@ async def offer(request: Request) -> dict[str, object]:
     two never disagree.
     """
     from pipecat.transports.smallwebrtc.request_handler import SmallWebRTCRequest
+
     from therapy.agent import run_bot
 
     body = await request.json()
@@ -279,6 +304,131 @@ def delete_session(session_id: str) -> dict[str, str]:
         )
     store.delete_session(session_id)
     return {"deleted": session_id}
+
+
+# --------------------------------------------------------------------- #
+# Review-UI sovereignty (W7): the user's model of themselves, browsable,
+# editable, deletable. "The assistant is its curator, not its owner."
+# --------------------------------------------------------------------- #
+
+
+@app.get("/api/graph")
+def graph() -> dict[str, object]:
+    """Return the whole user-model graph plus boundaries and pending inbox."""
+    model = _model()
+    return {
+        "nodes": model.nodes(),
+        "edges": model.edges(),
+        "boundaries": model.boundaries(),
+        "pending_insights": model.pending_insights(),
+    }
+
+
+@app.get("/api/graph/pending")
+def pending_insights() -> dict[str, object]:
+    """Proposed patterns awaiting the user's confirm/reject (W4 inbox)."""
+    return {"pending_insights": _model().pending_insights()}
+
+
+@app.patch("/api/graph/nodes/{node_id}")
+async def edit_node(node_id: int, request: Request) -> dict[str, object]:
+    """Edit a node's statement or its `never_initiate` flag (user sovereignty)."""
+    body = await request.json()
+    statement = body.get("statement")
+    never_initiate = body.get("never_initiate")
+    if statement is None and never_initiate is None:
+        raise HTTPException(status_code=400, detail="Nothing to update")
+    ok = _model().edit_node(
+        node_id,
+        statement=str(statement).strip() if statement is not None else None,
+        never_initiate=bool(never_initiate) if never_initiate is not None else None,
+    )
+    if not ok:
+        raise HTTPException(status_code=404, detail="Node not found")
+    return {"node": _model().get_node(node_id)}
+
+
+@app.post("/api/graph/nodes/{node_id}/confirm")
+def confirm_node(node_id: int) -> dict[str, object]:
+    """Explicitly validate a claim — the only path to `confirmed` (SPEC §3)."""
+    if not _model().confirm_node(node_id):
+        raise HTTPException(status_code=404, detail="Node not found")
+    return {"node": _model().get_node(node_id)}
+
+
+@app.post("/api/graph/nodes/{node_id}/reject")
+def reject_node(node_id: int) -> dict[str, object]:
+    """Reject a proposed pattern, demoting it back to an observation."""
+    if not _model().reject_node(node_id):
+        raise HTTPException(status_code=404, detail="Node not found")
+    return {"node": _model().get_node(node_id)}
+
+
+@app.delete("/api/graph/nodes/{node_id}")
+def delete_node(node_id: int) -> dict[str, object]:
+    """Delete a node (tombstoned so distillation cannot re-learn it)."""
+    if not _model().delete_node(node_id):
+        raise HTTPException(status_code=404, detail="Node not found")
+    return {"deleted": node_id}
+
+
+@app.delete("/api/graph/edges/{edge_id}")
+def delete_edge(edge_id: int) -> dict[str, object]:
+    """Delete an edge (tombstoned against re-learning)."""
+    if not _model().delete_edge(edge_id):
+        raise HTTPException(status_code=404, detail="Edge not found")
+    return {"deleted": edge_id}
+
+
+@app.get("/api/graph/boundaries")
+def boundaries() -> dict[str, object]:
+    """Return the editable `never_store` / `never_initiate` boundaries."""
+    return {"boundaries": _model().boundaries()}
+
+
+@app.post("/api/graph/boundaries")
+async def add_boundary(request: Request) -> dict[str, object]:
+    """Add a `never_store` pattern or `never_initiate` topic."""
+    body = await request.json()
+    kind = str(body.get("kind", ""))
+    value = str(body.get("value", "")).strip()
+    if kind not in {"never_store", "never_initiate"} or not value:
+        raise HTTPException(status_code=400, detail="kind and value required")
+    _model().add_boundary(kind, value)
+    return {"boundaries": _model().boundaries()}
+
+
+@app.delete("/api/graph/boundaries")
+async def remove_boundary(request: Request) -> dict[str, object]:
+    """Remove a boundary by kind + value."""
+    body = await request.json()
+    kind = str(body.get("kind", ""))
+    value = str(body.get("value", ""))
+    if not _model().remove_boundary(kind, value):
+        raise HTTPException(status_code=404, detail="Boundary not found")
+    return {"boundaries": _model().boundaries()}
+
+
+@app.get("/api/research")
+def research_documents() -> dict[str, object]:
+    """List the curated research documents the user has ingested."""
+    return {"documents": _research().documents()}
+
+
+@app.get("/api/research/query")
+def research_query(q: str, k: int = 3) -> dict[str, object]:
+    """Answer a psychoeducation query from the literature, with citations."""
+    if not q.strip():
+        raise HTTPException(status_code=400, detail="Query must not be empty")
+    return _research().psychoeducation(q, k=k)
+
+
+@app.get("/api/crisis-resources")
+def crisis_resources_config() -> dict[str, object]:
+    """The configurable crisis hotlines/contacts surfaced in the UI (W8)."""
+    from therapy.dialogue.policy import crisis_contacts, crisis_resources
+
+    return {"contacts": crisis_contacts(), "resources": crisis_resources()}
 
 
 @app.get("/")
