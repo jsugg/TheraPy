@@ -13,6 +13,7 @@ Safety (SPEC §4): therapy-informed, never therapy — no diagnoses; crisis
 language stops coaching and surfaces human resources.
 """
 
+import json
 import os
 
 CRISIS_RESOURCES_DEFAULT = (
@@ -20,8 +21,39 @@ CRISIS_RESOURCES_DEFAULT = (
 )
 
 
+def crisis_contacts() -> list[dict[str, str]]:
+    """Configured crisis hotlines/contacts as `[{label, value}]` (W8, SPEC §4).
+
+    Read from `THERAPY_CRISIS_CONTACTS` (a JSON array of `{"label","value"}`),
+    so the owner can localize the safety protocol's resources without code
+    changes. Malformed or empty config yields an empty list — the caller then
+    falls back to the plain-string resource.
+    """
+    raw = os.environ.get("THERAPY_CRISIS_CONTACTS", "").strip()
+    if not raw:
+        return []
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        return []
+    contacts: list[dict[str, str]] = []
+    for entry in parsed if isinstance(parsed, list) else []:
+        if isinstance(entry, dict) and entry.get("label") and entry.get("value"):
+            contacts.append(
+                {"label": str(entry["label"]), "value": str(entry["value"])}
+            )
+    return contacts
+
+
 def crisis_resources() -> str:
-    """Human resources surfaced on crisis language, configurable per locale."""
+    """Human resources surfaced on crisis language, configurable per locale.
+
+    Priority: the structured `crisis_contacts()` config (rendered as a list),
+    then the `THERAPY_CRISIS_RESOURCES` string override, then a safe default.
+    """
+    contacts = crisis_contacts()
+    if contacts:
+        return "; ".join(f"{c['label']}: {c['value']}" for c in contacts)
     return os.environ.get("THERAPY_CRISIS_RESOURCES", CRISIS_RESOURCES_DEFAULT)
 
 
@@ -103,6 +135,32 @@ def continuity_note(summaries: list[dict], facts: list[dict]) -> str | None:
         "something you remember, believe the user."
     )
     return "\n\n".join(parts)
+
+
+def graph_continuity_note(
+    model: object, *, topic: str = "", summaries: list[dict] | None = None
+) -> str | None:
+    """Graph-aware continuity for a new conversation (SPEC §8, W3).
+
+    Replaces the Phase-2 "flat facts + summaries" injection: identity,
+    preferences and the `never_initiate` list are always present, and a graph
+    walk from the opening `topic` pulls in the most relevant confirmed/pattern
+    claims with their confirmed edges. `model` is a
+    `knowledge.user_model.UserModel` (typed loosely to keep this framework-free
+    module free of a hard import). Recent session summaries, when supplied, are
+    appended as narrative colour. Returns None when there is nothing to inject.
+    """
+    from therapy.knowledge.user_model import render_context
+
+    note = render_context(model.assemble_context(topic))  # type: ignore[attr-defined]
+    parts = [note] if note else []
+    if summaries:
+        rendered = "\n".join(
+            f"- [{summary['started_at'][:10]}] {summary['summary']}"
+            for summary in summaries
+        )
+        parts.append("# Previous conversations, oldest first\n" + rendered)
+    return "\n\n".join(parts) if parts else None
 
 
 def resume_note() -> str:
