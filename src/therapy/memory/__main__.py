@@ -8,8 +8,8 @@ from __future__ import annotations
 
 import argparse
 import json
-from pathlib import Path
 import sys
+from pathlib import Path
 
 from therapy.memory import MemoryStore
 
@@ -46,7 +46,16 @@ def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
 
     if args.command == "export":
-        payload = json.dumps(MemoryStore().export_all(), indent=2, ensure_ascii=False)
+        # Composing the snapshot here keeps `MemoryStore` framework-free and
+        # unaware of the graph: the flat v1 `facts` are migrated into the
+        # property graph as `observation` nodes on `UserModel` init (idempotent,
+        # zero loss — SPEC Appendix A migration), and the graph is exported
+        # alongside the sessions/facts.
+        from therapy.knowledge.user_model import UserModel
+
+        snapshot = MemoryStore().export_all()
+        snapshot["graph"] = UserModel().export_all()
+        payload = json.dumps(snapshot, indent=2, ensure_ascii=False)
         if args.output is None:
             sys.stdout.write(payload)
         else:
