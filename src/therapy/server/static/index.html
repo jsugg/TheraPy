@@ -11,51 +11,117 @@
   <link rel="stylesheet" href="/styles.css">
 </head>
 <body>
-  <header>
-    <h1>TheraPy</h1>
-    <div id="header-controls">
-      <span id="status" data-state="idle">offline</span>
-      <button id="history" class="toggle" aria-pressed="false" title="History">📖</button>
-    </div>
-  </header>
-
-  <section id="history-view" hidden>
-    <div id="session-list-view">
-      <button id="session-new" class="primary">＋ New conversation</button>
-      <div id="session-list"></div>
-    </div>
-    <div id="session-detail" hidden>
-      <div id="session-actions">
-        <button id="history-back">← Sessions</button>
-        <button id="session-resume">▶ Continue</button>
-        <button id="session-rename" title="Rename this conversation">✏️</button>
-        <button id="session-delete" title="Delete this conversation">🗑</button>
+  <div class="app-shell">
+    <header class="app-header" aria-label="Companion header">
+      <div class="header-left">
+        <button id="history" class="icon-button toggle" type="button"
+                aria-label="Conversation history" aria-pressed="false" title="History">📖</button>
       </div>
-      <h2 id="session-title"></h2>
-      <div id="session-turns"></div>
+
+      <div class="companion-heading">
+        <h1 id="avatar-name">Rowan</h1>
+        <div id="presence" class="presence-pill" data-presence="offline"
+             aria-live="polite" aria-atomic="true">
+          <span id="presence-dot" aria-hidden="true"></span>
+          <span id="presence-label">Offline</span>
+        </div>
+        <span id="status" class="sr-only" data-state="idle">idle</span>
+      </div>
+
+      <div id="header-controls">
+        <button id="avatar-pick" class="icon-button" type="button"
+                aria-label="Choose companion" aria-haspopup="menu"
+                aria-expanded="false" title="Choose companion">🐾</button>
+        <div id="avatar-picker" class="avatar-picker" role="menu" hidden></div>
+      </div>
+    </header>
+
+    <section class="companion-portrait" aria-label="Companion presence">
+      <div id="avatar-frame" class="avatar-frame" data-presence="offline"
+           role="button" tabindex="0" aria-label="Open focus mode">
+        <img id="avatar" src="/avatars/rowan/portrait.webp"
+             srcset="/avatars/rowan/portrait-sm.webp 96w, /avatars/rowan/portrait.webp 512w"
+             sizes="(max-width: 520px) 136px, 150px"
+             alt="Rowan companion portrait" width="150" height="150" decoding="async">
+      </div>
+      <p id="avatar-tagline">Your wise companion</p>
+    </section>
+
+    <div class="content-shell">
+      <section id="history-view" aria-label="Conversation history" hidden>
+        <div id="session-list-view">
+          <button id="session-new" class="primary" type="button">＋ New conversation</button>
+          <div id="session-list"></div>
+        </div>
+        <div id="session-detail" hidden>
+          <div id="session-actions">
+            <button id="history-back" type="button">← Sessions</button>
+            <button id="session-resume" type="button">▶ Continue</button>
+            <button id="session-rename" class="icon-button" type="button"
+                    aria-label="Rename this conversation" title="Rename this conversation">✏️</button>
+            <button id="session-delete" class="icon-button danger" type="button"
+                    aria-label="Delete this conversation" title="Delete this conversation">🗑</button>
+          </div>
+          <h2 id="session-title"></h2>
+          <div id="session-turns"></div>
+        </div>
+      </section>
+
+      <main id="chat" aria-live="polite" aria-label="Conversation"></main>
+    </div>
+
+    <footer id="composer" class="composer" aria-label="Message composer">
+      <button id="connect" class="primary" type="button">Start conversation</button>
+      <div id="controls" hidden>
+        <div class="composer-row">
+          <button id="mic" class="icon-button toggle" type="button"
+                  aria-label="Microphone" aria-pressed="true" title="Microphone">🎙️</button>
+          <input id="text" type="text" placeholder="Type a message…"
+                 autocomplete="off" enterkeyhint="send" aria-label="Message text">
+          <button id="send" class="send-button" type="button"
+                  aria-label="Send message" title="Send">➤</button>
+          <button id="speaker" class="icon-button toggle" type="button"
+                  aria-label="Voice replies" aria-pressed="true" title="Voice replies">🔊</button>
+        </div>
+        <div class="voice-row">
+          <label class="lang-chip" aria-label="Reply language">
+            <span aria-hidden="true">🌐</span>
+            <select id="lang" title="Reply language">
+              <option value="">Auto</option>
+              <option value="es">ES</option>
+              <option value="en">EN</option>
+              <option value="pt">PT</option>
+            </select>
+          </label>
+          <span class="voice-row-actions">
+            <button id="talk" class="hold-button" type="button"
+                    aria-label="Hold to talk" aria-pressed="false" hidden>Hold to talk</button>
+            <button id="mic-mode" class="mode-button" type="button"
+                    aria-label="Switch microphone mode" aria-pressed="false">Open mic</button>
+          </span>
+        </div>
+      </div>
+    </footer>
+  </div>
+
+  <section id="focus-mode" class="focus-mode" hidden aria-hidden="true"
+           role="dialog" aria-modal="true" aria-label="Focus mode"
+           aria-describedby="focus-hint">
+    <button id="focus-exit" type="button" aria-label="Exit focus mode">
+      <span aria-hidden="true">×</span>
+    </button>
+    <div class="focus-mode__content">
+      <div id="focus-avatar-frame" data-presence="offline">
+        <img id="focus-avatar" src="/avatars/rowan/portrait.webp"
+             alt="Rowan companion portrait" decoding="async">
+      </div>
+      <p id="focus-presence" aria-live="polite" aria-atomic="true">Offline</p>
+      <p id="focus-hint">Just speak to talk — tap × to leave focus</p>
     </div>
   </section>
 
-  <main id="chat" aria-live="polite"></main>
-
-  <footer>
-    <button id="connect" class="primary">Start conversation</button>
-    <div id="controls" hidden>
-      <button id="mic" class="toggle" aria-pressed="true" title="Microphone">🎙️</button>
-      <input id="text" type="text" placeholder="Type instead of speaking…"
-             autocomplete="off" enterkeyhint="send">
-      <button id="send" title="Send">➤</button>
-      <select id="lang" title="Reply language">
-        <option value="">Auto</option>
-        <option value="es">ES</option>
-        <option value="en">EN</option>
-        <option value="pt">PT</option>
-      </select>
-      <button id="speaker" class="toggle" aria-pressed="true" title="Voice replies">🔊</button>
-    </div>
-  </footer>
-
-  <audio id="bot-audio" autoplay></audio>
+  <audio id="bot-audio" autoplay playsinline></audio>
+  <script src="/companion.js"></script>
   <script src="/app.js"></script>
 </body>
 </html>

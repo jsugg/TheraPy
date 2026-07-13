@@ -1,7 +1,13 @@
 """Data-channel payload shapes shared with the PWA (server/protocol.py)."""
 
+import pytest
+
 from therapy.server import live
-from therapy.server.protocol import session_state_message
+from therapy.server.protocol import (
+    PRESENCE_STATES,
+    presence_message,
+    session_state_message,
+)
 
 
 def _turn(i: int, text: str | None = None) -> dict:
@@ -40,6 +46,22 @@ def test_session_state_caps_to_most_recent_and_drops_empty() -> None:
     assert len(message["turns"]) == 39
     assert message["turns"][0]["text"] == "t11"
     assert message["turns"][-1]["text"] == "t49"
+
+
+def test_presence_message_shape() -> None:
+    assert presence_message("thinking") == {"type": "presence", "state": "thinking"}
+
+
+def test_presence_message_only_server_witnessable_states() -> None:
+    # The server emits only what it can see. offline/connecting/mic-off are
+    # client-owned (connection + local mute) and must be rejected here so a
+    # bug can't push a state the pipeline has no business asserting.
+    assert PRESENCE_STATES == {"listening", "thinking", "speaking"}
+    for ok in PRESENCE_STATES:
+        assert presence_message(ok)["state"] == ok
+    for bad in ("offline", "connecting", "mic-off", "", "SPEAKING"):
+        with pytest.raises(ValueError, match="presence state"):
+            presence_message(bad)
 
 
 def test_live_ownership_tokens() -> None:
