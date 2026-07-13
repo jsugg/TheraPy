@@ -158,6 +158,26 @@ function sendSpeakerOverride() {
   channel.send(JSON.stringify({ type: "voice_replies", enabled: speakerOverride }));
 }
 
+async function iceServers() {
+  // TURN relay for paths where host candidates can't reach the pipeline
+  // (phone over Tailscale). The page's own hostname reaches the relay on
+  // every network the PWA is served from; failure just means no relay
+  // fallback, so direct paths still connect.
+  try {
+    const cfg = await (await fetch("/api/ice-config")).json();
+    return [{
+      urls: [
+        `turn:${location.hostname}:${cfg.port}?transport=udp`,
+        `turn:${location.hostname}:${cfg.port}?transport=tcp`,
+      ],
+      username: cfg.username,
+      credential: cfg.credential,
+    }];
+  } catch {
+    return [];
+  }
+}
+
 async function connect() {
   setStatus("connecting…");
   const media = await navigator.mediaDevices.getUserMedia({
@@ -165,7 +185,7 @@ async function connect() {
   });
   micTrack = media.getAudioTracks()[0];
 
-  pc = new RTCPeerConnection();
+  pc = new RTCPeerConnection({ iceServers: await iceServers() });
   pc.addTrack(micTrack, media);
   pc.addTransceiver("audio", { direction: "recvonly" });
 

@@ -16,4 +16,6 @@ COPY . .
 RUN uv sync --frozen --no-dev
 
 EXPOSE 8000
-CMD ["uv", "run", "--no-dev", "uvicorn", "therapy.server.app:app", "--host", "0.0.0.0", "--port", "8000"]
+# The watchdog supervises uvicorn: restarts it on crash AND on a hung event
+# loop (health probe failures) — docker restart policies only cover exits.
+CMD ["uv", "run", "--no-dev", "python", "scripts/watchdog.py"]
