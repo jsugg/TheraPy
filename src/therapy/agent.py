@@ -31,6 +31,12 @@ Reply language (SPEC §7): per turn, `ReplyLanguage` picks the reply
 language — word-level dominant language of the phrase in auto mode, or the
 user's pin sent as a `reply_language` data-channel override (`null` = auto).
 The pin constrains replies and TTS voice only; STT stays auto.
+
+Memory (SPEC §8): each connection is one session in the local store — every
+turn is recorded (language, modality, timestamps), raw utterance audio is
+archived on the host, and new sessions open with prior summaries plus the
+user model in context (older history never verbatim). On disconnect the
+session is summarized and distilled in the background.
 """
 
 import asyncio
@@ -74,9 +80,12 @@ from therapy.dialogue.language_choice import ReplyLanguage, dominant_language
 from therapy.dialogue.modality import TEXT, VOICE, ReplyModality
 from therapy.dialogue.policy import (
     build_system_prompt,
+    continuity_note,
     language_pin_note,
     language_switch_note,
 )
+from therapy.memory import MemoryStore, make_summarizer
+from therapy.memory.distill import distill_facts
 from therapy.perception.stt import (
     DEFAULT_LANGUAGE,
     clamp_language,
@@ -106,12 +115,15 @@ class MultilingualWhisperSTTService(WhisperSTTService):
     TranscriptionFrame for downstream voice switching.
     """
 
-    def __init__(self, **kwargs: Any) -> None:
+    def __init__(self, recorder: Any = None, **kwargs: Any) -> None:
         super().__init__(
             settings=WhisperSTTSettings(model=whisper_model(), language=Language.EN),
             **kwargs,
         )
         self.current_language: str = DEFAULT_LANGUAGE
+        # (audio, text, language) → persisted user turn; this is the one spot
+        # where the raw utterance and its transcript exist together (SPEC §8).
+        self._recorder = recorder
 
     async def run_stt(self, audio: bytes):
         if not self._model:
@@ -135,6 +147,8 @@ class MultilingualWhisperSTTService(WhisperSTTService):
 
         if text:
             logger.debug(f"Transcription [{language}]: {text}")
+            if self._recorder:
+                await asyncio.to_thread(self._recorder, audio, text, language)
             yield TranscriptionFrame(
                 text=text,
                 user_id=self._user_id,
@@ -188,6 +202,16 @@ class TurnRelay(FrameProcessor):
             )
             reply = self._reply_language.note_phrase(frame.text)
             await self._maybe_switch(reply)
+            if self._reply_language.pinned and language != reply:
+                # Re-assert the pin right after the mismatched user message —
+                # small local models otherwise mirror the user's language.
+                await self.push_frame(
+                    LLMMessagesAppendFrame(
+                        messages=[
+                            {"role": "system", "content": language_pin_note(reply)}
+                        ]
+                    )
+                )
             # Spoken turn → spoken reply unless the user overrode the speaker.
             speak = self._modality.note_turn(VOICE)
             await self.push_frame(LLMConfigureOutputFrame(skip_tts=not speak))
@@ -206,12 +230,13 @@ class TurnRelay(FrameProcessor):
 
 
 class BotTextRelay(FrameProcessor):
-    """Accumulates the LLM reply and ships the full text to the client."""
+    """Accumulates the LLM reply; ships the full text to client and store."""
 
-    def __init__(self, get_language) -> None:
+    def __init__(self, get_language, recorder: Any = None) -> None:
         super().__init__()
         self._parts: list[str] = []
         self._get_language = get_language
+        self._recorder = recorder
 
     async def process_frame(self, frame: Frame, direction: FrameDirection) -> None:
         await super().process_frame(frame, direction)
@@ -222,6 +247,8 @@ class BotTextRelay(FrameProcessor):
                 text = "".join(self._parts).strip()
                 self._parts = []
                 if text:
+                    if self._recorder:
+                        await asyncio.to_thread(self._recorder, text)
                     await self.push_frame(
                         OutputTransportMessageUrgentFrame(
                             message={
@@ -332,9 +359,27 @@ async def run_bot(webrtc_connection: Any) -> None:
     # without this processor no speech is ever detected.
     vad = VADProcessor(vad_analyzer=SileroVADAnalyzer(params=VADParams(stop_secs=0.7)))
 
-    stt = MultilingualWhisperSTTService()
+    store = MemoryStore()
+    session_id = store.create_session()
+
     modality = ReplyModality()
     reply_language = ReplyLanguage(initial=DEFAULT_LANGUAGE)
+
+    def record_user_voice(audio: bytes, text: str, language: str) -> None:
+        store.add_turn(
+            session_id, "user", VOICE, language, text, audio=audio, sample_rate=16_000
+        )
+
+    def record_assistant(text: str) -> None:
+        store.add_turn(
+            session_id,
+            "assistant",
+            VOICE if modality.speak else TEXT,
+            reply_language.language,
+            text,
+        )
+
+    stt = MultilingualWhisperSTTService(recorder=record_user_voice)
     turn_relay = TurnRelay(modality, reply_language)
     tts = KokoroTTSService(
         settings=KokoroTTSSettings(
@@ -344,9 +389,13 @@ async def run_bot(webrtc_connection: Any) -> None:
     )
     llm = make_llm_service()
 
-    context = LLMContext(
-        messages=[{"role": "system", "content": build_system_prompt()}]
-    )
+    # Continuity (SPEC §8): the current conversation goes verbatim; the past
+    # arrives only as distilled summaries + the user model.
+    messages = [{"role": "system", "content": build_system_prompt()}]
+    memory_note = continuity_note(store.recent_summaries(), store.facts())
+    if memory_note:
+        messages.append({"role": "system", "content": memory_note})
+    context = LLMContext(messages=messages)
     aggregators = LLMContextAggregatorPair(context)
 
     stages: list[FrameProcessor] = [transport.input()]
@@ -360,7 +409,10 @@ async def run_bot(webrtc_connection: Any) -> None:
             turn_relay,
             aggregators.user(),
             llm,
-            BotTextRelay(get_language=lambda: reply_language.language),
+            BotTextRelay(
+                get_language=lambda: reply_language.language,
+                recorder=record_assistant,
+            ),
             tts,
             TTFAMonitor(),
             transport.output(),
@@ -440,8 +492,16 @@ async def run_bot(webrtc_connection: Any) -> None:
                     messages=[{"role": "system", "content": language_switch_note(reply)}]
                 )
             )
+        elif reply_language.pinned and language != reply:
+            # Same pin re-assertion as voice turns (TurnRelay).
+            frames.append(
+                LLMMessagesAppendFrame(
+                    messages=[{"role": "system", "content": language_pin_note(reply)}]
+                )
+            )
         stt.current_language = language
         turn_relay.note_language(reply)
+        await asyncio.to_thread(store.add_turn, session_id, "user", TEXT, language, text)
         # Typed turn → silent reply unless the user overrode the speaker.
         speak = modality.note_turn(TEXT)
         frames.append(LLMConfigureOutputFrame(skip_tts=not speak))
@@ -454,8 +514,28 @@ async def run_bot(webrtc_connection: Any) -> None:
         # transport's event task directly.
         await task.queue_frames(frames)
 
+    async def finalize_session() -> None:
+        """Summarize, distill, and close the session (SPEC §8) off the pipeline path."""
+        turns = await asyncio.to_thread(store.session_turns, session_id)
+        summary: str | None = None
+        facts: list[str] = []
+        if turns:
+            try:
+                summary = (await make_summarizer().summarize(turns)).strip() or None
+                facts = await distill_facts(turns)
+            except Exception as exc:  # LLM down ≠ lost session; keep the turns.
+                logger.warning(f"Session distillation failed for {session_id}: {exc}")
+        for statement in facts:
+            await asyncio.to_thread(store.upsert_fact, statement)
+        await asyncio.to_thread(store.end_session, session_id, summary)
+        logger.info(
+            f"Session {session_id} closed "
+            f"({len(turns)} turns, summary={bool(summary)}, facts={len(facts)})"
+        )
+
     @transport.event_handler("on_client_disconnected")
     async def on_client_disconnected(transport: Any, connection: Any) -> None:
+        asyncio.create_task(finalize_session())
         await task.cancel()
 
     runner = PipelineRunner(handle_sigint=False)

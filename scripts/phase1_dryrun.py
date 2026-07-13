@@ -5,10 +5,18 @@ continuous conversation against a running TheraPy server:
 
 1. speaks one utterance in each of es/en/pt over the SAME connection,
    checking per-utterance language detection and voice switching;
-2. sends a typed turn and verifies the reply is silent server-side
+2. reply-language auto mode (SPEC §7): a code-switched phrase whose
+   minority-language words must NOT flip the reply language, then a phrase
+   whose dominance flips mid-phrase and MUST flip it (the two normative
+   SPEC §7 examples, spoken — the flip phrase is stitched from a Spanish
+   voice and an English voice into one utterance);
+3. sends a typed turn and verifies the reply is silent server-side
    (modality mirroring — no TTS audio should arrive);
-3. speaks again while the assistant reply is still playing (barge-in) and
-   checks the reply audio stops.
+4. speaks again while the assistant reply is still playing (barge-in) and
+   checks the reply audio stops;
+5. pinned mode (SPEC §7): pins replies to pt over the data channel, speaks
+   Spanish, and checks the transcript stays es (STT auto) while the reply
+   comes back pt; unpins and checks auto resumes.
 
 Per spoken turn it reports client-side TTFA (end of user speech → first
 voiced audio frame); the server logs its own TTFA per turn (risk R1).
@@ -53,6 +61,16 @@ UTTERANCES = [
 ]
 TYPED_TURN = "¿Puedes resumir en una frase lo que te conté hoy?"
 BARGE_IN = ("en", "am_adam", "en-us", "Sorry to interrupt, can you keep it shorter please?")
+
+# SPEC §7 normative reply-language phrases, spoken (segments are stitched
+# into ONE utterance; each segment uses the voice of its own language).
+CODE_SWITCH_KEEP = [("em_alex", "es", "Todo bien, me estoy sintiendo ok.")]
+CODE_SWITCH_FLIP = [
+    ("em_alex", "es", "Sí, todo bien…"),
+    ("am_adam", "en-us", "though… no… actually things have been hard lately."),
+]
+PIN_UTTERANCE = ("em_alex", "es", "Hoy me costó mucho concentrarme en la oficina.")
+UNPIN_UTTERANCE = ("em_alex", "es", "Gracias, sigamos en español entonces.")
 
 
 class UserAudioTrack(MediaStreamTrack):
@@ -160,6 +178,27 @@ def synthesize(kokoro: Kokoro, text: str, voice: str, lang: str) -> np.ndarray:
     return (np.clip(resampled, -1, 1) * 32767).astype(np.int16)
 
 
+def _trim_silence(samples: np.ndarray, threshold: int = 300) -> np.ndarray:
+    voiced = np.where(np.abs(samples) > threshold)[0]
+    return samples if voiced.size == 0 else samples[voiced[0] : voiced[-1] + 1]
+
+
+def synthesize_segments(kokoro: Kokoro, segments: list[tuple[str, str, str]]) -> np.ndarray:
+    """One code-switched utterance from per-language segments.
+
+    Trailing synthesis silence is trimmed and segments are joined with a
+    150 ms gap — well under the server's 0.7 s VAD stop, so the whole
+    phrase lands as a single turn.
+    """
+    gap = np.zeros(int(0.15 * RATE), dtype=np.int16)
+    parts: list[np.ndarray] = []
+    for voice, lang, text in segments:
+        if parts:
+            parts.append(gap)
+        parts.append(_trim_silence(synthesize(kokoro, text, voice, lang)))
+    return np.concatenate(parts)
+
+
 async def wait_speech_end(mic: UserAudioTrack) -> float:
     while mic.speaking or mic.speech_ended_at is None:
         await asyncio.sleep(0.05)
@@ -167,8 +206,22 @@ async def wait_speech_end(mic: UserAudioTrack) -> float:
 
 
 async def spoken_turn(
-    label: str, audio: np.ndarray, mic: UserAudioTrack, obs: Observations, results: list[str]
+    label: str,
+    audio: np.ndarray,
+    mic: UserAudioTrack,
+    obs: Observations,
+    results: list[str],
+    *,
+    expect_user: str | None = None,
+    expect_reply: str | None = None,
 ) -> None:
+    """One spoken turn: feed audio, await transcripts, check languages + TTFA.
+
+    `expect_user` checks STT's detected language; `expect_reply` checks the
+    server's chosen reply language (SPEC §7). Either may be None to skip —
+    e.g. Whisper's whole-utterance label is unspecified for a code-switched
+    phrase, where only the reply language is normative.
+    """
     seen = len(obs.transcripts)
     mic.feed(audio)
     ended = await wait_speech_end(mic)
@@ -183,10 +236,18 @@ async def spoken_turn(
         await asyncio.sleep(0.1)
 
     ttfa = f"{first_audio - ended:.2f}s" if first_audio else "NO AUDIO"
-    detected = user_msg.get("language")
-    lang_ok = "ok" if detected == label else f"MISMATCH ({detected})"
+    checks = []
+    if expect_user:
+        detected = user_msg.get("language")
+        checks.append("stt: ok" if detected == expect_user else f"stt: MISMATCH ({detected})")
+    if expect_reply:
+        reply_lang = bot_msg.get("language")
+        checks.append(
+            f"reply-lang: ok ({reply_lang})" if reply_lang == expect_reply
+            else f"reply-lang: MISMATCH (want {expect_reply}, got {reply_lang})"
+        )
     results.append(
-        f"[{label}] language: {lang_ok} | client TTFA (incl. 0.7s VAD close): {ttfa}\n"
+        f"[{label}] {' | '.join(checks)} | client TTFA (incl. 0.7s VAD close): {ttfa}\n"
         f"     heard: {user_msg.get('text', '')!r}\n"
         f"     reply: {bot_msg.get('text', '')[:120]!r}"
     )
@@ -226,7 +287,9 @@ async def main() -> None:
         answer = response.json()
     await pc.setRemoteDescription(RTCSessionDescription(sdp=answer["sdp"], type=answer["type"]))
 
-    for _ in range(200):
+    # Generous window: on a cold server the first connection also pays
+    # whisper/kokoro model loading before the handshake completes.
+    for _ in range(1200):
         if channel.readyState == "open":
             break
         await asyncio.sleep(0.05)
@@ -236,7 +299,10 @@ async def main() -> None:
 
     # 1. One spoken turn per language, same connection (language switching).
     for label, voice, lang, text in UTTERANCES:
-        await spoken_turn(label, synthesize(kokoro, text, voice, lang), mic, obs, results)
+        await spoken_turn(
+            label, synthesize(kokoro, text, voice, lang), mic, obs, results,
+            expect_user=label, expect_reply=label,
+        )
         print(results[-1], flush=True)
         await asyncio.sleep(1.0)
 
@@ -269,6 +335,7 @@ async def main() -> None:
     if not obs.first_voiced_after(ended):
         results.append("[barge-in] SKIPPED — voice turn after typed turn produced no audio (mirroring broken?)")
     else:
+        seen_interrupt = len(obs.transcripts)
         mic.feed(synthesize(kokoro, text, voice, lang))
         await wait_speech_end(mic)
         await asyncio.sleep(2.5)
@@ -278,6 +345,61 @@ async def main() -> None:
             "[barge-in] reply audio stopped after interruption ✓" if stopped
             else f"[barge-in] audio still playing {time.monotonic() - last:.1f}s ago — check allow_interruptions"
         )
+        # Drain the interruption's own turn — its transcript and reply arrive
+        # late and must not bleed into the next scenario's assertions.
+        await obs.wait_transcript("user", seen_interrupt)
+        await obs.wait_transcript("assistant", seen_interrupt)
+        while (last := obs.last_voiced()) and time.monotonic() - last < 3.0:
+            await asyncio.sleep(0.2)
+    print(results[-1], flush=True)
+
+    # 4. Reply-language auto mode (SPEC §7 normative examples, spoken).
+    #    Re-anchor in Spanish first, so the code-switched phrase tests
+    #    "minority words don't flip" rather than a plain dominance switch.
+    print("Reply-language scenarios…", flush=True)
+    await asyncio.sleep(1.0)
+    await spoken_turn(
+        "anchor-es",
+        synthesize(kokoro, "Bueno, volvamos al español un momento.", "em_alex", "es"),
+        mic, obs, results, expect_user="es", expect_reply="es",
+    )
+    print(results[-1], flush=True)
+    await asyncio.sleep(1.0)
+    # (a) es-dominant phrase with a lone English word — must NOT flip.
+    await spoken_turn(
+        "code-switch-keep", synthesize_segments(kokoro, CODE_SWITCH_KEEP),
+        mic, obs, results, expect_user="es", expect_reply="es",
+    )
+    print(results[-1], flush=True)
+    await asyncio.sleep(1.0)
+    # (b) dominance flips to English mid-phrase — reply MUST flip. Whisper's
+    # whole-utterance label is unspecified for a mixed phrase; only the
+    # reply language is asserted.
+    await spoken_turn(
+        "code-switch-flip", synthesize_segments(kokoro, CODE_SWITCH_FLIP),
+        mic, obs, results, expect_reply="en",
+    )
+    print(results[-1], flush=True)
+
+    # 5. Pinned mode (SPEC §7): replies come back in the pinned language
+    #    while STT keeps auto-detecting; unpin restores auto.
+    await asyncio.sleep(1.0)
+    channel.send(json.dumps({"type": "reply_language", "language": "pt"}))
+    await asyncio.sleep(1.0)  # let the override land before the next turn
+    voice, lang, text = PIN_UTTERANCE
+    await spoken_turn(
+        "pinned-pt", synthesize(kokoro, text, voice, lang),
+        mic, obs, results, expect_user="es", expect_reply="pt",
+    )
+    print(results[-1], flush=True)
+    await asyncio.sleep(1.0)
+    channel.send(json.dumps({"type": "reply_language", "language": None}))
+    await asyncio.sleep(1.0)
+    voice, lang, text = UNPIN_UTTERANCE
+    await spoken_turn(
+        "unpinned-auto", synthesize(kokoro, text, voice, lang),
+        mic, obs, results, expect_user="es", expect_reply="es",
+    )
     print(results[-1], flush=True)
 
     print("\n=== Phase-1 dry run summary ===")
@@ -286,6 +408,12 @@ async def main() -> None:
     print("\nServer-side TTFA lines: docker compose logs therapy | grep TTFA")
 
     await pc.close()
+
+    bad = ("MISMATCH", "NO AUDIO", "LEAKED", "SKIPPED", "still playing")
+    failures = [line for line in results if any(marker in line for marker in bad)]
+    if failures:
+        sys.exit(f"\nFAIL — {len(failures)} scenario(s) not green.")
+    print("\nPASS — all scenarios green.")
 
 
 if __name__ == "__main__":

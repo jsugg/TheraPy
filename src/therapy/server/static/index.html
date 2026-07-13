@@ -13,8 +13,19 @@
 <body>
   <header>
     <h1>TheraPy</h1>
-    <span id="status" data-state="idle">offline</span>
+    <div id="header-controls">
+      <span id="status" data-state="idle">offline</span>
+      <button id="history" class="toggle" aria-pressed="false" title="History">📖</button>
+    </div>
   </header>
+
+  <section id="history-view" hidden>
+    <div id="session-list"></div>
+    <div id="session-detail" hidden>
+      <button id="history-back">← Sessions</button>
+      <div id="session-turns"></div>
+    </div>
+  </section>
 
   <main id="chat" aria-live="polite"></main>
 
