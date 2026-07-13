@@ -1,18 +1,11 @@
 """Reliability regressions: TURN config, connection preemption, compose wiring."""
 
 import asyncio
-from pathlib import Path
 
-from fastapi.testclient import TestClient
-
-from therapy.server.app import app, launch_bot
-
-client = TestClient(app)
-COMPOSE = (Path(__file__).parents[1] / "compose.yaml").read_text()
-DOCKERFILE = (Path(__file__).parents[1] / "Dockerfile").read_text()
+from therapy.server.app import launch_bot
 
 
-def test_ice_config_defaults() -> None:
+def test_ice_config_defaults(client) -> None:
     response = client.get("/api/ice-config")
     assert response.status_code == 200
     config = response.json()
@@ -21,7 +14,7 @@ def test_ice_config_defaults() -> None:
     assert config["port"] == 3478
 
 
-def test_ice_config_env_override(monkeypatch) -> None:
+def test_ice_config_env_override(client, monkeypatch) -> None:
     monkeypatch.setenv("THERAPY_TURN_PASSWORD", "s3cret")
     monkeypatch.setenv("THERAPY_TURN_PORT", "3479")
     config = client.get("/api/ice-config").json()
@@ -50,24 +43,26 @@ def test_new_connection_preempts_previous_pipeline() -> None:
     assert second_alive_then_cancelled
 
 
-def test_compose_declares_reliability_and_turn() -> None:
+def test_compose_declares_reliability_and_turn(repo_root) -> None:
+    compose = (repo_root / "compose.yaml").read_text()
     # Restart policies + healthcheck keep the stack self-recovering.
-    assert COMPOSE.count("restart: unless-stopped") == 2
-    assert "healthcheck" in COMPOSE and "/health" in COMPOSE
-    assert "stop_grace_period" in COMPOSE
+    assert compose.count("restart: unless-stopped") == 2
+    assert "healthcheck" in compose
+    assert "/health" in compose
+    assert "stop_grace_period" in compose
     # TURN relay for clients that can't reach container host candidates.
-    assert "coturn" in COMPOSE
-    assert "3478:3478/udp" in COMPOSE
-    assert "--lt-cred-mech" in COMPOSE
+    assert "coturn" in compose
+    assert "3478:3478/udp" in compose
+    assert "--lt-cred-mech" in compose
 
 
-def test_compose_caps_memory_per_service() -> None:
+def test_compose_caps_memory_per_service(repo_root) -> None:
     # Uncapped containers exhaust the Docker VM under load; a wedged VM
     # hangs the docker CLI and every port-forward (hypervisor stall,
     # observed 2026-07-10). Caps convert that into a container OOM-kill
     # that the restart policy recovers from. One cap per service.
-    assert COMPOSE.count("mem_limit:") == 2
+    assert (repo_root / "compose.yaml").read_text().count("mem_limit:") == 2
 
 
-def test_dockerfile_runs_watchdog() -> None:
-    assert "watchdog.py" in DOCKERFILE
+def test_dockerfile_runs_watchdog(repo_root) -> None:
+    assert "watchdog.py" in (repo_root / "Dockerfile").read_text()

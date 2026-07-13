@@ -1,25 +1,8 @@
 import sys
-from pathlib import Path
+import threading
+import time
 
-sys.path.insert(0, str(Path(__file__).parents[1]))
-
-from scripts.hostwatch import StackWatch, probe, run  # noqa: E402
-
-import socket  # noqa: E402
-import threading  # noqa: E402
-import time  # noqa: E402
-from collections.abc import Callable  # noqa: E402
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer  # noqa: E402
-
-
-class _OkHandler(BaseHTTPRequestHandler):
-    def do_GET(self) -> None:
-        self.send_response(200)
-        self.end_headers()
-        self.wfile.write(b"ok")
-
-    def log_message(self, _format: str, *_args: object) -> None:
-        return
+from scripts.hostwatch import StackWatch, probe, run
 
 
 class _StopAfterRecoverWatch(StackWatch):
@@ -31,36 +14,12 @@ class _StopAfterRecoverWatch(StackWatch):
         return "container"
 
 
-def _wait_until(predicate: Callable[[], bool], timeout: float = 3.0) -> None:
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        if predicate():
-            return
-        time.sleep(0.02)
-    raise AssertionError("condition was not met before timeout")
+def test_probe_returns_true_for_local_http_200(ok_server) -> None:
+    assert probe(f"{ok_server}/health", timeout=1.0) is True
 
 
-def _free_port() -> int:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        sock.bind(("127.0.0.1", 0))
-        return int(sock.getsockname()[1])
-
-
-def test_probe_returns_true_for_local_http_200() -> None:
-    server = ThreadingHTTPServer(("127.0.0.1", 0), _OkHandler)
-    port = int(server.server_address[1])
-    thread = threading.Thread(target=server.serve_forever)
-    thread.start()
-    try:
-        assert probe(f"http://127.0.0.1:{port}/health", timeout=1.0) is True
-    finally:
-        server.shutdown()
-        server.server_close()
-        thread.join(timeout=1.0)
-
-
-def test_probe_returns_false_for_closed_port() -> None:
-    port = _free_port()
+def test_probe_returns_false_for_closed_port(free_port) -> None:
+    port = free_port()
 
     assert probe(f"http://127.0.0.1:{port}/health", timeout=0.2) is False
 
@@ -152,7 +111,7 @@ def test_recover_restarts_provider_when_daemon_is_wedged() -> None:
     ]
 
 
-def test_watch_forever_recovers_after_max_failures() -> None:
+def test_watch_forever_recovers_after_max_failures(wait_until) -> None:
     probe_count = 0
 
     def fake_prober(_url: str, _timeout: float) -> bool:
@@ -184,7 +143,7 @@ def test_watch_forever_recovers_after_max_failures() -> None:
     thread = threading.Thread(target=watcher.watch_forever)
     thread.start()
     try:
-        _wait_until(lambda: bool(watcher.recoveries), timeout=1.0)
+        wait_until(lambda: bool(watcher.recoveries), timeout=1.0)
     finally:
         watcher.request_stop()
         thread.join(timeout=1.0)

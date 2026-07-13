@@ -9,15 +9,15 @@ callbacks do not share connections across threads.
 
 from __future__ import annotations
 
-from collections.abc import Iterator
-from contextlib import contextmanager
-from datetime import UTC, datetime
 import os
-from pathlib import Path
 import shutil
 import sqlite3
 import uuid
 import wave
+from collections.abc import Iterator
+from contextlib import contextmanager
+from datetime import UTC, datetime
+from pathlib import Path
 
 JsonScalar = str | int | None
 RowDict = dict[str, JsonScalar]

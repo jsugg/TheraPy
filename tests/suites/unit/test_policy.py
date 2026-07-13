@@ -37,7 +37,8 @@ def test_prompt_covers_trilingual_and_boundaries() -> None:
     for term in ("Spanish", "English", "Portuguese"):
         assert term in prompt
     assert "never diagnose" in prompt
-    assert "validate" in prompt.lower() and "challenge" in prompt.lower()
+    assert "validate" in prompt.lower()
+    assert "challenge" in prompt.lower()
 
 
 def test_crisis_resources_env_override(monkeypatch) -> None:
@@ -81,5 +82,6 @@ def test_continuity_note_renders_summaries_and_facts() -> None:
         [{"statement": "Has a dog named Bruno."}],
     )
     assert note is not None
-    assert "2026-07-09" in note and "Talked about work." in note
+    assert "2026-07-09" in note
+    assert "Talked about work." in note
     assert "Has a dog named Bruno." in note

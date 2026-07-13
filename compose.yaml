@@ -19,6 +19,15 @@ services:
       - therapy-data:/data
       # Model weights (whisper, kokoro, silero) — survive rebuilds.
       - model-cache:/root/.cache
+      # Live dev mounts — source (incl. PWA static) and tests, read-only over the
+      # baked copies. UI/code/test edits are picked up without an image rebuild:
+      # a browser reload serves fresh static, pytest reads current code + tests,
+      # and the server picks up Python edits on its next restart (`make restart`).
+      # `therapy` is an editable install at /app/src, and the venv lives at
+      # /app/.venv (NOT under these paths, so it is never shadowed). A rebuild is
+      # only needed when dependencies change.
+      - ./src:/app/src:ro
+      - ./tests:/app/tests:ro
     # Liveness beyond process-liveness: a wedged event loop still has a live
     # PID but stops answering /health. The in-container watchdog (Dockerfile
     # CMD) restarts uvicorn on hang; this healthcheck surfaces the state to
