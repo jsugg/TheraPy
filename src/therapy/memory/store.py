@@ -284,6 +284,29 @@ class MemoryStore:
 
         return turn_id
 
+    def turn_audio_path(self, session_id: str, turn_id: int) -> Path | None:
+        """Absolute path to a turn's archived WAV, or None.
+
+        The path is resolved from the turn's own stored (relative)
+        `audio_path` — the caller supplies only ids, never a path, so the
+        review UI cannot request a file outside the archive. Returns None
+        when the turn is not in this session, has no audio, or the file is
+        gone; the resolved path is confirmed to sit under the audio archive
+        as defense in depth.
+        """
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT audio_path FROM turns WHERE id = ? AND session_id = ?",
+                (turn_id, session_id),
+            ).fetchone()
+        if row is None or not row["audio_path"]:
+            return None
+        archive_root = self._audio_dir.resolve()
+        path = (self.data_dir / str(row["audio_path"])).resolve()
+        if not path.is_relative_to(archive_root) or not path.is_file():
+            return None
+        return path
+
     def sessions(self) -> list[RowDict]:
         """Return all sessions, newest first by start time."""
         with self._connect() as connection:
