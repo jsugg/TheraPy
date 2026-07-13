@@ -2,7 +2,7 @@
  * conversation (WebRTC, /api/*) is never cached. Shell fetches carry a
  * timeout: a hung server (wedged Docker VM) must degrade to the cached
  * shell in seconds, not spin forever. */
-const CACHE = "therapy-shell-v11";
+const CACHE = "therapy-shell-v12";
 const SHELL = [
   "/", "/styles.css", "/app.js", "/companion.js", "/manifest.webmanifest",
   "/icon.svg", "/icon-192.png", "/icon-512.png",

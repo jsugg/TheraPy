@@ -362,6 +362,11 @@ body {
 }
 
 .composer {
+  /* Frozen to the bottom, mirroring the sticky header — the footer must never
+     scroll away when the shell scrolls (or the mobile keyboard opens). */
+  position: sticky;
+  bottom: 0;
+  z-index: 10;
   padding: 0.75rem max(1rem, env(safe-area-inset-right)) calc(0.75rem + env(safe-area-inset-bottom)) max(1rem, env(safe-area-inset-left));
   border-top: 1px solid var(--border);
   background:
@@ -498,6 +503,15 @@ input::placeholder { color: var(--muted); }
   background: var(--accent);
   color: #fff;
   font-weight: 850;
+  /* Press-and-hold: the browser must not claim a slight finger drift as a
+     scroll/pan gesture — that would fire pointercancel and cut the hold short
+     (mic mutes mid-sentence). `none` keeps the pointer with the button for the
+     whole hold. Also suppress long-press text selection / callout on mobile. */
+  touch-action: none;
+  user-select: none;
+  -webkit-user-select: none;
+  -webkit-touch-callout: none;
+  -webkit-tap-highlight-color: transparent;
 }
 
 .hold-button.is-holding {

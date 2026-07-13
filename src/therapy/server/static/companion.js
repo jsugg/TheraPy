@@ -42,6 +42,7 @@ New companion ids: #avatar, #presence, #presence-label, #presence-dot,
     micOff: false, // local mic mute — client-owned, wins over server presence
     micMode: "open",
     holding: false,
+    holdSource: null, // which input started the hold (so only IT can end it)
     focusReturn: null, // element to restore focus to when focus mode closes
     schemeQuery: null,
     playbackAudio: null,
@@ -458,25 +459,66 @@ New companion ids: #avatar, #presence, #presence-label, #presence-dot,
     const talk = byId("talk");
     if (!talk) return;
 
-    talk.addEventListener("pointerdown", (event) => {
-      if (typeof talk.setPointerCapture === "function") {
-        talk.setPointerCapture(event.pointerId);
-      }
+    // Suppress the mobile long-press menu (Copy / Select all / Share). Without
+    // this, pressing and holding to talk pops the text-selection callout, which
+    // cancels the touch — firing pointercancel → endHold, so "listening" stops
+    // the instant the menu appears. CSS user-select/-webkit-touch-callout cover
+    // iOS; Android Chrome also needs the contextmenu event cancelled.
+    talk.addEventListener("contextmenu", (event) => event.preventDefault());
+    talk.addEventListener("selectstart", (event) => event.preventDefault());
+
+    // Only the input that STARTED the hold may end it. Without this, a second
+    // finger's release (or a stray keyup) would prematurely cut an in-progress
+    // hold — reachable on a touchscreen with two contacts. Pointer and Touch
+    // events are mutually exclusive here so a single tap can't self-cancel.
+    const start = (source, event) => {
+      if (state.holdSource !== null) return;
       beginHold(event);
-    });
-    talk.addEventListener("pointerup", endHold);
-    talk.addEventListener("pointercancel", endHold);
-    talk.addEventListener("pointerleave", endHold);
-    talk.addEventListener("touchstart", beginHold, { passive: false });
-    talk.addEventListener("touchend", endHold);
-    talk.addEventListener("touchcancel", endHold);
+      state.holdSource = state.holding ? source : null;
+    };
+    const finish = (source, event) => {
+      if (state.holdSource === source) endHold(event);
+    };
+
+    if ("PointerEvent" in window) {
+      const finishPointer = (event) => finish(`pointer:${event.pointerId}`, event);
+      talk.addEventListener("pointerdown", (event) => {
+        if (!event.isPrimary || event.button !== 0) return; // primary contact only
+        start(`pointer:${event.pointerId}`, event);
+        if (state.holding && typeof talk.setPointerCapture === "function") {
+          // Can throw if the pointer is no longer active — never break the hold.
+          try { talk.setPointerCapture(event.pointerId); } catch { /* ignore */ }
+        }
+      });
+      talk.addEventListener("pointerup", finishPointer);
+      talk.addEventListener("pointercancel", finishPointer);
+      talk.addEventListener("pointerleave", finishPointer);
+      talk.addEventListener("lostpointercapture", finishPointer);
+    } else {
+      talk.addEventListener("touchstart", (event) => {
+        const touch = event.changedTouches[0];
+        if (touch) start(`touch:${touch.identifier}`, event);
+      }, { passive: false });
+      const finishTouch = (event) => {
+        for (const touch of event.changedTouches) finish(`touch:${touch.identifier}`, event);
+      };
+      talk.addEventListener("touchend", finishTouch);
+      talk.addEventListener("touchcancel", finishTouch);
+    }
+
     talk.addEventListener("keydown", (event) => {
-      if ((event.key === " " || event.key === "Enter") && !event.repeat) beginHold(event);
+      if ((event.key === " " || event.key === "Enter") && !event.repeat) {
+        start(`key:${event.key}`, event);
+      }
     });
     talk.addEventListener("keyup", (event) => {
-      if (event.key === " " || event.key === "Enter") endHold(event);
+      if (event.key === " " || event.key === "Enter") finish(`key:${event.key}`, event);
     });
+    // Fail safe: never leave the mic hot if focus or the tab is lost mid-hold.
     window.addEventListener("blur", endHold);
+    document.addEventListener("visibilitychange", () => {
+      if (document.hidden) endHold();
+    });
   }
 
   function setMicMode(mode, notify) {
@@ -514,6 +556,7 @@ New companion ids: #avatar, #presence, #presence-label, #presence-dot,
   }
 
   function endHold(event) {
+    state.holdSource = null;
     if (!state.holding) return;
     if (event?.cancelable) event.preventDefault();
     state.holding = false;
