@@ -74,3 +74,31 @@ but you never bring up a topic they have asked you not to raise.
 def build_system_prompt() -> str:
     """Render the system prompt with runtime configuration."""
     return _SYSTEM_PROMPT_TEMPLATE.format(crisis_resources=crisis_resources())
+
+
+_LANGUAGE_NAMES = {"en": "English", "es": "Spanish", "pt": "Portuguese"}
+
+
+def language_switch_note(language: str) -> str:
+    """Per-switch reply-language reminder, appended to the LLM context.
+
+    The standing instruction in the system prompt is enough for large
+    models, but small local ones keep replying in the conversation's
+    dominant language after the user switches; an explicit note at the
+    switch point fixes adherence at negligible context cost.
+    """
+    name = _LANGUAGE_NAMES.get(language, language)
+    return f"The user is now speaking {name}. Reply entirely in {name} until they switch again."
+
+
+def language_pin_note(language: str) -> str:
+    """Reply-language pin instruction (SPEC §7: pinned mode).
+
+    The pin constrains replies only — the user may keep speaking any
+    language, so the note must override the standing follow-the-user rule.
+    """
+    name = _LANGUAGE_NAMES.get(language, language)
+    return (
+        f"The user asked you to reply only in {name} from now on, regardless of "
+        f"which language they speak or type. Reply entirely in {name} until told otherwise."
+    )

@@ -9,6 +9,7 @@ __pycache__/
 # Environment / secrets
 .env
 .env.*
+!.env.example
 
 # Data — personal audio, transcripts, user model. Never committed.
 data/
@@ -22,3 +23,8 @@ data/
 .DS_Store
 .idea/
 .vscode/
+*.swp
+
+# Tooling state
+.serena/
+.local/

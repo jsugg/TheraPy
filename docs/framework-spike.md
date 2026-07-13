@@ -1,7 +1,7 @@
 # Phase-0 spike: Pipecat vs. LiveKit Agents
 
 **Verdict: Pipecat with `SmallWebRTCTransport`.**
-Date: 2026-07-09 · Status: decided (research spike; phase 1 validates in code)
+Date: 2026-07-09 · Status: decided — phase 1 is built on it (`agent.py`, PWA client); working voice+text loop confirms the choice in code
 
 ## Evaluation criteria (from SPEC)
 

@@ -1,6 +1,6 @@
 # TheraPy — Project Specification
 
-**Status:** Draft v0.5 — strategic decisions settled
+**Status:** v0.6 — phase 0 complete, phase 1 implemented (acceptance pending)
 **Owner:** Juan Pedro Sugg
 **Date:** 2026-07-09
 **Supersedes:** the 2024 `TheraPy` prototype (to be archived; no code carried over)
@@ -28,7 +28,7 @@ The differentiator is the **longitudinal loop**: every conversation produces bot
 - **v1 is single-user, for the owner (dogfooding).** No accounts, onboarding, or multi-tenancy.
 - Designed with autistic adults in mind (explicit communication, predictability, no small-talk pressure), but generalization to other users is explicitly **out of scope for v1**.
 - **Trilingual from day one: Spanish, English, Portuguese.** The user may code-switch; the assistant detects the utterance language and responds in kind.
-- **Access: web + mobile (PWA), voice and text as equal citizens.** One conversation can mix modalities — speak, then type, then speak — and continue across devices. Voice runs over WebRTC.
+- **Access: one PWA serving both a desktop web interface and an installable mobile interface, voice and text as equal citizens.** One conversation can mix modalities — speak, then type, then speak — and continue across devices. Voice runs over WebRTC. Desktop browsers reach it directly (localhost/tailnet); phones install it from the browser.
 - Ambient/dedicated devices are **not** part of the current vision (explicitly parked; may or may not return).
 
 ## 3. Product pillars (phased, all in vision)
@@ -78,8 +78,8 @@ text in ────────────────────────
 
 | Component | Choice | Notes |
 |-----------|--------|-------|
-| Pipeline framework | **Pipecat vs. LiveKit Agents — phase-0 spike** | Both give transport, Silero VAD, turn-taking, barge-in. LiveKit's mobile/WebRTC story is stronger; multi-client + PWA requirements make this worth an honest comparison. Only `agent.py` knows the winner. |
-| Clients | **Single PWA** (web + mobile, installable) | WebRTC voice + text chat in one conversation view; PWA push for proactivity. No native app, no app stores. |
+| Pipeline framework | **Pipecat** with `SmallWebRTCTransport` — settled by phase-0 spike ([framework-spike.md](framework-spike.md)) | P2P WebRTC from one self-contained Python process; no SFU/Redis footprint. Silero VAD, turn-taking, barge-in. Only `agent.py` imports it; revisit triggers documented in the spike. |
+| Clients | **Single PWA**: desktop web interface + installable mobile interface | WebRTC voice + text chat in one conversation view; PWA push for proactivity. Desktop browser and phone are the same client. No native app, no app stores. |
 | STT | **faster-whisper** | Multilingual (es/en/pt native); shared model family with `ser`. |
 | Emotion | **`jsugg/ser`** via adapter | Per-turn batch on the VAD-buffered utterance (ser is not realtime yet — that's fine; see §6). |
 | LLM | **Cloud API (Claude), provider-swappable** | All prompts/policy behind a provider-agnostic interface; local (Ollama/vLLM) is a later option, not an MVP path. |
@@ -96,6 +96,7 @@ therapy/
 ├── pyproject.toml            # uv, Python 3.12+, same tooling stack as ser
 ├── src/therapy/
 │   ├── agent.py              # pipeline assembly — only file that imports Pipecat
+│   │                         #   (STT/TTS/relay processors, LLM provider factory)
 │   ├── perception/
 │   │   ├── stt.py
 │   │   └── emotion.py        # anti-corruption adapter around `ser`; owns EmotionFrame
@@ -106,9 +107,11 @@ therapy/
 │   │   ├── user_model.py     # property-graph self-model: typed nodes + typed edges (Appendix A)
 │   │   ├── distill.py        # inbox → nodes/edges promotion; graduation; context assembly
 │   │   └── research.py       # curated corpus: ingest, embed, retrieve (silent grounding + psychoeducation)
-│   ├── speech/tts.py         # Kokoro
+│   ├── speech/tts.py         # Kokoro voice map (per-language voices)
 │   ├── session/timeline.py   # merged emotion + transcript record; session-depth tagging; longitudinal queries
-│   └── server/               # FastAPI + web client; review UI from phase 2
+│   └── server/
+│       ├── app.py            # FastAPI: WebRTC signaling + PWA serving; review UI from phase 2
+│       └── static/           # PWA client (vanilla JS): web + mobile interface, manifest, service worker
 ├── tests/
 └── docs/
 ```
@@ -142,7 +145,10 @@ A second knowledge store, deliberately separate from the user model: the user mo
 
 ## 7. Multilinguality (es/en/pt)
 
-- **Detection:** per-utterance language ID from Whisper; respond in the utterance's language.
+- **Detection:** per-utterance language ID from Whisper, refined by word-level language ID over the transcript text (lingua-py, restricted to es/en/pt) — Whisper labels whole utterances only, which is too coarse for code-switched phrases.
+- **Reply language (user-selectable):** the PWA exposes a compact language selector — **Auto · ES · EN · PT** — next to the mic/speaker toggles; the choice persists client-side (localStorage) and is re-sent on connect as a data-channel override (`reply_language`, `null` = auto), keeping conversation state server-authoritative.
+  - **Auto (default):** reply in the **dominant** language of the last user phrase by word-level majority — *"Todo bien, me estoy sintiendo ok"* → Spanish reply (the lone "ok" doesn't flip it); *"Sí, todo bien… though… no… actually things have been hard lately"* → English reply. On a near-even mix or low-confidence detection, keep the language currently in use — no ping-ponging.
+  - **Pinned (ES/EN/PT):** the therapist always replies — text and TTS voice — in the pinned language. The pin constrains replies only: the user may keep speaking or typing any language, and STT continues auto-detecting for transcripts and the timeline.
 - **Code-switching:** mid-conversation switches are expected and supported; the session timeline records language per turn.
 - **Prompts:** dialogue policy maintained once (English source), with language rendered at generation time by the LLM — no triplicate prompt files.
 - **TTS:** chosen engine must produce natural es/en/pt (XTTS and Kokoro both cover these; quality per language to be evaluated — §10).
@@ -156,14 +162,22 @@ A second knowledge store, deliberately separate from the user model: the user mo
 
 ## 9. Roadmap
 
-| Phase | Deliverable | Acceptance |
-|-------|------------|-----------|
-| 0 | New repo scaffold (Docker from day one); **framework spike: Pipecat vs. LiveKit Agents**; archive old TheraPy | Spike verdict written down; stub server runs in compose |
-| 1 | **Working voice+text loop** (P1): PWA with WebRTC voice and text chat, mid-conversation switching, es/en/pt, barge-in; reachable from phone via Tailscale | Hold a natural 5-min mixed voice/text conversation in each language, from the phone |
-| 2 | **Memory + timeline + review UI**: SQLite store, transcripts, session summaries, continuity, user-model v1; browse transcripts in the PWA | Assistant correctly references something from a previous session |
-| 3 | **ser integration** (P2 begins): per-turn emotion in context + timeline; emotion recap; review UI shows emotion alongside transcript (validates ser accuracy early) | Recap matches user's own read of the session |
-| 4 | **Longitudinal insight + proactivity + research KB v1**: cross-session pattern queries, reflections; check-ins/digest channels; corpus ingest + both retrieval modes | North-star test: one true non-obvious self-insight |
-| 5 | P3 rehearsal mode / P4 daily structure; VPS migration when uptime starts to matter | Prioritize based on lived usage |
+| Phase | Deliverable | Acceptance | Status |
+|-------|------------|-----------|--------|
+| 0 | New repo scaffold (Docker from day one); **framework spike: Pipecat vs. LiveKit Agents**; archive old TheraPy | Spike verdict written down; stub server runs in compose | ✅ Done — verdict: Pipecat ([framework-spike.md](framework-spike.md)) |
+| 1 | **Working voice+text loop** (P1): PWA (web + mobile) with WebRTC voice and text chat, mid-conversation switching, es/en/pt, barge-in; reachable from phone via Tailscale | Hold a natural 5-min mixed voice/text conversation in each language, from the phone | 🔄 Implemented; acceptance run pending |
+| 2 | **Memory + timeline + review UI**: SQLite store, transcripts, session summaries, continuity, user-model v1; browse transcripts in the PWA | Assistant correctly references something from a previous session | Not started |
+| 3 | **ser integration** (P2 begins): per-turn emotion in context + timeline; emotion recap; review UI shows emotion alongside transcript (validates ser accuracy early) | Recap matches user's own read of the session | Not started |
+| 4 | **Longitudinal insight + proactivity + research KB v1**: cross-session pattern queries, reflections; check-ins/digest channels; corpus ingest + both retrieval modes | North-star test: one true non-obvious self-insight | Not started |
+| 5 | P3 rehearsal mode / P4 daily structure; VPS migration when uptime starts to matter | Prioritize based on lived usage | Not started |
+
+**Phase 1 — implemented so far** (commit `abff78b`): Pipecat pipeline behind `SmallWebRTCTransport` (Silero VAD, barge-in, per-turn TTFA logging); faster-whisper STT subclassed for per-utterance es/en/pt auto-detection; Kokoro TTS re-voiced per turn to the detected language; provider-agnostic LLM factory (Claude default; OpenRouter/Ollama for dev); typed turns over the WebRTC data channel into the same conversation context; vanilla-JS PWA (installable, offline shell) with mic/speaker toggles and modality mirroring; dialogue policy v1 (persona, register, validate-then-challenge, crisis protocol).
+
+**Phase 1 — hardening (2026-07-10):** server-side reply-modality mirroring landed (typed turns skip TTS synthesis via `LLMConfigureOutputFrame`; the client's speaker toggle sends a `voice_replies` override); fixed the container image (opencv system libs — the phase-1 image had never booted); fixed VAD wiring (Pipecat ≥1.x ignores `TransportParams.vad_analyzer` on non-Daily transports — speech was never detected until `VADProcessor` became an explicit pipeline stage); added `scripts/phase1_dryrun.py`, a scripted WebRTC client that runs the trilingual voice+text conversation against the live server and measures TTFA without a microphone. Fully-local LLM verified: `THERAPY_LLM=ollama` runs `gemma3:4b` on the host (container reaches it via `host.docker.internal`); a per-switch system note (`language_switch_note`, dialogue/policy.py) now reminds the model of the user's current language — small local models otherwise keep replying in the conversation's dominant language after a switch.
+
+**Phase 1 — dry-run evidence (2026-07-10):** `scripts/phase1_dryrun.py` passes against the live container: on a single WebRTC connection, spoken turns in es, en, and pt were each language-detected correctly and answered with the matching Kokoro voice; a typed turn got a text-only reply (no TTS audio reached the client — server-side mirroring verified); the next voice turn spoke again, and barge-in stopped the reply audio. TTFA (user stops speaking → first reply audio) across two clean runs: 3.3–15.5 s server-side, 8.3–22.6 s client-side including the 0.7 s VAD stop window; Kokoro's own synthesis TTFA is 1.3–1.9 s. The spread is dominated by the free-tier dev LLM (Kokoro's own synthesis TTFA is 0.5–2 s; whisper adds ~2–3 s on this CPU), so R1 must be re-measured with the target provider during the acceptance run. Known dev-provider quirk: the free OpenRouter meta-router sometimes ignores the reply-language instruction and occasionally emits junk replies ("User Safety: safe") — language detection itself was correct. With the fully-local `gemma3:4b` via Ollama the same dry run passes with correct reply language in all three turns (after the per-switch language note) and coherent, on-persona replies; TTFA is 12.7–20.7 s server-side, since the LLM shares the CPU with whisper and Kokoro.
+
+**Phase 1 — outstanding:** the reply-language selector with dominant-language auto mode (§7 — added to scope 2026-07-10); the human acceptance run itself (5-min mixed voice/text conversation in each language, from the phone over Tailscale HTTPS); and TTFA validation against R1 under real network conditions.
 
 ## 10. Decisions log & open questions
 
@@ -173,7 +187,8 @@ A second knowledge store, deliberately separate from the user model: the user mo
 - Interaction: no formal sessions; fluid check-ins ↔ deep conversations, always available, proactive within boundaries (§3).
 - Emotion vocabulary: two-layer representation — raw ser labels stored verbatim, config-driven product mapping per consumer (§6).
 - Review UI: early, phase 2–3, partly to validate ser accuracy.
-- Clients: single PWA for web + mobile; voice (WebRTC) and text are equal, switchable mid-conversation; conversation state is server-authoritative.
+- Clients: single PWA serving both the desktop web interface and the installable mobile interface; voice (WebRTC) and text are equal, switchable mid-conversation; conversation state is server-authoritative.
+- Pipeline framework (settled 2026-07-09, phase-0 spike): **Pipecat with `SmallWebRTCTransport`** over LiveKit Agents — one self-contained Python process, no SFU/Redis; revisit triggers in [framework-spike.md](framework-spike.md).
 - Hosting: own machine + Tailscale for MVP; personal VPS is the target state. Docker Compose from day one to make migration cheap. Ambient devices explicitly parked.
 - Proactivity channels: all four (push, in-app, scheduled check-ins, digest), individually configurable with quiet hours.
 - Research KB: curated local RAG, both modes — silent grounding by default, source-attributed psychoeducation on demand.
@@ -181,6 +196,9 @@ A second knowledge store, deliberately separate from the user model: the user mo
 - Persona: stable identity, adaptive register (ser-driven); style arc = validate first, then challenge, with challenge intensity register-gated (§5).
 - Cloud LLM context: current conversation verbatim + distilled past (summaries + user model) — never raw history (§8).
 - Naming: **keep TheraPy** — archive the old repo, recreate fresh under the same name.
+
+**Settled (2026-07-10):**
+- Reply language is user-selectable (Auto · ES · EN · PT) with **Auto = dominant language of the last phrase**, word-level majority via **lingua-py** (new dependency, phase-1-gated in pyproject); ties/low confidence keep the current language; a pin constrains replies only (STT stays auto); selection persists client-side (§7).
 
 - Raw utterance audio: **kept indefinitely** (encrypted at rest before any VPS move). Each ser upgrade re-analyzes history — the emotional timeline gets retroactively smarter, and the archive doubles as eval data for ser itself.
 
