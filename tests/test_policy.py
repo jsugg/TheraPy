@@ -4,7 +4,32 @@ from therapy.dialogue.policy import (
     crisis_resources,
     language_pin_note,
     language_switch_note,
+    rehydrate_messages,
+    resume_note,
 )
+
+
+def test_resume_note_forbids_regreeting() -> None:
+    note = resume_note()
+    assert "same ongoing conversation" in note
+    assert "do not greet" in note
+
+
+def test_rehydrate_messages_maps_turns_verbatim_and_caps() -> None:
+    turns = [
+        {"role": "user", "text": "Hola", "language": "es", "modality": "voice"},
+        {"role": "assistant", "text": "Hola, ¿cómo estás?", "language": "es"},
+        {"role": "user", "text": "", "language": "es"},  # empty → dropped
+    ]
+    messages = rehydrate_messages(turns)
+    assert messages == [
+        {"role": "user", "content": "Hola"},
+        {"role": "assistant", "content": "Hola, ¿cómo estás?"},
+    ]
+    many = [{"role": "user", "text": f"t{i}"} for i in range(60)]
+    capped = rehydrate_messages(many, limit=40)
+    assert len(capped) == 40
+    assert capped[0]["content"] == "t20"  # most recent turns win
 
 
 def test_prompt_covers_trilingual_and_boundaries() -> None:
@@ -21,8 +46,11 @@ def test_crisis_resources_env_override(monkeypatch) -> None:
     assert "Línea 135" in build_system_prompt()
 
 
-def test_language_switch_note_names_the_language() -> None:
-    assert "Portuguese" in language_switch_note("pt")
+def test_language_switch_note_is_written_in_the_target_language() -> None:
+    # The note is instruction AND language prime: an English note in the
+    # context is itself English evidence pulling a small model to English.
+    assert "português" in language_switch_note("pt")
+    assert "español" in language_switch_note("es")
     assert "English" in language_switch_note("en")
     # Unknown codes degrade to the code itself rather than raising.
     assert "fr" in language_switch_note("fr")
@@ -30,8 +58,17 @@ def test_language_switch_note_names_the_language() -> None:
 
 def test_language_pin_note_overrides_follow_the_user() -> None:
     note = language_pin_note("pt")
-    assert "Portuguese" in note
-    assert "regardless" in note
+    assert "português" in note
+    assert "não importa" in note  # overrides follow-the-user, in Portuguese
+    assert "regardless" in language_pin_note("en")
+
+
+def test_reply_language_reminder_is_short_and_in_target_language() -> None:
+    from therapy.dialogue.policy import reply_language_reminder
+
+    note = reply_language_reminder("es")
+    assert "español" in note
+    assert len(note) < 100  # per-turn cost must stay negligible
 
 
 def test_continuity_note_empty_history_is_none() -> None:

@@ -21,6 +21,48 @@ and any commitments or open threads. Phrase claims as remembered context, e.g.
 transcript."""
 
 
+TITLE_PROMPT = """Give this session a very short title: three to six words naming its
+main topic. Write the title in {language}. Output only the title itself —
+no quotes, no trailing punctuation, no explanation."""
+
+_TITLE_LANGUAGES = {"en": "English", "es": "Spanish", "pt": "Portuguese"}
+
+
+def dominant_turn_language(turns: list[dict[str, object]]) -> str:
+    """Most frequent user-turn language code; 'en' when there are none."""
+    counts: dict[str, int] = {}
+    for turn in turns:
+        if turn.get("role") == "user":
+            code = str(turn.get("language") or "")
+            if code:
+                counts[code] = counts.get(code, 0) + 1
+    return max(counts, key=lambda code: counts[code]) if counts else "en"
+
+
+def clean_title(raw: str) -> str | None:
+    """First line of LLM output, dequoted and capped; None if unusable."""
+    stripped = raw.strip()
+    if not stripped:
+        return None
+    line = stripped.splitlines()[0].strip().strip("\"'“”«»").rstrip(".!…").strip()
+    return line[:80] or None
+
+
+async def entitle(turns: list[dict[str, object]]) -> str | None:
+    """A short topic title in the session's dominant language."""
+    if not turns:
+        return None
+    language = dominant_turn_language(turns)
+    raw = await complete(
+        TITLE_PROMPT.format(
+            language=_TITLE_LANGUAGES.get(language, "the user's language")
+        ),
+        render_transcript(turns),
+        max_tokens=40,
+    )
+    return clean_title(raw)
+
+
 class Summarizer(Protocol):
     """Async session summarizer interface."""
 

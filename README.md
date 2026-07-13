@@ -15,7 +15,10 @@ that compound into longitudinal self-insight.
 Phases 0–2 engineering complete (framework spike: Pipecat, see
 [`docs/framework-spike.md`](docs/framework-spike.md)). Phase 1 — the
 trilingual voice+text loop (es/en/pt) — is implemented and dry-run green;
-only the human acceptance conversation remains. One PWA serves both
+phone field tests surfaced two defects (a resumed transcript not rendering
+over a slow mobile data channel, and a Spanish turn answered in English),
+both fixed and regression-tested (SPEC §9 Hardening 7–8). The clean human
+acceptance conversation is the remaining gate. One PWA serves both
 interfaces: a **web interface** in any desktop browser and an installable
 **mobile interface** on the phone. Speak or type in the same conversation,
 switch mid-turn, barge-in supported. The reply language is user-selectable
@@ -45,6 +48,15 @@ ollama pull gemma3:4b       # default model — decent es/en/pt, CPU-friendly
 #       OLLAMA_BASE_URL=http://host.docker.internal:11434/v1
 ```
 
+Dropped connections resume: reconnecting within
+`THERAPY_RESUME_WINDOW_SECS` (default 15 min) continues the interrupted
+session — same transcript, same context — instead of starting a new one.
+Set it to `0` to make every connection a fresh session. The chat view
+re-renders the resumed transcript on connect (server truth), and the 📖
+history browser can start a fresh conversation, continue any past
+session, rename it (titles are auto-generated from the topic at session
+end), or delete one (turns + archived audio) outright.
+
 The 2024 prototype lives at
 [`jsugg/TheraPy-legacy`](https://github.com/jsugg/TheraPy-legacy) (archived);
 no code was carried over.
@@ -71,12 +83,12 @@ docker compose exec therapy uv run --no-dev python scripts/phase1_dryrun.py
 docker compose logs therapy | grep TTFA   # server-side numbers (risk R1)
 ```
 
-Latest dry-run result (2026-07-10, fully-local gemma3:4b): all ten
-scenarios green — trilingual turns, typed-turn silence, barge-in, both
-SPEC §7 normative code-switched phrases, pin/unpin. Client-side TTFA
-7.9–50.5 s (first turn pays cold model loading; whisper, Kokoro, and the
-LLM share this CPU) — to be re-measured with the target provider during
-the acceptance run.
+Latest dry-run result (2026-07-10, shipped image, fully-local gemma3:4b):
+all ten scenarios green — trilingual turns, typed-turn silence, barge-in,
+both SPEC §7 normative code-switched phrases, pin/unpin. Client-side TTFA
+9.2–32.5 s on a warm container (whisper, Kokoro, and the LLM share this
+CPU) — to be re-measured with the target provider during the acceptance
+run.
 
 Phase-2 acceptance (continuity + data round-trip; runs a scripted
 two-session conversation against the live server, then exercises

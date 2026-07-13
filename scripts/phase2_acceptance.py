@@ -87,16 +87,37 @@ class TypedClient:
         if message.get("type") == "transcript":
             self.transcripts.append(message)
             self.event.set()
+        if message.get("type") == "session":
+            self.session_state = message
+            self.event.set()
 
-    async def connect(self) -> None:
+    async def request_session_state(self, timeout: float = 30.0) -> dict:
+        """Ask for the server-truth chat state, like the PWA on channel open."""
+        self.session_state: dict | None = None
+        self.channel.send(json.dumps({"type": "client_ready"}))
+        deadline = time.monotonic() + timeout
+        while self.session_state is None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                sys.exit(f"FAIL: no session state within {timeout}s")
+            self.event.clear()
+            try:
+                await asyncio.wait_for(self.event.wait(), remaining)
+            except asyncio.TimeoutError:
+                pass
+        return self.session_state
+
+    async def connect(self, *, new_session: bool = True) -> None:
         # recvonly audio keeps the server's pipeline shape identical to the PWA.
+        # new_session=True isolates scenarios from reconnect-resume; the
+        # resume scenario itself connects with False, like the real PWA.
         self.pc.addTransceiver("audio", direction="recvonly")
         await self.pc.setLocalDescription(await self.pc.createOffer())
         while self.pc.iceGatheringState != "complete":
             await asyncio.sleep(0.05)
         async with httpx.AsyncClient() as client:
             response = await client.post(
-                f"{SERVER}/api/offer",
+                f"{SERVER}/api/offer" + ("?new_session=1" if new_session else ""),
                 json={
                     "sdp": self.pc.localDescription.sdp,
                     "type": self.pc.localDescription.type,
@@ -134,6 +155,13 @@ class TypedClient:
 
     async def close(self) -> None:
         await self.pc.close()
+
+
+async def list_sessions() -> list[dict]:
+    async with httpx.AsyncClient() as client:
+        response = await client.get(f"{SERVER}/api/sessions", timeout=30)
+        response.raise_for_status()
+        return response.json()["sessions"]
 
 
 async def wait_for_summary(deadline_s: float = 240.0) -> dict:
@@ -174,6 +202,37 @@ async def main() -> None:
         print(f"[A] user: {turn!r}\n    assistant: {reply[:100]!r}", flush=True)
     await a.close()
     results.append("[session A] fact stated, replies received ✓")
+
+    # 1b. Reconnect-resume: a drop + reconnect within the resume window must
+    #     continue session A, not open an amnesiac new one (regression:
+    #     field test 2026-07-10). Deterministic check — same newest session
+    #     id, no new session row, still answering. This reconnect also
+    #     exercises cancelling session A's in-flight finalization.
+    before = await list_sessions()
+    a2 = TypedClient()
+    await a2.connect(new_session=False)
+    state = await a2.request_session_state()
+    replayed = (
+        state.get("resumed") is True
+        and state.get("session_id") == before[0]["id"]
+        and len(state.get("turns") or []) >= 4  # 2 user + 2 assistant from A
+    )
+    results.append(
+        "[replay] client received the resumed transcript ✓"
+        if replayed
+        else f"[replay] FAIL — {json.dumps(state)[:160]}"
+    )
+    reply = await a2.ask("¿Sigues ahí? Se cortó la conexión un momento.")
+    print(f"[resume] assistant: {reply[:100]!r}", flush=True)
+    await a2.close()
+    after = await list_sessions()
+    if len(after) == len(before) and after[0]["id"] == before[0]["id"]:
+        results.append("[resume] reconnect continued the same session ✓")
+    else:
+        results.append(
+            f"[resume] FAIL — sessions {len(before)}→{len(after)}, "
+            f"newest {before[0]['id'][:8]}→{after[0]['id'][:8]}"
+        )
 
     # 2. Background summarization must finish before B connects — continuity
     #    is injected at connect time.

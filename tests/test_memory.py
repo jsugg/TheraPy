@@ -1,5 +1,6 @@
 import asyncio
 import json
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 import wave
 
@@ -39,6 +40,78 @@ def test_session_lifecycle(tmp_path: Path) -> None:
     assert turns[0]["language"] == "es"
     assert turns[1]["role"] == "assistant"
     assert turns[1]["text"] == "That sounds heavy."
+
+
+def test_resume_candidate_returns_recently_ended_newest_session(
+    tmp_path: Path,
+) -> None:
+    store = MemoryStore(tmp_path)
+    session_id = store.create_session()
+    store.add_turn(session_id, "user", "text", "en", "Hello.")
+    store.end_session(session_id)
+
+    assert store.resume_candidate(900.0) == session_id
+
+
+def test_resume_candidate_returns_none_when_stale(tmp_path: Path) -> None:
+    store = MemoryStore(tmp_path)
+    session_id = store.create_session()
+    store.add_turn(session_id, "user", "text", "en", "Hello.")
+    store.end_session(session_id)
+
+    assert store.resume_candidate(900.0, now=datetime.now(UTC) + timedelta(hours=2)) is None
+
+
+def test_resume_candidate_uses_last_turn_for_unfinalized_session(
+    tmp_path: Path,
+) -> None:
+    store = MemoryStore(tmp_path)
+    session_id = store.create_session()
+    stale_started_at = (datetime.now(UTC) - timedelta(hours=2)).isoformat(
+        timespec="microseconds"
+    )
+    with store._connect() as connection:
+        with connection:
+            connection.execute(
+                "UPDATE sessions SET started_at = ? WHERE id = ?",
+                (stale_started_at, session_id),
+            )
+    store.add_turn(session_id, "user", "text", "en", "Still here.")
+    last_turn = store.session_turns(session_id)[-1]
+    now = datetime.fromisoformat(str(last_turn["ts"])) + timedelta(minutes=5)
+
+    assert store.resume_candidate(900.0, now=now) == session_id
+
+
+def test_resume_candidate_empty_store_returns_none(tmp_path: Path) -> None:
+    store = MemoryStore(tmp_path)
+
+    assert store.resume_candidate(900.0) is None
+
+
+def test_resume_candidate_zero_window_returns_none_for_fresh_session(
+    tmp_path: Path,
+) -> None:
+    store = MemoryStore(tmp_path)
+    store.create_session()
+
+    assert store.resume_candidate(0.0) is None
+
+
+def test_reopen_session_clears_finalization_and_summary_history(
+    tmp_path: Path,
+) -> None:
+    store = MemoryStore(tmp_path)
+    session_id = store.create_session()
+    store.end_session(session_id, "The user checked in.")
+    assert store.recent_summaries()[0]["summary"] == "The user checked in."
+
+    store.reopen_session(session_id)
+
+    session = store.sessions()[0]
+    assert session["ended_at"] is None
+    assert session["summary"] is None
+    assert store.recent_summaries() == []
 
 
 def test_audio_archival(tmp_path: Path) -> None:
@@ -164,3 +237,77 @@ def test_parse_facts_filters_noise() -> None:
     raw = "- Has a dog named Bruno.\n\n* Works as a nurse.\nNONE\n" + "x" * 250
     assert parse_facts(raw) == ["Has a dog named Bruno.", "Works as a nurse."]
     assert parse_facts("NONE") == []
+
+
+def test_delete_session_removes_rows_and_audio_only_for_that_session(
+    tmp_path: Path,
+) -> None:
+    store = MemoryStore(tmp_path)
+    doomed = store.create_session()
+    doomed_turn = store.add_turn(
+        doomed, "user", "voice", "es", "Bórrame.", audio=b"\x00\x00" * 160
+    )
+    kept = store.create_session()
+    store.add_turn(kept, "user", "text", "en", "Keep me.")
+
+    doomed_audio = tmp_path / "audio" / doomed
+    assert doomed_audio.exists()
+    assert store.has_session(doomed)
+
+    assert store.delete_session(doomed) is True
+    assert not store.has_session(doomed)
+    assert store.session_turns(doomed) == []
+    assert not doomed_audio.exists()
+    assert doomed_turn not in [turn["id"] for turn in store.session_turns(kept)]
+    assert store.has_session(kept)
+    assert len(store.session_turns(kept)) == 1
+
+    assert store.delete_session("nope") is False
+
+
+def test_titles_set_ensure_and_legacy_migration(tmp_path: Path) -> None:
+    import sqlite3
+
+    # A database created before titles existed must gain the column.
+    legacy = tmp_path / "therapy.db"
+    with sqlite3.connect(legacy) as connection:
+        connection.executescript(
+            """
+            CREATE TABLE sessions (
+                id TEXT PRIMARY KEY,
+                started_at TEXT NOT NULL,
+                ended_at TEXT,
+                summary TEXT
+            );
+            INSERT INTO sessions (id, started_at) VALUES ('old', '2026-07-09T10:00:00+00:00');
+            """
+        )
+
+    store = MemoryStore(tmp_path)
+    assert store.sessions()[0]["title"] is None  # migrated, not crashed
+
+    # ensure_title fills only the blank; a rename (set_title) always wins.
+    store.ensure_title("old", "Generated title")
+    assert store.sessions()[0]["title"] == "Generated title"
+    store.ensure_title("old", "Second generation")
+    assert store.sessions()[0]["title"] == "Generated title"
+    assert store.set_title("old", "My own name") is True
+    assert store.sessions()[0]["title"] == "My own name"
+    assert store.set_title("nope", "x") is False
+
+
+def test_clean_title_and_dominant_turn_language() -> None:
+    from therapy.memory.summarizer import clean_title, dominant_turn_language
+
+    assert clean_title('"Ansiedad por el trabajo."\nExtra line') == "Ansiedad por el trabajo"
+    assert clean_title("   ") is None
+    assert clean_title("x" * 200) == "x" * 80
+
+    turns = [
+        {"role": "user", "language": "es", "text": "Hola"},
+        {"role": "assistant", "language": "en", "text": "Hi"},
+        {"role": "user", "language": "es", "text": "Sigo"},
+        {"role": "user", "language": "en", "text": "ok"},
+    ]
+    assert dominant_turn_language(turns) == "es"
+    assert dominant_turn_language([]) == "en"

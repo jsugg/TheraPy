@@ -17,6 +17,9 @@
   }
 }
 * { box-sizing: border-box; }
+/* An author `display` (e.g. main{display:flex}) overrides the UA's
+   [hidden]{display:none} — without this, "hidden" views still render. */
+[hidden] { display: none !important; }
 html, body { height: 100%; }
 body {
   margin: 0;
@@ -64,7 +67,18 @@ main {
   text-align: left;
   cursor: pointer;
 }
+.session-row .title { font-weight: 600; }
 .session-row .meta { font-size: .8rem; opacity: .6; }
+#session-title { margin: .25rem 0 .5rem; font-size: 1.05rem; }
+#session-new { display: block; width: 100%; margin-bottom: .75rem; }
+#session-actions {
+  display: flex;
+  gap: .4rem;
+  align-items: center;
+  margin-bottom: .5rem;
+}
+#session-resume { background: var(--accent); color: #fff; }
+#session-delete { margin-left: auto; }
 .msg {
   max-width: 85%;
   padding: .55rem .8rem;

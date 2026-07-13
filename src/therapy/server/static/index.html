@@ -20,9 +20,18 @@
   </header>
 
   <section id="history-view" hidden>
-    <div id="session-list"></div>
+    <div id="session-list-view">
+      <button id="session-new" class="primary">＋ New conversation</button>
+      <div id="session-list"></div>
+    </div>
     <div id="session-detail" hidden>
-      <button id="history-back">← Sessions</button>
+      <div id="session-actions">
+        <button id="history-back">← Sessions</button>
+        <button id="session-resume">▶ Continue</button>
+        <button id="session-rename" title="Rename this conversation">✏️</button>
+        <button id="session-delete" title="Delete this conversation">🗑</button>
+      </div>
+      <h2 id="session-title"></h2>
       <div id="session-turns"></div>
     </div>
   </section>

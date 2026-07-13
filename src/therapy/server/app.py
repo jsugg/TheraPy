@@ -14,6 +14,8 @@ from fastapi.staticfiles import StaticFiles
 
 from therapy import __version__
 from therapy.memory import MemoryStore
+from therapy.memory.store import resume_window_secs
+from therapy.server import live
 
 STATIC_DIR = Path(__file__).parent / "static"
 
@@ -88,21 +90,66 @@ def launch_bot(
     return task
 
 
+def _resolve_session(
+    store: MemoryStore, *, new_session: bool, explicit: str | None
+) -> tuple[str | None, bool]:
+    """Resolve which stored session a new connection will land in.
+
+    Mirrors run_bot's resume logic so the offer response can tell the client
+    up front which session it is joining. The client then loads that
+    transcript over HTTP instead of waiting for the data-channel `session`
+    replay — pipecat clears its outbound queue and disables it if the data
+    channel is slow to open (10 s), which is exactly what happens on the
+    phone over the TURN relay, so the replay was silently dropped and the
+    resumed transcript never rendered (field test 2026-07-10).
+
+    Returns the resolved session id (None for a fresh session) and whether
+    connecting resumes it.
+    """
+    if explicit:
+        return (explicit, True) if store.has_session(explicit) else (None, False)
+    if new_session:
+        return None, False
+    resumed = store.resume_candidate(resume_window_secs())
+    return resumed, resumed is not None
+
+
 @app.post("/api/offer")
 async def offer(request: Request) -> dict[str, object]:
-    """SDP offer → answer; the new connection preempts the previous pipeline."""
+    """SDP offer → answer; the new connection preempts the previous pipeline.
+
+    `?new_session=1` skips reconnect-resume so the pipeline always opens a
+    fresh session — test scripts need isolated sessions; real clients
+    resume an interrupted one (SPEC §8). `?session=<id>` continues that
+    specific session (the history browser's explicit choice).
+
+    The answer carries `session_id`/`resumed` so the client can load the
+    transcript over HTTP; the resolved id is also what run_bot joins, so the
+    two never disagree.
+    """
     from pipecat.transports.smallwebrtc.request_handler import SmallWebRTCRequest
     from therapy.agent import run_bot
 
     body = await request.json()
+    new_session = request.query_params.get("new_session") == "1"
+    resolved, resumed = _resolve_session(
+        _store(),
+        new_session=new_session,
+        explicit=request.query_params.get("session"),
+    )
 
     async def on_connection(connection: object) -> None:
-        launch_bot(connection, run_bot)
+        launch_bot(
+            connection,
+            lambda conn: run_bot(
+                conn, new_session=new_session, resume_session_id=resolved
+            ),
+        )
 
     answer = await _handler().handle_web_request(
         SmallWebRTCRequest.from_dict(body), on_connection
     )
-    return answer or {}
+    return {**(answer or {}), "session_id": resolved, "resumed": resumed}
 
 
 @app.get("/api/ice-config")
@@ -119,6 +166,17 @@ def ice_config() -> dict[str, object]:
         "credential": os.environ.get("THERAPY_TURN_PASSWORD", "therapy-local"),
         "port": int(os.environ.get("THERAPY_TURN_PORT", "3478")),
     }
+
+
+@app.get("/api/resumable")
+def resumable() -> dict[str, object]:
+    """Whether connecting now would resume a session (SPEC §8).
+
+    The client labels its connect button accordingly — "Resume" must not
+    look like "Start", or a user expecting a fresh conversation lands in
+    an old one unawares.
+    """
+    return {"session_id": _store().resume_candidate(resume_window_secs())}
 
 
 @app.get("/api/sessions")
@@ -144,6 +202,36 @@ def session_detail(session_id: str) -> dict[str, object]:
     if session is None:
         raise HTTPException(status_code=404, detail="Session not found")
     return {"session": session, "turns": store.session_turns(session_id)}
+
+
+@app.patch("/api/sessions/{session_id}")
+async def rename_session(session_id: str, request: Request) -> dict[str, str]:
+    """Rename a session (user edit of the auto-generated title)."""
+    body = await request.json()
+    title = str(body.get("title", "")).strip()[:80]
+    if not title:
+        raise HTTPException(status_code=400, detail="Title must not be empty")
+    if not _store().set_title(session_id, title):
+        raise HTTPException(status_code=404, detail="Session not found")
+    return {"id": session_id, "title": title}
+
+
+@app.delete("/api/sessions/{session_id}")
+def delete_session(session_id: str) -> dict[str, str]:
+    """Delete one session (turns + archived audio) from the review UI.
+
+    Wholesale wipe stays a deliberate CLI act (`python -m therapy.memory
+    delete --yes`); this is the per-conversation eraser.
+    """
+    store = _store()
+    if not store.has_session(session_id):
+        raise HTTPException(status_code=404, detail="Session not found")
+    if live.is_active(session_id):
+        raise HTTPException(
+            status_code=409, detail="Session is live — disconnect first"
+        )
+    store.delete_session(session_id)
+    return {"deleted": session_id}
 
 
 @app.get("/")

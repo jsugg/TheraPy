@@ -5,7 +5,7 @@ from fastapi.testclient import TestClient
 import pytest
 
 from therapy.memory import MemoryStore
-from therapy.server.app import _store, app
+from therapy.server.app import _resolve_session, _store, app
 
 
 @pytest.fixture(autouse=True)
@@ -79,3 +79,90 @@ def test_session_detail_returns_404_for_unknown_id() -> None:
 
     assert response.status_code == 404
     assert response.json() == {"detail": "Session not found"}
+
+
+def test_delete_session_endpoint_removes_one_session(tmp_path: Path) -> None:
+    store = MemoryStore(tmp_path)
+    doomed = store.create_session()
+    store.add_turn(doomed, "user", "text", "en", "Erase this.")
+    kept = store.create_session()
+
+    with TestClient(app) as client:
+        response = client.delete(f"/api/sessions/{doomed}")
+        assert response.status_code == 200
+        assert response.json() == {"deleted": doomed}
+        remaining = client.get("/api/sessions").json()["sessions"]
+
+    assert [session["id"] for session in remaining] == [kept]
+    assert client.delete("/api/sessions/nope").status_code == 404
+
+
+def test_delete_session_refuses_while_pipeline_is_live(tmp_path: Path) -> None:
+    from therapy.server import live
+
+    store = MemoryStore(tmp_path)
+    session_id = store.create_session()
+    token = live.claim(session_id)
+    try:
+        with TestClient(app) as client:
+            assert client.delete(f"/api/sessions/{session_id}").status_code == 409
+    finally:
+        live.release(session_id, token)
+    assert store.has_session(session_id)
+
+
+def test_resumable_reflects_the_newest_session_freshness(tmp_path: Path) -> None:
+    with TestClient(app) as client:
+        assert client.get("/api/resumable").json() == {"session_id": None}
+
+    store = MemoryStore(tmp_path)
+    session_id = store.create_session()
+    store.add_turn(session_id, "user", "text", "es", "Hola.")
+    store.end_session(session_id, "Greeted.")
+
+    with TestClient(app) as client:
+        assert client.get("/api/resumable").json() == {"session_id": session_id}
+
+
+def test_resolve_session_reports_what_the_connection_joins(tmp_path: Path) -> None:
+    # The offer response carries this so the client loads the transcript over
+    # HTTP instead of the data-channel replay, which pipecat drops when the
+    # channel is slow to open on mobile (field test 2026-07-10).
+    store = MemoryStore(tmp_path)
+    resumable = store.create_session()
+    store.add_turn(resumable, "user", "text", "es", "Hola.")
+    store.end_session(resumable, "Greeted.")
+
+    # Default connect resumes the recent session; new_session forces a fresh
+    # one even though a resumable session exists.
+    assert _resolve_session(store, new_session=False, explicit=None) == (
+        resumable,
+        True,
+    )
+    assert _resolve_session(store, new_session=True, explicit=None) == (None, False)
+
+    # An explicit id is joined verbatim; an unknown one falls back to fresh.
+    assert _resolve_session(store, new_session=False, explicit=resumable) == (
+        resumable,
+        True,
+    )
+    assert _resolve_session(store, new_session=False, explicit="nope") == (None, False)
+
+
+def test_resolve_session_fresh_when_nothing_resumable(tmp_path: Path) -> None:
+    store = MemoryStore(tmp_path)
+    assert _resolve_session(store, new_session=False, explicit=None) == (None, False)
+
+
+def test_rename_session_endpoint(tmp_path: Path) -> None:
+    store = MemoryStore(tmp_path)
+    session_id = store.create_session()
+
+    with TestClient(app) as client:
+        ok = client.patch(f"/api/sessions/{session_id}", json={"title": "  Sueño y traba jo  "})
+        assert ok.status_code == 200
+        assert ok.json()["title"] == "Sueño y traba jo"
+        assert client.patch(f"/api/sessions/{session_id}", json={"title": "  "}).status_code == 400
+        assert client.patch("/api/sessions/nope", json={"title": "x"}).status_code == 404
+
+    assert store.sessions()[0]["title"] == "Sueño y traba jo"

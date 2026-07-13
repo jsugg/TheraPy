@@ -33,6 +33,11 @@ def _row_dict(row: sqlite3.Row) -> RowDict:
     return dict(row)
 
 
+def resume_window_secs() -> float:
+    """How long after its last activity a session is still resumable."""
+    return float(os.environ.get("THERAPY_RESUME_WINDOW_SECS", "900"))
+
+
 class MemoryStore:
     """Persistent session transcripts, summaries, facts, and audio."""
 
@@ -70,7 +75,8 @@ class MemoryStore:
                     id TEXT PRIMARY KEY,
                     started_at TEXT NOT NULL,
                     ended_at TEXT,
-                    summary TEXT
+                    summary TEXT,
+                    title TEXT
                 );
 
                 CREATE TABLE IF NOT EXISTS turns (
@@ -95,6 +101,15 @@ class MemoryStore:
                 );
                 """
             )
+            # Databases created before titles existed (2026-07-10) lack the
+            # column; CREATE TABLE IF NOT EXISTS won't add it.
+            columns = {
+                row["name"]
+                for row in connection.execute("PRAGMA table_info(sessions)")
+            }
+            if "title" not in columns:
+                with connection:
+                    connection.execute("ALTER TABLE sessions ADD COLUMN title TEXT")
 
     def create_session(self) -> str:
         """Create a session row and return its UUID4 hex id."""
@@ -118,6 +133,89 @@ class MemoryStore:
                     WHERE id = ?
                     """,
                     (_utc_now(), summary, session_id),
+                )
+
+    def resume_candidate(
+        self, window_secs: float, now: datetime | None = None
+    ) -> str | None:
+        """Return the newest session id when it is recent enough to resume.
+
+        This backs reconnect-resume: a dropped WebRTC connection should not
+        split one conversation into two sessions.
+        """
+        if window_secs <= 0:
+            return None
+        if now is None:
+            now = datetime.now(UTC)
+
+        with self._connect() as connection:
+            session = connection.execute(
+                """
+                SELECT id, started_at, ended_at
+                FROM sessions
+                ORDER BY started_at DESC, rowid DESC
+                LIMIT 1
+                """
+            ).fetchone()
+            if session is None:
+                return None
+
+            session_id = str(session["id"])
+            started_at = str(session["started_at"])
+            ended_at = session["ended_at"]
+            if ended_at is not None:
+                activity_ts = str(ended_at)
+            else:
+                turn = connection.execute(
+                    """
+                    SELECT ts
+                    FROM turns
+                    WHERE session_id = ?
+                    ORDER BY ts DESC, id DESC
+                    LIMIT 1
+                    """,
+                    (session_id,),
+                ).fetchone()
+                activity_ts = str(turn["ts"]) if turn is not None else started_at
+
+        last_activity = datetime.fromisoformat(activity_ts)
+        if (now - last_activity).total_seconds() <= window_secs:
+            return session_id
+        return None
+
+    def has_session(self, session_id: str) -> bool:
+        """Whether a session row exists (guards explicit-resume requests)."""
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT 1 FROM sessions WHERE id = ?", (session_id,)
+            ).fetchone()
+        return row is not None
+
+    def delete_session(self, session_id: str) -> bool:
+        """Delete one session, its turns (FK cascade), and its audio archive.
+
+        Returns:
+            True when a session row was deleted, False for an unknown id.
+        """
+        with self._connect() as connection:
+            with connection:
+                cursor = connection.execute(
+                    "DELETE FROM sessions WHERE id = ?", (session_id,)
+                )
+        shutil.rmtree(self._audio_dir / session_id, ignore_errors=True)
+        return cursor.rowcount > 0
+
+    def reopen_session(self, session_id: str) -> None:
+        """Clear finalization fields so an interrupted session can continue."""
+        with self._connect() as connection:
+            with connection:
+                connection.execute(
+                    """
+                    UPDATE sessions
+                    SET ended_at = NULL, summary = NULL
+                    WHERE id = ?
+                    """,
+                    (session_id,),
                 )
 
     def add_turn(
@@ -182,12 +280,35 @@ class MemoryStore:
         with self._connect() as connection:
             rows = connection.execute(
                 """
-                SELECT id, started_at, ended_at, summary
+                SELECT id, started_at, ended_at, summary, title
                 FROM sessions
                 ORDER BY started_at DESC, rowid DESC
                 """
             ).fetchall()
         return [_row_dict(row) for row in rows]
+
+    def set_title(self, session_id: str, title: str) -> bool:
+        """Set a session's title (user edit — overwrites); False if unknown id."""
+        with self._connect() as connection:
+            with connection:
+                cursor = connection.execute(
+                    "UPDATE sessions SET title = ? WHERE id = ?",
+                    (title, session_id),
+                )
+        return cursor.rowcount > 0
+
+    def ensure_title(self, session_id: str, title: str) -> None:
+        """Fill in an auto-generated title only where none exists yet.
+
+        A user's edit (or an earlier generation) always wins — re-finalizing
+        a resumed session must not rename it behind the user's back.
+        """
+        with self._connect() as connection:
+            with connection:
+                connection.execute(
+                    "UPDATE sessions SET title = COALESCE(title, ?) WHERE id = ?",
+                    (title, session_id),
+                )
 
     def session_turns(self, session_id: str) -> list[RowDict]:
         """Return a session's turns in chronological order."""

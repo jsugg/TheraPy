@@ -17,6 +17,7 @@ and lives here as server-authoritative state.
 
 from lingua import Language, LanguageDetectorBuilder
 
+from therapy.dialogue.policy import language_pin_note
 from therapy.perception.stt import DEFAULT_LANGUAGE, SUPPORTED_LANGUAGES
 
 _LINGUA_TO_CODE = {
@@ -66,9 +67,16 @@ def dominant_language(text: str, current: str) -> str:
 class ReplyLanguage:
     """Server-authoritative reply-language state: auto tracking + user pin."""
 
-    def __init__(self, initial: str = DEFAULT_LANGUAGE) -> None:
+    def __init__(self, initial: str = DEFAULT_LANGUAGE, established: bool = False) -> None:
+        """Args:
+        initial: Reply language before the user has said anything.
+        established: Whether `initial` reflects actual conversation history
+            (a resumed session) rather than a cold default — an established
+            language only yields to the full switch-hysteresis rule.
+        """
         self._auto = initial
         self._pin: str | None = None
+        self._established = established
 
     @property
     def language(self) -> str:
@@ -86,11 +94,48 @@ class ReplyLanguage:
         self._pin = code
         return self.language
 
+    # A quoted foreign fragment ("what I said was 'muriendo de sueño'") or a
+    # VAD-clipped shard must not flip the conversation language. Phrases
+    # shorter than this keep the current language — deliberate switches are
+    # full sentences (both SPEC §7 normative examples are 6+ words).
+    MIN_WORDS_TO_SWITCH = 4
+
     def note_phrase(self, text: str) -> str:
         """Track a user phrase; returns the reply language for this turn.
 
         The auto choice updates even while pinned, so unpinning resumes
         from the user's actual current language, not a stale one.
+
+        Switch hysteresis only applies once a language is established: a
+        conversation-opening "¡Hola! ¿Cómo estás?" is three words — the
+        cold-start default must yield to the first detectable phrase, or
+        the greeting gets answered in English (field test 2026-07-10).
         """
-        self._auto = dominant_language(text, self._auto)
+        counts = word_language_counts(text)
+        total = sum(counts.values())
+        if total and (not self._established or total >= self.MIN_WORDS_TO_SWITCH):
+            self._auto = dominant_language(text, self._auto)
+            self._established = True
         return self.language
+
+
+def reply_language_override_effect(
+    code: str | None, reply: str, relay_language: str | None
+) -> tuple[str | None, str | None]:
+    """Effect of a client `reply_language` override (SPEC §7) on the pipeline.
+
+    The PWA replays its selector on every connect and on every change. This
+    returns `(tts_language, note)`: re-voice the TTS to `tts_language` when it
+    is not None, and append `note` to the LLM context when it is not None.
+
+    Auto mode (`code` falsy) follows the user and must assert **nothing**. On
+    a fresh connect the relay language is still unset while auto defaults to
+    English, so asserting the auto choice injected an English "the user is now
+    speaking English" anchor ahead of the first turn — a small model then
+    answered a Spanish greeting in English (field test 2026-07-11). Only an
+    explicit pin anchors the reply language; auto is handled per turn as the
+    user actually speaks.
+    """
+    if not code:
+        return None, None
+    return (reply if reply != relay_language else None), language_pin_note(reply)

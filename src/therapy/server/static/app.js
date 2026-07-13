@@ -21,6 +21,8 @@ let pc = null;
 let channel = null;
 let micTrack = null;
 let speakerOverride = null; // null = auto (mirror modality), true/false = user override
+let viewingSessionId = null; // session open in the history detail view
+let historyLoaded = false; // initial transcript rendered for the current connection
 
 // Reply language (SPEC §7): "" = auto, or a pinned es/en/pt. Persists across
 // visits and is re-sent on every connect — the server holds the live state.
@@ -45,6 +47,17 @@ function setStatus(text, state = "idle") {
   status.dataset.state = state;
 }
 
+// Resuming must not look like starting fresh — label the button by what
+// connecting will actually do (the server decides via the resume window).
+async function refreshConnectLabel() {
+  try {
+    const state = await (await fetch("/api/resumable")).json();
+    $("connect").textContent = state.session_id
+      ? "Resume conversation"
+      : "Start conversation";
+  } catch { /* server unreachable — leave the current label */ }
+}
+
 function addMessage(role, text, language) {
   const div = document.createElement("div");
   div.className = `msg ${role}`;
@@ -59,8 +72,29 @@ function addMessage(role, text, language) {
   chat.scrollTop = chat.scrollHeight;
 }
 
-function firstLine(text) {
-  return (text || "").split("\n")[0];
+// Render the resumed transcript once per connection. Whichever path resolves
+// first wins — the HTTP fetch below, or the data-channel `session` replay as a
+// fallback — so a live transcript that already arrived is never wiped.
+function renderHistoryOnce(turns, resumed) {
+  if (historyLoaded) return;
+  historyLoaded = true;
+  for (const turn of turns) addMessage(turn.role, turn.text, turn.language);
+  if (resumed) setStatus("resumed", "listening");
+}
+
+// The reliable initial-transcript path: fetch over HTTP rather than depend on
+// the data-channel `session` push, which pipecat drops when the channel is
+// slow to open on mobile over the TURN relay (field test 2026-07-10).
+async function loadConnectHistory(sessionId, resumed) {
+  if (historyLoaded || !sessionId) return;
+  try {
+    const res = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}`);
+    if (!res.ok) return; // leave the data-channel replay as the fallback
+    const turns = ((await res.json()).turns || [])
+      .filter((t) => t.text)
+      .slice(-40); // match the data-channel replay's cap (protocol.py)
+    renderHistoryOnce(turns, resumed);
+  } catch { /* offline — the data-channel replay may still arrive */ }
 }
 
 function sessionDate(value) {
@@ -83,23 +117,22 @@ function renderSessionList(sessions) {
     row.type = "button";
     row.className = "session-row";
 
+    // Title first (auto-generated topic, or the date until one exists);
+    // the full summary lives in the detail view, not the list.
     const title = document.createElement("div");
-    title.textContent = sessionDate(session.started_at);
+    title.className = "title";
+    title.textContent = session.title || sessionDate(session.started_at);
     if (session.ended_at === null) {
       title.appendChild(document.createTextNode(" (active)"));
     }
 
     const meta = document.createElement("div");
     meta.className = "meta";
-    meta.textContent = `${session.turn_count || 0} turns`;
+    meta.textContent =
+      `${sessionDate(session.started_at)} · ${session.turn_count || 0} turns`;
 
     row.appendChild(title);
     row.appendChild(meta);
-    if (session.summary) {
-      const summary = document.createElement("div");
-      summary.textContent = firstLine(session.summary);
-      row.appendChild(summary);
-    }
 
     row.addEventListener("click", () => loadSession(session.id));
     sessionList.appendChild(row);
@@ -123,7 +156,7 @@ function renderSessionTurns(turns) {
 
 async function loadSessions() {
   sessionDetail.hidden = true;
-  sessionList.hidden = false;
+  $("session-list-view").hidden = false;
   sessionList.textContent = "Loading sessions…";
   const response = await fetch("/api/sessions");
   if (!response.ok) throw new Error("Could not load sessions");
@@ -135,8 +168,12 @@ async function loadSession(sessionId) {
   const response = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}`);
   if (!response.ok) throw new Error("Could not load session");
   const payload = await response.json();
+  viewingSessionId = sessionId;
+  const session = payload.session || {};
+  $("session-title").textContent =
+    session.title || sessionDate(session.started_at);
   renderSessionTurns(payload.turns || []);
-  sessionList.hidden = true;
+  $("session-list-view").hidden = true;
   sessionDetail.hidden = false;
 }
 
@@ -178,8 +215,14 @@ async function iceServers() {
   }
 }
 
-async function connect() {
+async function connect(opts = {}) {
   setStatus("connecting…");
+  historyLoaded = false;
+  chat.replaceChildren(); // history reloads below (HTTP) or via the replay
+  if (pc) {
+    try { pc.close(); } catch { /* already dead */ }
+    pc = null;
+  }
   const media = await navigator.mediaDevices.getUserMedia({
     audio: { echoCancellation: true, noiseSuppression: true },
   });
@@ -190,12 +233,21 @@ async function connect() {
   pc.addTransceiver("audio", { direction: "recvonly" });
 
   channel = pc.createDataChannel("chat", { ordered: true });
-  channel.onopen = sendReplyLanguage; // replay the persisted pin (SPEC §7)
+  channel.onopen = () => {
+    sendReplyLanguage(); // replay the persisted pin (SPEC §7)
+    // Fallback server-truth chat state, in case the HTTP load in connect()
+    // didn't render (the primary path). renderHistoryOnce dedupes the two.
+    channel.send(JSON.stringify({ type: "client_ready" }));
+  };
   channel.onmessage = (event) => {
     let msg;
     try { msg = JSON.parse(event.data); } catch { return; }
     if (msg.type === "transcript" && msg.text) {
       addMessage(msg.role, msg.text, msg.language);
+    }
+    if (msg.type === "session") {
+      // Fallback: the HTTP load in connect() is the primary path.
+      renderHistoryOnce(msg.turns || [], msg.resumed);
     }
   };
 
@@ -206,20 +258,30 @@ async function connect() {
       setStatus("disconnected");
       $("connect").hidden = false;
       $("controls").hidden = true;
+      refreshConnectLabel(); // a drop usually makes the next connect a resume
     }
   };
 
   const offer = await pc.createOffer();
   await pc.setLocalDescription(offer);
-  // Wait for ICE gathering so a single POST carries all candidates.
+  // Gather candidates for a single POST, but bounded: with a TURN server
+  // configured, browsers can take many seconds to declare gathering
+  // "complete" (e.g. a slow tcp variant) — 3 s of candidates is enough.
   await new Promise((resolve) => {
-    if (pc.iceGatheringState === "complete") return resolve();
+    const timer = setTimeout(resolve, 3000);
+    const done = () => { clearTimeout(timer); resolve(); };
+    if (pc.iceGatheringState === "complete") return done();
     pc.addEventListener("icegatheringstatechange", () => {
-      if (pc.iceGatheringState === "complete") resolve();
+      if (pc.iceGatheringState === "complete") done();
     });
   });
 
-  const response = await fetch("/api/offer", {
+  // Default: the server resumes a recently interrupted session. Explicit
+  // choices from the history view override it in either direction.
+  let offerUrl = "/api/offer";
+  if (opts.sessionId) offerUrl += `?session=${encodeURIComponent(opts.sessionId)}`;
+  else if (opts.newSession) offerUrl += "?new_session=1";
+  const response = await fetch(offerUrl, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
@@ -227,11 +289,14 @@ async function connect() {
       type: pc.localDescription.type,
     }),
   });
-  await pc.setRemoteDescription(await response.json());
+  const answer = await response.json();
+  await pc.setRemoteDescription(answer);
 
   $("connect").hidden = true;
   $("controls").hidden = false;
   applySpeaker(true);
+  // Reliable initial render, independent of the data channel's timing.
+  loadConnectHistory(answer.session_id, answer.resumed);
 }
 
 function sendText() {
@@ -244,15 +309,70 @@ function sendText() {
   applySpeaker(false); // typed turn → mirror to silent replies unless overridden
 }
 
-$("connect").addEventListener("click", () =>
-  connect().catch((err) => setStatus(`error: ${err.message}`))
-);
+function startConversation(opts = {}) {
+  // Immediate feedback: the button yields to the status line right away;
+  // it only comes back if the connection attempt fails.
+  $("connect").hidden = true;
+  connect(opts).catch((err) => {
+    setStatus(`error: ${err.message}`);
+    $("connect").hidden = false;
+    $("controls").hidden = true;
+  });
+}
+
+$("connect").addEventListener("click", () => startConversation());
 $("send").addEventListener("click", sendText);
 $("text").addEventListener("keydown", (e) => { if (e.key === "Enter") sendText(); });
 $("history").addEventListener("click", () => setHistoryVisible(historyView.hidden));
 $("history-back").addEventListener("click", () => {
   sessionDetail.hidden = true;
-  sessionList.hidden = false;
+  $("session-list-view").hidden = false;
+});
+
+// Session management: start fresh, continue a chosen session, or erase one.
+$("session-new").addEventListener("click", () => {
+  setHistoryVisible(false);
+  startConversation({ newSession: true });
+});
+$("session-resume").addEventListener("click", () => {
+  if (!viewingSessionId) return;
+  setHistoryVisible(false);
+  startConversation({ sessionId: viewingSessionId });
+});
+$("session-rename").addEventListener("click", async () => {
+  if (!viewingSessionId) return;
+  const current = $("session-title").textContent;
+  const title = window.prompt("Session title", current);
+  if (!title || !title.trim() || title.trim() === current) return;
+  const response = await fetch(
+    `/api/sessions/${encodeURIComponent(viewingSessionId)}`,
+    {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ title: title.trim() }),
+    },
+  );
+  if (!response.ok) {
+    setStatus("error: could not rename");
+    return;
+  }
+  $("session-title").textContent = (await response.json()).title;
+});
+
+$("session-delete").addEventListener("click", async () => {
+  if (!viewingSessionId) return;
+  if (!window.confirm("Delete this conversation and its audio for good?")) return;
+  const response = await fetch(
+    `/api/sessions/${encodeURIComponent(viewingSessionId)}`,
+    { method: "DELETE" },
+  );
+  if (!response.ok) {
+    const detail = (await response.json().catch(() => ({}))).detail;
+    setStatus(`error: ${detail || "could not delete"}`);
+    return;
+  }
+  viewingSessionId = null;
+  loadSessions().catch((err) => setStatus(`error: ${err.message}`));
 });
 
 $("mic").addEventListener("click", () => {
@@ -273,3 +393,5 @@ $("speaker").addEventListener("click", () => {
 if ("serviceWorker" in navigator) {
   navigator.serviceWorker.register("/sw.js");
 }
+
+refreshConnectLabel();

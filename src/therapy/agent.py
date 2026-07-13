@@ -76,24 +76,66 @@ from pipecat.transports.base_transport import TransportParams
 from pipecat.transports.smallwebrtc.transport import SmallWebRTCTransport
 from pipecat.utils.time import time_now_iso8601
 
-from therapy.dialogue.language_choice import ReplyLanguage, dominant_language
+from therapy.dialogue.language_choice import (
+    ReplyLanguage,
+    dominant_language,
+    reply_language_override_effect,
+)
 from therapy.dialogue.modality import TEXT, VOICE, ReplyModality
 from therapy.dialogue.policy import (
     build_system_prompt,
     continuity_note,
     language_pin_note,
     language_switch_note,
+    rehydrate_messages,
+    reply_language_reminder,
+    resume_note,
 )
 from therapy.memory import MemoryStore, make_summarizer
 from therapy.memory.distill import distill_facts
+from therapy.memory.store import resume_window_secs
+from therapy.memory.summarizer import entitle
 from therapy.perception.stt import (
     DEFAULT_LANGUAGE,
     clamp_language,
+    genuine_foreign_speech,
+    is_supported,
+    plausible_segment,
     whisper_model,
 )
+from therapy.server import live
+from therapy.server.protocol import session_state_message
 from therapy.speech.tts import voice_for
 
 LANGUAGE_ENUM = {"en": Language.EN, "es": Language.ES, "pt": Language.PT}
+
+# Shared across connections — see MultilingualWhisperSTTService._load.
+_whisper_model: Any = None
+
+# Reconnect-resume coordination (SPEC §8). A dropped connection schedules
+# finalization, but the same client usually reconnects seconds later — the
+# new pipeline must be able to cancel an in-flight finalize (_finalizers)
+# and, for one scheduled after it already resumed, make it a no-op
+# (live.py ownership tokens; only the current owner may close a session).
+_finalizers: dict[str, asyncio.Task[None]] = {}
+
+
+def vad_params() -> VADParams:
+    """Speech-detection thresholds, env-tunable without a rebuild.
+
+    Pipecat's defaults (confidence .7, min_volume .6) were tuned for close,
+    clean microphones; real phone speech over opus sits quieter, and the
+    field test lost most of it. stop_secs=1.0 also keeps a phrase with a
+    natural mid-sentence pause in one utterance instead of three.
+    """
+    return VADParams(
+        confidence=float(os.environ.get("THERAPY_VAD_CONFIDENCE", "0.6")),
+        start_secs=0.2,
+        # 1.2 s: thinking pauses mid-sentence kept splitting real speech at
+        # 1.0 s (field test); the cost is turn-end latency, tune per taste.
+        stop_secs=float(os.environ.get("THERAPY_VAD_STOP_SECS", "1.2")),
+        min_volume=float(os.environ.get("THERAPY_VAD_MIN_VOLUME", "0.3")),
+    )
 
 
 def tts_settings_for(language: str) -> TTSUpdateSettingsFrame:
@@ -104,6 +146,41 @@ def tts_settings_for(language: str) -> TTSUpdateSettingsFrame:
             language=LANGUAGE_ENUM[language],
         )
     )
+
+
+def _transcribe_utterance(
+    model: Any,
+    audio_float: Any,
+    language: str | None,
+    no_speech_threshold: float,
+) -> tuple[str, str | None, float]:
+    """Decode one utterance fully inside the calling (worker) thread.
+
+    faster-whisper's transcribe() is lazy — the heavy decode runs where the
+    segments generator is consumed. Consuming it on the event loop blocked
+    the loop for the length of the decode; on a long utterance that starved
+    WebRTC keepalives and dropped the connection mid-turn (field test
+    2026-07-10, confirmed by a watchdog health-probe failure at that
+    moment). Everything whisper-bound stays in this function.
+    """
+    segments, info = model.transcribe(
+        audio_float,
+        language=language,
+        # Carrying decoder context across utterances compounds
+        # hallucinations on degraded audio.
+        condition_on_previous_text=False,
+    )
+    text = " ".join(
+        segment.text.strip()
+        for segment in segments
+        if plausible_segment(
+            segment.no_speech_prob,
+            segment.avg_logprob,
+            segment.compression_ratio,
+            no_speech_threshold,
+        )
+    ).strip()
+    return text, info.language, info.language_probability
 
 
 class MultilingualWhisperSTTService(WhisperSTTService):
@@ -125,35 +202,72 @@ class MultilingualWhisperSTTService(WhisperSTTService):
         # where the raw utterance and its transcript exist together (SPEC §8).
         self._recorder = recorder
 
+    def _load(self) -> None:
+        # One faster-whisper instance per process, not per connection: loading
+        # takes tens of seconds on CPU (it blocked handshakes of connections
+        # racing the load) and each copy costs ~1 GB. Only one pipeline is
+        # live at a time (connection preemption), so sharing is safe.
+        global _whisper_model
+        if _whisper_model is None:
+            super()._load()
+            _whisper_model = self._model
+        else:
+            self._model = _whisper_model
+
     async def run_stt(self, audio: bytes):
         if not self._model:
             return
         await self.start_processing_metrics()
         audio_float = np.frombuffer(audio, dtype=np.int16).astype(np.float32) / 32768.0
-        segments, info = await asyncio.to_thread(
-            self._model.transcribe, audio_float, language=None
-        )
-        detected = info.language if info.language_probability > 0.5 else None
-        language = clamp_language(detected, self.current_language)
-        self.current_language = language
-
         threshold = self._settings.no_speech_prob
-        text = " ".join(
-            segment.text.strip()
-            for segment in segments
-            if not isinstance(threshold, float) or segment.no_speech_prob < threshold
-        ).strip()
+        no_speech = threshold if isinstance(threshold, float) else 0.6
+
+        text, detected, probability = await asyncio.to_thread(
+            _transcribe_utterance, self._model, audio_float, None, no_speech
+        )
+        if probability <= 0.5:
+            detected = None
+        if genuine_foreign_speech(detected, text):
+            # The user really is speaking a language TheraPy doesn't (the
+            # decode survived the plausibility filter) — transcribe it
+            # honestly under its own tag. The conversation language and
+            # reply choice stay put (TurnRelay skips unsupported turns).
+            language = str(detected).lower().split("-")[0]
+        else:
+            if detected and not is_supported(detected):
+                # Unsupported detection whose decode died in the filter —
+                # a hallucination signature (repeated Korean stock phrases
+                # in field testing), not a user switching languages.
+                # Re-decode anchored to the conversation to recover it.
+                logger.debug(
+                    f"Unsupported detection {detected!r}; re-decoding as "
+                    f"{self.current_language}"
+                )
+                text, _, _ = await asyncio.to_thread(
+                    _transcribe_utterance,
+                    self._model,
+                    audio_float,
+                    self.current_language,
+                    no_speech,
+                )
+                detected = self.current_language
+            language = clamp_language(detected, self.current_language)
+            self.current_language = language
         await self.stop_processing_metrics()
 
         if text:
             logger.debug(f"Transcription [{language}]: {text}")
             if self._recorder:
                 await asyncio.to_thread(self._recorder, audio, text, language)
+            try:
+                frame_language = Language(language)
+            except ValueError:
+                frame_language = None
             yield TranscriptionFrame(
                 text=text,
                 user_id=self._user_id,
                 timestamp=time_now_iso8601(),
-                language=LANGUAGE_ENUM[language],
+                language=frame_language,
             )
 
 
@@ -174,6 +288,13 @@ class TurnRelay(FrameProcessor):
         self._language: str | None = None
         self._modality = modality
         self._reply_language = reply_language
+        self._last_note_at: float = 0.0
+
+    async def _note(self, content: str) -> None:
+        self._last_note_at = time.monotonic()
+        await self.push_frame(
+            LLMMessagesAppendFrame(messages=[{"role": "system", "content": content}])
+        )
 
     @property
     def language(self) -> str | None:
@@ -183,35 +304,39 @@ class TurnRelay(FrameProcessor):
         """Record a language change applied elsewhere (e.g. a typed turn)."""
         self._language = language
 
-    async def _maybe_switch(self, language: str) -> None:
-        if language != self._language:
-            self._language = language
-            await self.push_frame(tts_settings_for(language))
-            await self.push_frame(
-                LLMMessagesAppendFrame(
-                    messages=[{"role": "system", "content": language_switch_note(language)}]
-                )
-            )
+    async def _maybe_switch(self, language: str) -> bool:
+        if language == self._language:
+            return False
+        self._language = language
+        await self.push_frame(tts_settings_for(language))
+        await self._note(language_switch_note(language))
+        return True
 
     async def process_frame(self, frame: Frame, direction: FrameDirection) -> None:
         await super().process_frame(frame, direction)
         if isinstance(frame, TranscriptionFrame) and direction == FrameDirection.DOWNSTREAM:
-            language = clamp_language(
-                frame.language.value if frame.language else None,
-                self._language or DEFAULT_LANGUAGE,
-            )
-            reply = self._reply_language.note_phrase(frame.text)
-            await self._maybe_switch(reply)
-            if self._reply_language.pinned and language != reply:
-                # Re-assert the pin right after the mismatched user message —
-                # small local models otherwise mirror the user's language.
-                await self.push_frame(
-                    LLMMessagesAppendFrame(
-                        messages=[
-                            {"role": "system", "content": language_pin_note(reply)}
-                        ]
-                    )
-                )
+            raw = frame.language.value if frame.language else None
+            base = raw.lower().split("-")[0] if raw else None
+            if base and not is_supported(base):
+                # Genuine speech in a language TheraPy doesn't speak: the
+                # transcript keeps its honest tag, but it must not steer
+                # the reply language — lingua only knows es/en/pt and
+                # would misread German words as one of them.
+                language = base
+                reply = self._reply_language.language
+            else:
+                language = clamp_language(base, self._language or DEFAULT_LANGUAGE)
+                reply = self._reply_language.note_phrase(frame.text)
+            switched = await self._maybe_switch(reply)
+            # Anchor EVERY turn, not just switches: small local models drift
+            # back to English mid-conversation (field test 2026-07-10) while
+            # the tag and voice stay correct. Bursty fragments of one
+            # aggregated turn share a single note (4 s dedupe).
+            if not switched and time.monotonic() - self._last_note_at > 4.0:
+                if self._reply_language.pinned and language != reply:
+                    await self._note(language_pin_note(reply))
+                else:
+                    await self._note(reply_language_reminder(reply))
             # Spoken turn → spoken reply unless the user overrode the speaker.
             speak = self._modality.note_turn(VOICE)
             await self.push_frame(LLMConfigureOutputFrame(skip_tts=not speak))
@@ -345,8 +470,22 @@ def make_llm_service():
     raise ValueError(f"Unknown THERAPY_LLM provider: {provider!r}")
 
 
-async def run_bot(webrtc_connection: Any) -> None:
-    """Build and run one conversation pipeline for a WebRTC connection."""
+async def run_bot(
+    webrtc_connection: Any,
+    *,
+    new_session: bool = False,
+    resume_session_id: str | None = None,
+) -> None:
+    """Build and run one conversation pipeline for a WebRTC connection.
+
+    Args:
+        webrtc_connection: The signaling-complete SmallWebRTC connection.
+        new_session: Skip reconnect-resume and always open a fresh session
+            (test scripts need isolated sessions; real clients resume).
+        resume_session_id: Continue this specific session (history browser's
+            explicit choice — no freshness window applies). Unknown ids fall
+            back to the default behavior. Wins over new_session.
+    """
     transport = SmallWebRTCTransport(
         webrtc_connection=webrtc_connection,
         params=TransportParams(
@@ -357,13 +496,48 @@ async def run_bot(webrtc_connection: Any) -> None:
     # Pipecat ≥1.x: VAD is an explicit pipeline stage. `TransportParams`
     # still accepts a `vad_analyzer` but non-Daily transports ignore it —
     # without this processor no speech is ever detected.
-    vad = VADProcessor(vad_analyzer=SileroVADAnalyzer(params=VADParams(stop_secs=0.7)))
+    vad = VADProcessor(vad_analyzer=SileroVADAnalyzer(params=vad_params()))
 
     store = MemoryStore()
-    session_id = store.create_session()
+
+    # A dropped connection is not a session boundary: reconnecting within
+    # the resume window reopens the interrupted session instead of starting
+    # an amnesiac new one (field test: a 4-minute WebRTC drop made the bot
+    # deny the whole prior conversation).
+    resumed_turns: list[dict] = []
+    session_id = None
+    if resume_session_id:
+        if store.has_session(resume_session_id):
+            session_id = resume_session_id
+        else:
+            logger.warning(f"Cannot resume unknown session {resume_session_id!r}")
+    if session_id is None and not new_session:
+        session_id = store.resume_candidate(resume_window_secs())
+    if session_id:
+        pending = _finalizers.pop(session_id, None)
+        if pending is not None:
+            pending.cancel()
+        store.reopen_session(session_id)
+        resumed_turns = store.session_turns(session_id)
+        logger.info(f"Resuming session {session_id} ({len(resumed_turns)} turns)")
+    else:
+        session_id = store.create_session()
+    owner = live.claim(session_id)
+
+    # Language state survives the reconnect too — pick up where the user
+    # left off instead of snapping back to English.
+    initial_language = DEFAULT_LANGUAGE
+    for turn in reversed(resumed_turns):
+        if turn["role"] == "user":
+            initial_language = clamp_language(str(turn["language"]), DEFAULT_LANGUAGE)
+            break
 
     modality = ReplyModality()
-    reply_language = ReplyLanguage(initial=DEFAULT_LANGUAGE)
+    # established: only a resumed session has real history behind `initial`
+    # — a fresh one must adopt the user's first phrase (greeting) outright.
+    reply_language = ReplyLanguage(
+        initial=initial_language, established=bool(resumed_turns)
+    )
 
     def record_user_voice(audio: bytes, text: str, language: str) -> None:
         store.add_turn(
@@ -380,21 +554,28 @@ async def run_bot(webrtc_connection: Any) -> None:
         )
 
     stt = MultilingualWhisperSTTService(recorder=record_user_voice)
+    stt.current_language = initial_language
     turn_relay = TurnRelay(modality, reply_language)
     tts = KokoroTTSService(
         settings=KokoroTTSSettings(
-            voice=voice_for(DEFAULT_LANGUAGE),
-            language=LANGUAGE_ENUM[DEFAULT_LANGUAGE],
+            voice=voice_for(initial_language),
+            language=LANGUAGE_ENUM[initial_language],
         )
     )
     llm = make_llm_service()
 
     # Continuity (SPEC §8): the current conversation goes verbatim; the past
-    # arrives only as distilled summaries + the user model.
+    # arrives only as distilled summaries + the user model. A resumed
+    # session IS the current conversation — its turns are rehydrated
+    # verbatim after the reconnect marker. (recent_summaries already
+    # excludes it: reopen_session cleared its ended_at.)
     messages = [{"role": "system", "content": build_system_prompt()}]
     memory_note = continuity_note(store.recent_summaries(), store.facts())
     if memory_note:
         messages.append({"role": "system", "content": memory_note})
+    if resumed_turns:
+        messages.append({"role": "system", "content": resume_note()})
+        messages.extend(rehydrate_messages(resumed_turns))
     context = LLMContext(messages=messages)
     aggregators = LLMContextAggregatorPair(context)
 
@@ -433,6 +614,15 @@ async def run_bot(webrtc_connection: Any) -> None:
         if not isinstance(message, dict):
             return
 
+        # Client's channel just opened — send the server-truth chat state so
+        # a reconnect or page reload renders the resumed transcript.
+        if message.get("type") == "client_ready":
+            state = session_state_message(
+                session_id, bool(resumed_turns), resumed_turns
+            )
+            await task.queue_frames([OutputTransportMessageUrgentFrame(message=state)])
+            return
+
         # Speaker override from the client: true/false, or null for auto.
         if message.get("type") == "voice_replies":
             enabled = message.get("enabled")
@@ -449,29 +639,24 @@ async def run_bot(webrtc_connection: Any) -> None:
             except ValueError:
                 logger.warning(f"Ignoring unsupported reply_language: {code!r}")
                 return
-            if reply != turn_relay.language:
-                note = language_pin_note(reply) if code else language_switch_note(reply)
-                turn_relay.note_language(reply)
-                await task.queue_frames(
-                    [
-                        tts_settings_for(reply),
-                        LLMMessagesAppendFrame(
-                            messages=[{"role": "system", "content": note}]
-                        ),
-                    ]
+            # Auto asserts nothing on replay; only a pin anchors (the effect
+            # helper carries the reasoning). Otherwise the fresh-connect auto
+            # default (en) primes the model to English before the user speaks.
+            voice_language, note = reply_language_override_effect(
+                code if isinstance(code, str) else None, reply, turn_relay.language
+            )
+            frames: list[Frame] = []
+            if voice_language:
+                turn_relay.note_language(voice_language)
+                frames.append(tts_settings_for(voice_language))
+            if note:
+                frames.append(
+                    LLMMessagesAppendFrame(
+                        messages=[{"role": "system", "content": note}]
+                    )
                 )
-            elif code:
-                # Same language, but now a pin — the LLM must hold it even
-                # if the user switches.
-                await task.queue_frames(
-                    [
-                        LLMMessagesAppendFrame(
-                            messages=[
-                                {"role": "system", "content": language_pin_note(reply)}
-                            ]
-                        )
-                    ]
-                )
+            if frames:
+                await task.queue_frames(frames)
             return
 
         # Typed turn from the data channel — same conversation, text modality.
@@ -487,18 +672,15 @@ async def run_bot(webrtc_connection: Any) -> None:
         frames: list[Frame] = []
         if reply != turn_relay.language:
             frames.append(tts_settings_for(reply))
-            frames.append(
-                LLMMessagesAppendFrame(
-                    messages=[{"role": "system", "content": language_switch_note(reply)}]
-                )
-            )
+            note = language_switch_note(reply)
         elif reply_language.pinned and language != reply:
-            # Same pin re-assertion as voice turns (TurnRelay).
-            frames.append(
-                LLMMessagesAppendFrame(
-                    messages=[{"role": "system", "content": language_pin_note(reply)}]
-                )
-            )
+            note = language_pin_note(reply)
+        else:
+            # Per-turn anchor, mirroring TurnRelay (small-model drift).
+            note = reply_language_reminder(reply)
+        frames.append(
+            LLMMessagesAppendFrame(messages=[{"role": "system", "content": note}])
+        )
         stt.current_language = language
         turn_relay.note_language(reply)
         await asyncio.to_thread(store.add_turn, session_id, "user", TEXT, language, text)
@@ -521,27 +703,62 @@ async def run_bot(webrtc_connection: Any) -> None:
         nonlocal finalized
         if finalized:
             return
+        # A reconnect may have resumed this session before this task ran
+        # (preemption schedules finalize during cancellation, possibly after
+        # the new pipeline already took ownership) — then it is no longer
+        # ours to close.
+        if not live.owns(session_id, owner):
+            return
         finalized = True
         turns = await asyncio.to_thread(store.session_turns, session_id)
         summary: str | None = None
         facts: list[str] = []
+        title: str | None = None
         if turns:
             try:
                 summary = (await make_summarizer().summarize(turns)).strip() or None
                 facts = await distill_facts(turns)
+                title = await entitle(turns)
             except Exception as exc:  # LLM down ≠ lost session; keep the turns.
                 logger.warning(f"Session distillation failed for {session_id}: {exc}")
         for statement in facts:
             await asyncio.to_thread(store.upsert_fact, statement)
+        if title:
+            # Fill-only: a user's rename (or an earlier generation) wins.
+            await asyncio.to_thread(store.ensure_title, session_id, title)
         await asyncio.to_thread(store.end_session, session_id, summary)
+        live.release(session_id, owner)
         logger.info(
             f"Session {session_id} closed "
             f"({len(turns)} turns, summary={bool(summary)}, facts={len(facts)})"
         )
 
+    finalize_task: asyncio.Task[None] | None = None
+
+    def schedule_finalize() -> None:
+        """Start finalization, registered so a resuming reconnect can cancel it.
+
+        Scheduled at most once: a normal disconnect reaches both call sites
+        (the event handler, then the runner's finally), and a duplicate
+        registration would shadow the real task in _finalizers — a resume
+        would then cancel the no-op while the original closed the session
+        out from under the new pipeline.
+        """
+        nonlocal finalize_task
+        if finalize_task is not None:
+            return
+        finalize_task = asyncio.create_task(finalize_session())
+        _finalizers[session_id] = finalize_task
+
+        def _forget(done: asyncio.Task[None]) -> None:
+            if _finalizers.get(session_id) is done:
+                del _finalizers[session_id]
+
+        finalize_task.add_done_callback(_forget)
+
     @transport.event_handler("on_client_disconnected")
     async def on_client_disconnected(transport: Any, connection: Any) -> None:
-        asyncio.create_task(finalize_session())
+        schedule_finalize()
         await task.cancel()
 
     runner = PipelineRunner(handle_sigint=False)
@@ -550,4 +767,4 @@ async def run_bot(webrtc_connection: Any) -> None:
     finally:
         # A preempted pipeline (new connection cancelled this one) never sees
         # on_client_disconnected — its session must still close and summarize.
-        asyncio.create_task(finalize_session())
+        schedule_finalize()

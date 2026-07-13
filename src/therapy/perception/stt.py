@@ -25,3 +25,41 @@ def clamp_language(code: str | None, fallback: str) -> str:
         if base in SUPPORTED_LANGUAGES:
             return base
     return fallback
+
+
+def is_supported(code: str | None) -> bool:
+    """Whether a detected language code is one TheraPy speaks."""
+    return bool(code) and code.lower().split("-")[0] in SUPPORTED_LANGUAGES
+
+
+def genuine_foreign_speech(detected: str | None, text: str) -> bool:
+    """Plausible decode in an unsupported language = real speech, not noise.
+
+    Hallucinated decodes die in the plausibility filter (their text comes
+    back empty); what survives in an unsupported language is the user
+    actually speaking it. Present it verbatim with its real tag — anchoring
+    the re-decode to a supported language makes whisper silently translate
+    (field test: German shown as English, tagged en).
+    """
+    return bool(text) and bool(detected) and not is_supported(detected)
+
+
+def plausible_segment(
+    no_speech_prob: float,
+    avg_logprob: float,
+    compression_ratio: float,
+    no_speech_threshold: float = 0.6,
+) -> bool:
+    """Whisper hallucination filter for one transcription segment.
+
+    Degraded audio makes Whisper emit repeated stock phrases, often in an
+    unrelated language (a Korean "뵐게요. 뵐게요." surfaced in field testing
+    mid-English-sentence). Repetition inflates the compression ratio and
+    the decoder's own confidence drops — the thresholds are the ones
+    Whisper itself uses to reject a decoding before falling back.
+    """
+    if no_speech_prob > no_speech_threshold:
+        return False
+    if avg_logprob < -1.2:
+        return False
+    return compression_ratio <= 2.4
