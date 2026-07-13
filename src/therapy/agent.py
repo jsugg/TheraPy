@@ -46,7 +46,6 @@ from typing import Any
 
 import numpy as np
 from loguru import logger
-
 from pipecat.audio.vad.silero import SileroVADAnalyzer
 from pipecat.audio.vad.vad_analyzer import VADParams
 from pipecat.frames.frames import (
@@ -69,7 +68,9 @@ from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.runner import PipelineRunner
 from pipecat.pipeline.task import PipelineParams, PipelineTask
 from pipecat.processors.aggregators.llm_context import LLMContext
-from pipecat.processors.aggregators.llm_response_universal import LLMContextAggregatorPair
+from pipecat.processors.aggregators.llm_response_universal import (
+    LLMContextAggregatorPair,
+)
 from pipecat.processors.audio.vad_processor import VADProcessor
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 from pipecat.services.kokoro.tts import KokoroTTSService, KokoroTTSSettings
@@ -88,15 +89,16 @@ from therapy.dialogue.language_choice import (
 from therapy.dialogue.modality import TEXT, VOICE, ReplyModality
 from therapy.dialogue.policy import (
     build_system_prompt,
-    continuity_note,
+    graph_continuity_note,
     language_pin_note,
     language_switch_note,
     rehydrate_messages,
     reply_language_reminder,
     resume_note,
 )
+from therapy.knowledge import distill as knowledge_distill
+from therapy.knowledge.user_model import UserModel
 from therapy.memory import MemoryStore, make_summarizer
-from therapy.memory.distill import distill_facts
 from therapy.memory.store import resume_window_secs
 from therapy.memory.summarizer import entitle
 from therapy.perception.stt import (
@@ -566,6 +568,9 @@ async def run_bot(
     vad = VADProcessor(vad_analyzer=SileroVADAnalyzer(params=vad_params()))
 
     store = MemoryStore()
+    # The property-graph user model shares the store's data dir (SPEC Appendix
+    # A). v1 facts are migrated to observation nodes on init.
+    user_model = UserModel()
 
     # A dropped connection is not a session boundary: reconnecting within
     # the resume window reopens the interrupted session instead of starting
@@ -612,6 +617,9 @@ async def run_bot(
         store.add_turn(
             session_id, "user", VOICE, language, text, audio=audio, sample_rate=16_000
         )
+        # Freeform observation inbox (W2): distillation promotes it between
+        # sessions. never_store is enforced inside add_observation.
+        user_model.add_observation(text, session_id=session_id, language=language)
 
     def record_assistant(text: str) -> None:
         store.add_turn(
@@ -639,7 +647,20 @@ async def run_bot(
     # verbatim after the reconnect marker. (recent_summaries already
     # excludes it: reopen_session cleared its ended_at.)
     messages = [{"role": "system", "content": build_system_prompt()}]
-    memory_note = continuity_note(store.recent_summaries(), store.facts())
+    # Graph-walk context assembly (W3): identity + preferences + the
+    # never_initiate list, plus relevant confirmed/pattern claims. The opening
+    # topic is the resumed conversation's last user turn, if any.
+    opening_topic = next(
+        (
+            str(turn["text"])
+            for turn in reversed(resumed_turns)
+            if turn["role"] == "user" and turn.get("text")
+        ),
+        "",
+    )
+    memory_note = graph_continuity_note(
+        user_model, topic=opening_topic, summaries=store.recent_summaries()
+    )
     if memory_note:
         messages.append({"role": "system", "content": memory_note})
     if resumed_turns:
@@ -769,6 +790,9 @@ async def run_bot(
         stt.current_language = language
         turn_relay.note_language(reply)
         await asyncio.to_thread(store.add_turn, session_id, "user", TEXT, label, text)
+        await asyncio.to_thread(
+            user_model.add_observation, text, session_id=session_id, language=label
+        )
         # Typed turn → silent reply unless the user overrode the speaker.
         speak = modality.note_turn(TEXT)
         frames.append(LLMConfigureOutputFrame(skip_tts=not speak))
@@ -797,25 +821,29 @@ async def run_bot(
         finalized = True
         turns = await asyncio.to_thread(store.session_turns, session_id)
         summary: str | None = None
-        facts: list[str] = []
+        distilled = knowledge_distill.DistillResult()
         title: str | None = None
         if turns:
             try:
                 summary = (await make_summarizer().summarize(turns)).strip() or None
-                facts = await distill_facts(turns)
+                # Between-session distillation (W2): inbox + transcript -> graph
+                # nodes/edges, then the graduation floor. Replaces the Phase-2
+                # flat-fact extraction.
+                distilled = await knowledge_distill.distill_session(
+                    user_model, turns, session_id
+                )
                 title = await entitle(turns)
             except Exception as exc:  # LLM down ≠ lost session; keep the turns.
                 logger.warning(f"Session distillation failed for {session_id}: {exc}")
-        for statement in facts:
-            await asyncio.to_thread(store.upsert_fact, statement)
         if title:
             # Fill-only: a user's rename (or an earlier generation) wins.
             await asyncio.to_thread(store.ensure_title, session_id, title)
         await asyncio.to_thread(store.end_session, session_id, summary)
         live.release(session_id, owner)
         logger.info(
-            f"Session {session_id} closed "
-            f"({len(turns)} turns, summary={bool(summary)}, facts={len(facts)})"
+            f"Session {session_id} closed ({len(turns)} turns, "
+            f"summary={bool(summary)}, nodes={len(distilled.promoted_nodes)}, "
+            f"proposed={len(distilled.proposed_patterns)})"
         )
 
     finalize_task: asyncio.Task[None] | None = None
