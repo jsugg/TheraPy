@@ -10,8 +10,8 @@ continuous conversation against a running TheraPy server:
    whose dominance flips mid-phrase and MUST flip it (the two normative
    SPEC §7 examples, spoken — the flip phrase is stitched from a Spanish
    voice and an English voice into one utterance);
-3. sends a typed turn and verifies the reply is silent server-side
-   (modality mirroring — no TTS audio should arrive);
+3. sends a typed turn and verifies it gets a text reply (whether audio
+   accompanies it is the user's speaker-toggle choice, so it is not gated);
 4. speaks again while the assistant reply is still playing (barge-in) and
    checks the reply audio stops;
 5. pinned mode (SPEC §7): pins replies to pt over the data channel, speaks
@@ -319,19 +319,20 @@ async def main() -> None:
         print(results[-1], flush=True)
         await asyncio.sleep(1.0)
 
-    # 2. Typed turn → transcript reply, and NO audio (server-side TTS skip).
-    # First let the previous reply's audio finish draining, otherwise its
-    # tail registers as a false "leak".
+    # 2. Typed turn → text reply. The reply modality mirrors the input by
+    # default (typed → silent), but audio on a typed reply is fine — the user's
+    # speaker toggle is the audio control, so it is observed, not gated (owner,
+    # 2026-07-11). Gate only on the text reply arriving.
     while (last := obs.last_voiced()) and time.monotonic() - last < 2.0:
         await asyncio.sleep(0.2)
     seen = len(obs.transcripts)
     sent_at = time.monotonic()
     channel.send(json.dumps({"type": "user_text", "text": TYPED_TURN}))
     bot_msg = await obs.wait_transcript("assistant", seen)
-    await asyncio.sleep(3.0)  # grace window in which audio must NOT appear
-    leaked = obs.first_voiced_after(sent_at)
-    silent = "silent ✓" if leaked is None else f"AUDIO LEAKED at +{leaked - sent_at:.2f}s"
-    results.append(f"[typed] reply modality: {silent}\n     reply: {bot_msg.get('text', '')[:120]!r}")
+    await asyncio.sleep(2.0)
+    modality = "silent (mirrored)" if obs.first_voiced_after(sent_at) is None else "with audio"
+    status = "text reply ✓" if bot_msg.get("text") else "NO TEXT REPLY"
+    results.append(f"[typed] {status} — {modality}\n     reply: {bot_msg.get('text', '')[:120]!r}")
     print(results[-1], flush=True)
 
     # 3. Voice turn again (mirroring must restore speech), used for barge-in:
@@ -422,7 +423,7 @@ async def main() -> None:
 
     await pc.close()
 
-    bad = ("MISMATCH", "NO AUDIO", "LEAKED", "SKIPPED", "still playing")
+    bad = ("MISMATCH", "NO AUDIO", "NO TEXT REPLY", "SKIPPED", "still playing")
     failures = [line for line in results if any(marker in line for marker in bad)]
     if failures:
         sys.exit(f"\nFAIL — {len(failures)} scenario(s) not green.")

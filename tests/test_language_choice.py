@@ -5,6 +5,7 @@ import pytest
 from therapy.dialogue.language_choice import (
     ReplyLanguage,
     dominant_language,
+    label_language,
     reply_language_override_effect,
 )
 
@@ -112,3 +113,26 @@ def test_pin_override_anchors_without_revoicing_when_language_matches() -> None:
     voice, note = reply_language_override_effect("es", "es", "es")
     assert voice is None
     assert note is not None and "español" in note.lower()
+
+
+# --- label_language: honest display tag (broader than the reply set) --------
+
+
+def test_label_language_names_out_of_scope_languages() -> None:
+    # German is out of scope for replies but must be tagged honestly (field
+    # test 2026-07-11: German shown as de/pt/none inconsistently).
+    assert label_language("Ich möchte wissen, was du darüber denkst.", "pt") == "de"
+    assert label_language("Sag mir, was du glaubst, was das Leben ist.", "pt") == "de"
+
+
+def test_label_language_keeps_supported_languages() -> None:
+    assert label_language("Hoy fue un día muy largo en el trabajo.", "en") == "es"
+    assert label_language("I finally finished the project today.", "es") == "en"
+    assert label_language("Hoje foi um dia bem longo no trabalho.", "en") == "pt"
+
+
+def test_label_language_falls_back_on_empty_or_uncertain() -> None:
+    assert label_language("", "pt") == "pt"
+    assert label_language("   ", "es") == "es"
+    # A bare number carries no language signal — keep the fallback.
+    assert label_language("42", "en") == "en"
