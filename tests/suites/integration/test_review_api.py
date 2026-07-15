@@ -115,7 +115,10 @@ def test_delete_session_endpoint_removes_one_session(data_dir: Path, client) -> 
 
     response = client.delete(f"/api/sessions/{doomed}")
     assert response.status_code == 200
-    assert response.json() == {"deleted": doomed}
+    result = response.json()
+    assert result["deleted"] == doomed
+    assert result["mode"] == "keep_knowledge"
+    assert result["learned_knowledge_survives"] is True
     remaining = client.get("/api/sessions").json()["sessions"]
 
     assert [session["id"] for session in remaining] == [kept]
@@ -189,7 +192,7 @@ def test_rename_session_endpoint(data_dir: Path, client) -> None:
         client.patch(
             f"/api/sessions/{session_id}", json={"title": "  "}
         ).status_code
-        == 400
+        == 422
     )
     assert client.patch("/api/sessions/nope", json={"title": "x"}).status_code == 404
 

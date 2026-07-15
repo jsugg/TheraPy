@@ -108,6 +108,57 @@ body {
   border: 0;
 }
 
+/* Owner model workspace: readable list is primary; SVG is an optional overview. */
+.workspace { padding: 0 0 2rem; }
+.workspace-header, .card-heading, .boundary-row, .item-actions {
+  display: flex; align-items: center; justify-content: space-between; gap: .75rem;
+}
+.workspace-header { align-items: flex-start; }
+.workspace-header h2, .workspace-card h3, .workspace-card h4 { margin: 0; }
+.workspace-header p { margin: .25rem 0; }
+.eyebrow { color: var(--muted, #52665d); font-size: .78rem; font-weight: 700; letter-spacing: .08em; text-transform: uppercase; }
+.workspace-card {
+  background: color-mix(in srgb, var(--surface, #fff) 94%, #d8f3dc);
+  border: 1px solid color-mix(in srgb, currentColor 12%, transparent);
+  border-radius: 1rem; margin-top: 1rem; padding: 1rem;
+}
+.filter-row { display: flex; align-items: end; flex-wrap: wrap; gap: .75rem; margin: 1rem 0; }
+.filter-row label { display: grid; gap: .3rem; min-width: 9rem; font-size: .84rem; }
+.filter-row input, .filter-row select { max-width: 20rem; }
+.model-columns { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 1rem; }
+.model-item { border-top: 1px solid color-mix(in srgb, currentColor 12%, transparent); padding: .8rem 0; }
+.model-item:first-child { border-top: 0; }
+.model-item .meta { color: var(--muted, #52665d); font-size: .8rem; margin: .25rem 0 .55rem; }
+.item-actions { justify-content: flex-start; flex-wrap: wrap; }
+.item-actions button { min-height: 2.4rem; }
+.boundary-row { border-top: 1px solid color-mix(in srgb, currentColor 12%, transparent); padding: .55rem 0; }
+.model-graph { width: 100%; min-height: 18rem; background: #f4fbf6; border-radius: .75rem; }
+.graph-edge { stroke: #8aa398; stroke-width: 2; }
+.graph-edge.status-confirmed { stroke: #2d6a4f; stroke-width: 3; }
+.graph-node circle { fill: #b7e4c7; stroke: #2d6a4f; stroke-width: 2; cursor: pointer; }
+.graph-node.status-proposed circle { fill: #ffe8a3; stroke: #9c6b00; }
+.graph-node.status-rejected circle { fill: #eee; stroke: #777; }
+.graph-node text { text-anchor: middle; font-size: 11px; fill: #183a2c; }
+.danger-zone { border-color: #b74d4d; }
+.channel-settings { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: .65rem; border-top: 1px solid color-mix(in srgb, currentColor 12%, transparent); padding: 1rem 0; }
+.channel-settings h4 { grid-column: 1 / -1; text-transform: capitalize; }
+.channel-settings label { display: grid; gap: .25rem; font-size: .8rem; }
+.channel-settings button { align-self: end; }
+.outreach-message { background: #edf8f0; border-left: .25rem solid #40916c; padding: .75rem; }
+#digest-list pre { white-space: pre-wrap; font: inherit; }
+#model-detail { width: min(42rem, calc(100% - 2rem)); max-height: 85vh; overflow: auto; border: 0; border-radius: 1rem; }
+#model-detail::backdrop { background: rgb(0 0 0 / .42); }
+#model-detail dl { display: grid; grid-template-columns: max-content 1fr; gap: .3rem .8rem; }
+#model-detail dt { font-weight: 700; }
+#model-detail dd { margin: 0; overflow-wrap: anywhere; }
+.dialog-close { float: right; }
+
+@media (max-width: 720px) {
+  .model-columns { grid-template-columns: 1fr; }
+  .filter-row > label { flex: 1 1 9rem; }
+  .channel-settings { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+
 .presence-pill {
   display: inline-flex;
   align-items: center;

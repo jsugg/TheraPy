@@ -2,7 +2,7 @@
  * conversation (WebRTC, /api/*) is never cached. Shell fetches carry a
  * timeout: a hung server (wedged Docker VM) must degrade to the cached
  * shell in seconds, not spin forever. */
-const CACHE = "therapy-shell-v12";
+const CACHE = "therapy-shell-v18";
 const SHELL = [
   "/", "/styles.css", "/app.js", "/companion.js", "/manifest.webmanifest",
   "/icon.svg", "/icon-192.png", "/icon-512.png",
@@ -53,5 +53,40 @@ self.addEventListener("fetch", (e) => {
           headers: { "Content-Type": "text/plain" },
         });
       })
+  );
+});
+
+// Push payloads intentionally carry no reflection text, only local navigation.
+self.addEventListener("push", (event) => {
+  let payload = {};
+  try { payload = event.data ? event.data.json() : {}; } catch { payload = {}; }
+  const title = payload.title || "TheraPy";
+  event.waitUntil(self.registration.showNotification(title, {
+    body: "A reflection is available whenever you want it.",
+    icon: "/icon-192.png",
+    badge: "/icon-192.png",
+    data: { url: payload.url || "/#model" },
+    tag: "therapy-reflection-available",
+    renotify: false,
+  }));
+});
+
+self.addEventListener("notificationclick", (event) => {
+  event.notification.close();
+  const target = new URL(
+    event.notification.data?.url || "/#model",
+    self.location.origin,
+  ).href;
+  event.waitUntil(
+    self.clients.matchAll({ type: "window", includeUncontrolled: true })
+      .then((clients) => {
+        for (const client of clients) {
+          if (client.url.startsWith(self.location.origin) && "focus" in client) {
+            client.navigate(target);
+            return client.focus();
+          }
+        }
+        return self.clients.openWindow(target);
+      }),
   );
 });

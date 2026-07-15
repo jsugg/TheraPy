@@ -74,9 +74,17 @@ def _reset_app_singletons() -> None:
     """Clear the app's lru_cache singletons so each test rebuilds them fresh."""
     from therapy.server import app as app_mod
 
-    for cached in ("_store", "_model", "_research"):
+    for cached in (
+        "_store",
+        "_model",
+        "_research",
+        "_insights",
+        "_proactivity",
+        "_data",
+        "_acceptance_agent",
+    ):
         singleton = getattr(app_mod, cached, None)
-        if singleton is not None:
+        if singleton is not None and hasattr(singleton, "cache_clear"):
             singleton.cache_clear()
 
 

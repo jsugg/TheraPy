@@ -16,6 +16,9 @@
       <div class="header-left">
         <button id="history" class="icon-button toggle" type="button"
                 aria-label="Conversation history" aria-pressed="false" title="History">📖</button>
+        <button id="model-workspace-button" class="icon-button toggle" type="button"
+                aria-label="Your model and research" aria-pressed="false"
+                title="Your model">🧭</button>
       </div>
 
       <div class="companion-heading">
@@ -65,6 +68,92 @@
           <h2 id="session-title"></h2>
           <div id="session-turns"></div>
         </div>
+      </section>
+
+      <section id="model-workspace" class="workspace" aria-label="Your model" hidden>
+        <header class="workspace-header">
+          <div>
+            <p class="eyebrow">Owner workspace</p>
+            <h2>Your model</h2>
+            <p>Inspect, correct, confirm, or erase anything Rowan has learned.</p>
+          </div>
+          <button id="model-close" type="button" aria-label="Close your model">×</button>
+        </header>
+
+        <form id="graph-filters" class="filter-row" aria-label="Graph filters">
+          <label>Type <select id="graph-type"><option value="">All</option></select></label>
+          <label>Status
+            <select id="graph-status">
+              <option value="">All</option><option>observation</option>
+              <option>proposed</option><option>confirmed</option>
+              <option>rejected</option><option>needs_revalidation</option>
+            </select>
+          </label>
+          <label>Source
+            <select id="graph-source">
+              <option value="">All</option><option>conversation</option>
+              <option>distilled</option><option>user-stated</option><option>inferred</option>
+            </select>
+          </label>
+          <button type="submit">Apply</button>
+        </form>
+
+        <section class="workspace-card" aria-labelledby="graph-heading">
+          <div class="card-heading">
+            <h3 id="graph-heading">Knowledge graph</h3>
+            <button id="graph-view-toggle" type="button" aria-pressed="false">Show graph</button>
+          </div>
+          <svg id="model-graph" class="model-graph" viewBox="0 0 720 300"
+               role="img" aria-label="Knowledge relationship graph" hidden></svg>
+          <div id="model-list" class="model-columns">
+            <section><h4>Claims</h4><div id="model-nodes"></div></section>
+            <section><h4>Relationships</h4><div id="model-edges"></div></section>
+          </div>
+        </section>
+
+        <section class="workspace-card" aria-labelledby="insights-heading">
+          <h3 id="insights-heading">Pending reflections</h3>
+          <div id="pending-insights"></div>
+        </section>
+
+        <section class="workspace-card" aria-labelledby="boundaries-heading">
+          <h3 id="boundaries-heading">Privacy boundaries</h3>
+          <form id="boundary-form" class="filter-row">
+            <label>Rule <select id="boundary-kind"><option>never_store</option><option>never_initiate</option></select></label>
+            <label>Topic or phrase <input id="boundary-value" maxlength="500" required></label>
+            <button type="submit">Add boundary</button>
+          </form>
+          <div id="boundary-list"></div>
+        </section>
+
+        <section class="workspace-card" aria-labelledby="research-heading">
+          <h3 id="research-heading">Research corpus</h3>
+          <form id="research-upload" class="filter-row">
+            <label>Local source <input id="research-file" type="file"
+              accept=".pdf,.png,.jpg,.jpeg,.webp,.html,.htm,.md,.txt" required></label>
+            <button type="submit">Import locally</button>
+          </form>
+          <div id="research-documents"></div>
+        </section>
+
+        <section class="workspace-card" aria-labelledby="proactivity-heading">
+          <h3 id="proactivity-heading">Proactive reflections</h3>
+          <p>Every channel is off until you opt in. Times use your saved timezone.</p>
+          <div id="proactivity-channels"></div>
+          <button id="push-subscribe" type="button">Enable this browser for encrypted push</button>
+          <div id="in-app-outreach" aria-live="polite"></div>
+          <div id="digest-list"></div>
+        </section>
+
+        <section class="workspace-card danger-zone" aria-labelledby="data-heading">
+          <h3 id="data-heading">Your data</h3>
+          <button id="data-export" type="button">Export everything</button>
+          <label>Restore a complete export
+            <input id="data-restore-file" type="file" accept="application/json,.json">
+          </label>
+          <button id="data-restore" type="button">Restore everything</button>
+          <button id="data-delete" class="danger" type="button">Delete everything</button>
+        </section>
       </section>
 
       <main id="chat" aria-live="polite" aria-label="Conversation"></main>
@@ -121,6 +210,11 @@
   </section>
 
   <audio id="bot-audio" autoplay playsinline></audio>
+  <dialog id="model-detail" aria-labelledby="model-detail-title">
+    <form method="dialog"><button class="dialog-close" aria-label="Close">×</button></form>
+    <h2 id="model-detail-title">Claim detail</h2>
+    <div id="model-detail-body"></div>
+  </dialog>
   <script src="/companion.js"></script>
   <script src="/app.js"></script>
 </body>

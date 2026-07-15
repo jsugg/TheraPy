@@ -25,6 +25,7 @@ class FakeVoiceGateway:
     answer: WebRTCAnswer = WebRTCAnswer(sdp="answer-sdp", type="answer", pc_id="peer-1")
     error: Exception | None = None
     calls: list[tuple[WebRTCOffer, SessionTarget]] = field(default_factory=list)
+    disconnected: list[str] = field(default_factory=list)
     closed: bool = False
 
     async def negotiate(
@@ -37,6 +38,10 @@ class FakeVoiceGateway:
 
     async def close(self) -> None:
         self.closed = True
+
+    async def disconnect(self, peer_id: str) -> bool:
+        self.disconnected.append(peer_id)
+        return True
 
 
 @pytest.fixture
@@ -74,6 +79,18 @@ def test_offer_new_session_preserves_response_shape(
             SessionTarget(session_id=None, new_session=True),
         )
     ]
+
+
+def test_disconnect_voice_uses_owned_gateway(
+    gateway_client: tuple[TestClient, FakeVoiceGateway],
+) -> None:
+    client, gateway = gateway_client
+
+    response = client.post("/api/voice/disconnect", params={"pc_id": "peer-1"})
+
+    assert response.status_code == 200
+    assert response.json() == {"disconnected": True}
+    assert gateway.disconnected == ["peer-1"]
 
 
 def test_offer_automatically_resumes_and_enriches_transcript_in_order(
