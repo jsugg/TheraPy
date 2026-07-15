@@ -1,7 +1,7 @@
 # Phase-0 spike: Pipecat vs. LiveKit Agents
 
 **Verdict: Pipecat with `SmallWebRTCTransport`.**
-Date: 2026-07-09 · Status: decided — phase 1 is built on it (`agent.py`, PWA client); working voice+text loop confirms the choice in code
+Date: 2026-07-09 · Status: decided — phase 1 is built on it (`therapy.integrations.pipecat`, PWA client); working voice+text loop confirms the choice in code
 
 ## Evaluation criteria (from SPEC)
 
@@ -41,8 +41,10 @@ Python process.
 - P2P WebRTC proves unreliable across networks the VPS must serve → managed SFU reconsidered
 - Native mobile apps replace the PWA → LiveKit's mobile SDKs weigh more
 
-Migration cost is contained by design: only `agent.py` (server) and the
-client transport layer know the framework (SPEC §5).
+Migration cost is contained by design: direct Pipecat dependencies live only
+under `therapy.integrations.pipecat`; FastAPI and domain modules use TheraPy's
+owned `VoiceGateway` contract. The browser remains the other transport-aware
+edge (SPEC §5).
 
 ## Sources
 

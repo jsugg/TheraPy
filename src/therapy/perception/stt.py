@@ -1,7 +1,7 @@
 """STT configuration and language detection helpers (framework-free).
 
 The actual pipeline service (a faster-whisper subclass with per-utterance
-language auto-detection) lives in agent.py, the only framework-aware module
+language auto-detection) lives in the Pipecat integration pipeline
 (SPEC §5). This module owns the domain knowledge it consumes: which
 languages TheraPy speaks and model selection. Text-language detection for
 typed turns lives in dialogue/language_choice.py (lingua, word-level).

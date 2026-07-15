@@ -2,7 +2,7 @@
 
 Framework-free. SPEC §5: response modality mirrors the input by default —
 a spoken turn gets a spoken reply, a typed turn gets a silent one — with a
-user override on top. The pipeline (agent.py) consults this state to tell
+user override on top. The Pipecat pipeline consults this state to tell
 the LLM/TTS stage whether to synthesize speech for the upcoming reply.
 """
 

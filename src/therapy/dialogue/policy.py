@@ -1,7 +1,7 @@
 """Dialogue policy: persona, register, style arc, safety guardrails.
 
-Framework-free. The pipeline (agent.py) injects `build_system_prompt()` as
-the LLM system message; the LLM provider itself is selected in agent.py
+Framework-free. The Pipecat pipeline injects `build_system_prompt()` as
+the LLM system message; the LLM provider itself is selected by that adapter
 behind a provider-agnostic factory (SPEC §5).
 
 Persona (SPEC §5): stable identity, adaptive register — one character whose

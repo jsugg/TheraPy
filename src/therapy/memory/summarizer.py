@@ -2,12 +2,13 @@
 
 Only transcript text reaches the LLM — raw audio never leaves the data
 directory. Provider selection mirrors the pipeline's `THERAPY_LLM`
-convention (agent.py), but this module stays framework-free: the SDK or
-plain HTTP, no pipeline services. Summarization runs once, at session end,
-off the realtime path.
+convention (the Pipecat pipeline), but this module stays framework-free: the
+SDK or plain HTTP, no pipeline services. Summarization runs once, at session
+end, off the realtime path.
 """
 
 import os
+from collections.abc import Mapping, Sequence
 from typing import Protocol
 
 import httpx
@@ -28,7 +29,7 @@ no quotes, no trailing punctuation, no explanation."""
 _TITLE_LANGUAGES = {"en": "English", "es": "Spanish", "pt": "Portuguese"}
 
 
-def dominant_turn_language(turns: list[dict[str, object]]) -> str:
+def dominant_turn_language(turns: Sequence[Mapping[str, object]]) -> str:
     """Most frequent user-turn language code; 'en' when there are none."""
     counts: dict[str, int] = {}
     for turn in turns:
@@ -48,7 +49,7 @@ def clean_title(raw: str) -> str | None:
     return line[:80] or None
 
 
-async def entitle(turns: list[dict[str, object]]) -> str | None:
+async def entitle(turns: Sequence[Mapping[str, object]]) -> str | None:
     """A short topic title in the session's dominant language."""
     if not turns:
         return None
@@ -66,12 +67,12 @@ async def entitle(turns: list[dict[str, object]]) -> str | None:
 class Summarizer(Protocol):
     """Async session summarizer interface."""
 
-    async def summarize(self, turns: list[dict[str, object]]) -> str:
+    async def summarize(self, turns: Sequence[Mapping[str, object]]) -> str:
         """Summarize transcript turns for future context."""
         ...
 
 
-def render_transcript(turns: list[dict[str, object]]) -> str:
+def render_transcript(turns: Sequence[Mapping[str, object]]) -> str:
     """One compact line per turn: `user (es, voice): …` / `assistant (en): …`."""
     lines: list[str] = []
     for turn in turns:
@@ -159,7 +160,7 @@ class LLMSummarizer:
         self._model = model
         self._base_url = base_url
 
-    async def summarize(self, turns: list[dict[str, object]]) -> str:
+    async def summarize(self, turns: Sequence[Mapping[str, object]]) -> str:
         """Return a compact session summary; empty string for no turns."""
         if not turns:
             return ""

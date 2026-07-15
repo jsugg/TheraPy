@@ -1,18 +1,18 @@
 """FastAPI backend: WebRTC signaling + PWA static serving (SPEC §5)."""
 
-import asyncio
+import json
 import os
-from collections.abc import Awaitable, Callable, Coroutine, Sequence
+from collections.abc import Sequence
 from contextlib import asynccontextmanager
 from functools import lru_cache
 from pathlib import Path
-from typing import TYPE_CHECKING, Protocol
+from typing import TYPE_CHECKING, Annotated
 
 if TYPE_CHECKING:
     from therapy.knowledge.research import ResearchKB
     from therapy.knowledge.user_model import UserModel
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
@@ -21,33 +21,28 @@ from therapy.memory import MemoryStore
 from therapy.memory.store import RowDict, resume_window_secs
 from therapy.server import live
 from therapy.server.protocol import session_state_message
+from therapy.voice.contracts import (
+    ConnectionConflict,
+    InvalidOffer,
+    SessionTarget,
+    VoiceUnavailable,
+    WebRTCOffer,
+)
+from therapy.voice.ports import VoiceGateway
 
 STATIC_DIR = Path(__file__).parent / "static"
+MAX_OFFER_BODY_BYTES = 256 * 1024
 
-
-class _WebRTCHandler(Protocol):
-    """Subset of SmallWebRTCRequestHandler used by this module."""
-
-    async def close(self) -> None: ...
-
-    async def handle_web_request(
-        self,
-        request: object,
-        on_connection: Callable[[object], Awaitable[None]],
-    ) -> dict[str, object] | None: ...
-
-
-_webrtc_handler: _WebRTCHandler | None = None
-_bot_tasks: set[asyncio.Task[None]] = set()
+_voice_gateway: VoiceGateway | None = None
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    global _voice_gateway
     yield
-    if _webrtc_handler is not None:
-        await _webrtc_handler.close()
-    for task in _bot_tasks:
-        task.cancel()
+    gateway, _voice_gateway = _voice_gateway, None
+    if gateway is not None:
+        await gateway.close()
 
 
 app = FastAPI(title="TheraPy", version=__version__, lifespan=lifespan)
@@ -79,40 +74,19 @@ def _research() -> "ResearchKB":
     return ResearchKB()
 
 
-def _handler() -> _WebRTCHandler:
-    """Return the lazily initialized SmallWebRTC request handler."""
-    global _webrtc_handler
-    if _webrtc_handler is None:
-        from pipecat.transports.smallwebrtc.request_handler import (
-            SmallWebRTCRequestHandler,
-        )
+def get_voice_gateway() -> VoiceGateway:
+    """Return the lazy process-wide voice runtime implementation."""
+    global _voice_gateway
+    if _voice_gateway is None:
+        from therapy.integrations.pipecat.runtime import PipecatVoiceGateway
 
-        _webrtc_handler = SmallWebRTCRequestHandler()
-    return _webrtc_handler
+        _voice_gateway = PipecatVoiceGateway()
+    return _voice_gateway
 
 
 @app.get("/health")
 def health() -> dict[str, str]:
     return {"status": "ok", "version": __version__}
-
-
-def launch_bot(
-    connection: object,
-    bot: Callable[[object], Coroutine[object, object, None]],
-) -> asyncio.Task[None]:
-    """Start a pipeline for a connection, preempting any existing one.
-
-    v1 is single-user (SPEC §2): a second live pipeline is never a second
-    user, only a reconnect — and every pipeline loads its own STT/TTS
-    models, so letting them stack is how the container runs out of memory.
-    The newest connection always wins.
-    """
-    for task in list(_bot_tasks):
-        task.cancel()
-    task = asyncio.create_task(bot(connection))
-    _bot_tasks.add(task)
-    task.add_done_callback(_bot_tasks.discard)
-    return task
 
 
 def _resolve_session(
@@ -140,7 +114,10 @@ def _resolve_session(
 
 
 @app.post("/api/offer")
-async def offer(request: Request) -> dict[str, object]:
+async def offer(
+    request: Request,
+    gateway: Annotated[VoiceGateway, Depends(get_voice_gateway)],
+) -> dict[str, object]:
     """SDP offer → answer; the new connection preempts the previous pipeline.
 
     `?new_session=1` skips reconnect-resume so the pipeline always opens a
@@ -152,11 +129,25 @@ async def offer(request: Request) -> dict[str, object]:
     transcript over HTTP; the resolved id is also what run_bot joins, so the
     two never disagree.
     """
-    from pipecat.transports.smallwebrtc.request_handler import SmallWebRTCRequest
+    content_length = request.headers.get("content-length")
+    if content_length is not None:
+        try:
+            if int(content_length) > MAX_OFFER_BODY_BYTES:
+                raise HTTPException(status_code=413, detail="Offer body is too large")
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Invalid Content-Length") from None
+    body = await request.body()
+    if len(body) > MAX_OFFER_BODY_BYTES:
+        raise HTTPException(status_code=413, detail="Offer body is too large")
+    try:
+        payload = json.loads(body)
+    except (json.JSONDecodeError, RecursionError, UnicodeDecodeError):
+        raise HTTPException(status_code=400, detail="Invalid JSON body") from None
+    try:
+        webrtc_offer = WebRTCOffer.from_payload(payload)
+    except InvalidOffer as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
 
-    from therapy.agent import run_bot
-
-    body = await request.json()
     store = _store()
     new_session = request.query_params.get("new_session") == "1"
     resolved, resumed = _resolve_session(
@@ -171,22 +162,19 @@ async def offer(request: Request) -> dict[str, object]:
         resolved or "", resumed, store.session_turns(resolved) if resolved else []
     )
 
-    async def on_connection(connection: object) -> None:
-        launch_bot(
-            connection,
-            # run_bot joins exactly `resolved`: a real id resumes it, None opens
-            # a fresh session. new_session=(resolved is None) stops run_bot from
-            # picking its own resume candidate and disagreeing with this answer.
-            lambda conn: run_bot(
-                conn, new_session=resolved is None, resume_session_id=resolved
-            ),
+    try:
+        answer = await gateway.negotiate(
+            webrtc_offer,
+            SessionTarget(session_id=resolved, new_session=resolved is None),
         )
-
-    answer = await _handler().handle_web_request(
-        SmallWebRTCRequest.from_dict(body), on_connection
-    )
+    except ConnectionConflict as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except InvalidOffer as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except VoiceUnavailable as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
     return {
-        **(answer or {}),
+        **answer.as_payload(),
         "session_id": resolved,
         "resumed": state["resumed"],
         "turns": state["turns"],

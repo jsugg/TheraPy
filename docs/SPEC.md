@@ -78,7 +78,7 @@ text in ────────────────────────
 
 | Component | Choice | Notes |
 |-----------|--------|-------|
-| Pipeline framework | **Pipecat** with `SmallWebRTCTransport` — settled by phase-0 spike ([framework-spike.md](framework-spike.md)) | P2P WebRTC from one self-contained Python process; no SFU/Redis footprint. Silero VAD, turn-taking, barge-in. Only `agent.py` imports it; revisit triggers documented in the spike. |
+| Pipeline framework | **Pipecat** with `SmallWebRTCTransport` — settled by phase-0 spike ([framework-spike.md](framework-spike.md)) | P2P WebRTC from one self-contained Python process; no SFU/Redis footprint. Silero VAD, turn-taking, barge-in. Pipecat is confined to `therapy.integrations.pipecat`; the server depends on the framework-free `VoiceGateway` port. Revisit triggers are documented in the spike. |
 | Clients | **Single PWA**: desktop web interface + installable mobile interface | WebRTC voice + text chat in one conversation view; PWA push for proactivity. Desktop browser and phone are the same client. No native app, no app stores. |
 | STT | **faster-whisper** | Multilingual (es/en/pt native); shared model family with `ser`. |
 | Emotion | **`jsugg/ser`** via adapter | Per-turn batch on the VAD-buffered utterance (ser is not realtime yet — that's fine; see §6). |
@@ -95,8 +95,11 @@ text in ────────────────────────
 therapy/
 ├── pyproject.toml            # uv, Python 3.12+, same tooling stack as ser
 ├── src/therapy/
-│   ├── agent.py              # pipeline assembly — only file that imports Pipecat
-│   │                         #   (STT/TTS/relay processors, LLM provider factory)
+│   ├── voice/                # owned signaling DTOs/errors + VoiceGateway port
+│   ├── integrations/
+│   │   └── pipecat/
+│   │       ├── runtime.py    # signaling, peer lifecycle, pipeline supervision
+│   │       └── pipeline.py   # STT/TTS/relay processors, LLM provider factory
 │   ├── perception/
 │   │   ├── stt.py
 │   │   └── emotion.py        # anti-corruption adapter around `ser`; owns EmotionFrame

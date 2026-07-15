@@ -1,4 +1,4 @@
-"""Phase-2 acceptance (SPEC §9): continuity across sessions + data round-trip.
+"""Memory-continuity verification (SPEC §9): sessions + data round-trip.
 
 Scripted client against the live server, typed turns only (memory is
 modality-agnostic, and text keeps the run fast on CPU):
@@ -15,7 +15,7 @@ modality-agnostic, and text keeps the run fast on CPU):
 
 Run inside the container:
 
-    docker compose exec therapy uv run --no-dev python scripts/phase2_acceptance.py
+    docker compose exec therapy uv run --no-dev python scripts/verify_memory_continuity.py
 """
 
 import asyncio
@@ -287,11 +287,11 @@ async def main() -> None:
         f"wipe {'verified empty ✓' if empty else 'FAIL — data remains'}"
     )
 
-    print("\n=== Phase-2 acceptance summary ===")
+    print("\n=== Memory-continuity verification summary ===")
     for line in results:
         print(line)
     if any("FAIL" in line for line in results):
-        sys.exit("\nFAIL — phase-2 acceptance not green.")
+        sys.exit("\nFAIL — memory-continuity verification not green.")
     print("\nPASS — continuity, export, and delete all verified.")
 
 

@@ -1,4 +1,4 @@
-"""Phase-1 instrumented dry run (SPEC §9): drives the live server end-to-end.
+"""Voice/text loop verification (SPEC §9): drives the live server end-to-end.
 
 A scripted WebRTC client (aiortc — already a pipecat dependency) holds one
 continuous conversation against a running TheraPy server:
@@ -25,7 +25,7 @@ uses, with distinct "user" voices, so the run needs no microphone.
 
 Run inside the container (models must be cached; see README):
 
-    docker compose exec therapy uv run --no-dev python scripts/phase1_dryrun.py
+    docker compose exec therapy uv run --no-dev python scripts/verify_voice_text_loop.py
 """
 
 import asyncio

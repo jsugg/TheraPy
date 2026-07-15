@@ -1,9 +1,9 @@
-"""Pipeline assembly — the only module that imports the voice-agent framework.
+"""Pipecat pipeline assembly inside the framework integration boundary.
 
 Framework: Pipecat with SmallWebRTCTransport (docs/framework-spike.md).
 Everything domain-shaped (prompts, language tables, voice maps) lives in
-framework-free modules; a framework swap — or a reversal of the spike
-verdict — touches this file and the client transport layer only (SPEC §5).
+framework-free modules; a framework swap is contained within
+`therapy.integrations.pipecat` and the client transport layer (SPEC §5).
 
 Pipeline per connection:
 
@@ -77,6 +77,7 @@ from pipecat.services.kokoro.tts import KokoroTTSService, KokoroTTSSettings
 from pipecat.services.whisper.stt import WhisperSTTService, WhisperSTTSettings
 from pipecat.transcriptions.language import Language
 from pipecat.transports.base_transport import TransportParams
+from pipecat.transports.smallwebrtc.connection import SmallWebRTCConnection
 from pipecat.transports.smallwebrtc.transport import SmallWebRTCTransport
 from pipecat.utils.time import time_now_iso8601
 
@@ -271,7 +272,6 @@ class MultilingualWhisperSTTService(WhisperSTTService):
         await self.stop_processing_metrics()
 
         if text:
-            logger.debug(f"Transcription [{language}]: {text}")
             if self._recorder:
                 await asyncio.to_thread(self._recorder, audio, text, language)
             try:
@@ -542,7 +542,7 @@ def make_llm_service():
 
 
 async def run_bot(
-    webrtc_connection: Any,
+    webrtc_connection: SmallWebRTCConnection,
     *,
     new_session: bool = False,
     resume_session_id: str | None = None,
@@ -697,7 +697,6 @@ async def run_bot(
     task = PipelineTask(
         pipeline,
         params=PipelineParams(
-            allow_interruptions=True,  # barge-in
             enable_metrics=True,
         ),
     )
@@ -836,7 +835,11 @@ async def run_bot(
                 )
                 title = await entitle(turns)
             except Exception as exc:  # LLM down ≠ lost session; keep the turns.
-                logger.warning(f"Session distillation failed for {session_id}: {exc}")
+                logger.warning(
+                    "Session distillation failed for %s failure_type=%s",
+                    session_id,
+                    type(exc).__name__,
+                )
         if title:
             # Fill-only: a user's rename (or an earlier generation) wins.
             await asyncio.to_thread(store.ensure_title, session_id, title)

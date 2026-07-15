@@ -1,7 +1,7 @@
 """Property-graph self-model: typed nodes + typed edges over SQLite.
 
 Full schema: SPEC Appendix A. This module is framework-free (SPEC dependency
-boundary — only `agent.py` imports Pipecat) and shares the local `therapy.db`
+boundary — only `therapy.integrations.pipecat` imports Pipecat) and shares the local `therapy.db`
 file with `memory.store`, so a single owner-controlled data directory holds
 everything (SPEC §8).
 

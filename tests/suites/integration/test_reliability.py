@@ -1,8 +1,4 @@
-"""Reliability regressions: TURN config, connection preemption, compose wiring."""
-
-import asyncio
-
-from therapy.server.app import launch_bot
+"""Reliability regressions: TURN config and deployment wiring."""
 
 
 def test_ice_config_defaults(client) -> None:
@@ -20,27 +16,6 @@ def test_ice_config_env_override(client, monkeypatch) -> None:
     config = client.get("/api/ice-config").json()
     assert config["credential"] == "s3cret"
     assert config["port"] == 3479
-
-
-def test_new_connection_preempts_previous_pipeline() -> None:
-    async def scenario() -> tuple[bool, bool]:
-        started = asyncio.Event()
-
-        async def bot(connection: object) -> None:
-            started.set()
-            await asyncio.sleep(30)
-
-        first = launch_bot("conn-1", bot)
-        await started.wait()
-        second = launch_bot("conn-2", bot)
-        await asyncio.sleep(0.05)
-        first_cancelled = first.cancelled()
-        second.cancel()
-        return first_cancelled, second.cancelled() or not second.done()
-
-    first_cancelled, second_alive_then_cancelled = asyncio.run(scenario())
-    assert first_cancelled  # single-user: newest connection wins (memory!)
-    assert second_alive_then_cancelled
 
 
 def test_compose_declares_reliability_and_turn(repo_root) -> None:

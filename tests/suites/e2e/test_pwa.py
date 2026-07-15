@@ -164,9 +164,8 @@ def test_live_connection_renders_transcript_presence_and_resume_flow(
     assert pushed_states, "no server-pushed presence message arrived"
     assert set(pushed_states) <= {"listening", "thinking", "speaking"}, pushed_states
 
-    # Push-to-talk is an opt-in mic mode: toggling it reveals the Hold button
-    # (the deep hold/long-press behaviour is covered by test_6; here we only
-    # prove the reveal/hide wiring inside a live connection).
+    # Push-to-talk is an opt-in mic mode: toggling it reveals the Hold button;
+    # deep hold/long-press behavior has focused coverage elsewhere.
     expect(page.locator("#talk")).to_be_hidden()
     page.locator("#mic-mode").click()
     expect(page.locator("#talk")).to_be_visible()
