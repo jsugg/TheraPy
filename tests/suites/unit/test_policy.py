@@ -1,6 +1,10 @@
+import pytest
+
 from therapy.dialogue.policy import (
+    CrisisConfigurationError,
     build_system_prompt,
     continuity_note,
+    crisis_contacts,
     crisis_resources,
     language_pin_note,
     language_switch_note,
@@ -45,6 +49,17 @@ def test_crisis_resources_env_override(monkeypatch) -> None:
     monkeypatch.setenv("THERAPY_CRISIS_RESOURCES", "Línea 135")
     assert crisis_resources() == "Línea 135"
     assert "Línea 135" in build_system_prompt()
+
+
+def test_crisis_contacts_are_strict_but_response_path_keeps_safe_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("THERAPY_CRISIS_CONTACTS", '[{"label":"Only label"}]')
+
+    with pytest.raises(CrisisConfigurationError, match="label and value"):
+        crisis_contacts()
+    assert "emergency services" in crisis_resources()
+    assert "emergency services" in build_system_prompt()
 
 
 def test_language_switch_note_is_written_in_the_target_language() -> None:
