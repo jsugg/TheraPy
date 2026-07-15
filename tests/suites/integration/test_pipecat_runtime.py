@@ -176,6 +176,34 @@ def test_adapter_maps_owned_offer_and_answer_without_leaking_vendor_objects() ->
     asyncio.run(scenario())
 
 
+def test_disconnect_only_stops_matching_peer_and_gateway_remains_reusable() -> None:
+    async def scenario() -> None:
+        handler = FakeRequestHandler()
+        stopped = asyncio.Event()
+
+        async def run_pipeline(connection: _Connection, target: SessionTarget) -> None:
+            del connection, target
+            try:
+                await asyncio.Event().wait()
+            finally:
+                stopped.set()
+
+        gateway = make_gateway(handler, run_pipeline)
+        target = SessionTarget(session_id=None, new_session=True)
+        first = await gateway.negotiate(WebRTCOffer(sdp="first", type="offer"), target)
+
+        assert await gateway.disconnect("another-peer") is False
+        assert await gateway.disconnect(first.pc_id) is True
+        assert stopped.is_set()
+        assert handler.connections[first.pc_id].disconnected is True
+
+        second = await gateway.negotiate(WebRTCOffer(sdp="second", type="offer"), target)
+        assert second.pc_id != first.pc_id
+        await gateway.close()
+
+    asyncio.run(scenario())
+
+
 def test_renegotiation_does_not_launch_duplicate_pipeline() -> None:
     async def scenario() -> None:
         handler = FakeRequestHandler()

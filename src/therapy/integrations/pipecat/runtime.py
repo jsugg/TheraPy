@@ -61,6 +61,7 @@ type RequestFactory = Callable[[WebRTCOffer], _VendorRequest]
 type PipelineRunner = Callable[
     [_Connection, SessionTarget], Coroutine[object, object, None]
 ]
+type FinalizerDrainer = Callable[[float], Awaitable[None]]
 
 
 def _load_pipecat() -> tuple[_RequestHandler, RequestFactory]:
@@ -114,6 +115,17 @@ async def _default_pipeline_runner(
     )
 
 
+async def _default_finalizer_drainer(timeout: float) -> None:
+    """Load the Pipecat finalizer registry only for the production runner."""
+    from therapy.integrations.pipecat.pipeline import drain_session_finalizers
+
+    await drain_session_finalizers(timeout)
+
+
+async def _noop_finalizer_drainer(timeout: float) -> None:
+    del timeout
+
+
 class PipecatVoiceGateway:
     """Own Pipecat signaling, peer connections, and pipeline task lifecycle."""
 
@@ -123,6 +135,7 @@ class PipecatVoiceGateway:
         handler: _RequestHandler | None = None,
         request_factory: RequestFactory | None = None,
         pipeline_runner: PipelineRunner | None = None,
+        finalizer_drainer: FinalizerDrainer | None = None,
         cancel_timeout: float = 10.0,
     ) -> None:
         if cancel_timeout <= 0:
@@ -133,7 +146,13 @@ class PipecatVoiceGateway:
             handler, request_factory = _load_pipecat()
         self._handler = handler
         self._request_factory = request_factory
+        using_default_pipeline = pipeline_runner is None
         self._pipeline_runner = pipeline_runner or _default_pipeline_runner
+        self._finalizer_drainer = finalizer_drainer or (
+            _default_finalizer_drainer
+            if using_default_pipeline
+            else _noop_finalizer_drainer
+        )
         self._cancel_timeout = cancel_timeout
         self._lock = asyncio.Lock()
         self._pipeline_task: asyncio.Task[None] | None = None
@@ -243,6 +262,23 @@ class PipecatVoiceGateway:
             self._pipeline_connection = None
             if stop_failure is not None:
                 raise stop_failure
+
+    async def disconnect(self, peer_id: str) -> bool:
+        """Stop the matching peer without shutting down the reusable gateway."""
+        if not peer_id:
+            raise ValueError("peer_id must not be empty")
+        async with self._lock:
+            connection = self._pipeline_connection
+            if self._closed or connection is None or connection.pc_id != peer_id:
+                return False
+            await self._stop_pipeline()
+            try:
+                await self._finalizer_drainer(self._cancel_timeout)
+            except TimeoutError as exc:
+                raise VoiceUnavailable(
+                    "Voice session finalization did not stop in time"
+                ) from exc
+            return True
 
     async def _replace_pipeline(
         self, connection: _Connection, target: SessionTarget

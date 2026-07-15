@@ -43,6 +43,8 @@ import asyncio
 import logging
 import os
 import time
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
@@ -54,8 +56,11 @@ from pipecat.frames.frames import (
     Frame,
     InputAudioRawFrame,
     LLMConfigureOutputFrame,
+    LLMContextFrame,
     LLMFullResponseEndFrame,
+    LLMFullResponseStartFrame,
     LLMMessagesAppendFrame,
+    LLMMessagesTransformFrame,
     LLMTextFrame,
     OutputTransportMessageUrgentFrame,
     TranscriptionFrame,
@@ -90,7 +95,6 @@ from therapy.dialogue.language_choice import (
 from therapy.dialogue.modality import TEXT, VOICE, ReplyModality
 from therapy.dialogue.policy import (
     build_system_prompt,
-    graph_continuity_note,
     language_pin_note,
     language_switch_note,
     rehydrate_messages,
@@ -98,6 +102,8 @@ from therapy.dialogue.policy import (
     resume_note,
 )
 from therapy.knowledge import distill as knowledge_distill
+from therapy.knowledge.context import ContextAssembler, replace_longitudinal_context
+from therapy.knowledge.insight import session_recap
 from therapy.knowledge.user_model import UserModel
 from therapy.memory import MemoryStore, make_summarizer
 from therapy.memory.store import resume_window_secs
@@ -127,6 +133,97 @@ _whisper_model: Any = None
 # and, for one scheduled after it already resumed, make it a no-op
 # (live.py ownership tokens; only the current owner may close a session).
 _finalizers: dict[str, asyncio.Task[None]] = {}
+
+type SessionTurns = list[dict[str, object]]
+type SummaryGenerator = Callable[[SessionTurns], Awaitable[str]]
+type DistillationGenerator = Callable[
+    [UserModel, SessionTurns, str], Awaitable[knowledge_distill.DistillResult]
+]
+type TextArtifactGenerator = Callable[[SessionTurns], Awaitable[str]]
+
+
+@dataclass(frozen=True, slots=True)
+class _SessionArtifacts:
+    summary: str | None
+    distillation: knowledge_distill.DistillResult
+    recap: str | None
+    title: str | None
+
+
+async def _default_summary(turns: SessionTurns) -> str:
+    return await make_summarizer().summarize(turns)
+
+
+async def _default_distillation(
+    model: UserModel, turns: SessionTurns, session_id: str
+) -> knowledge_distill.DistillResult:
+    return await knowledge_distill.distill_session(model, turns, session_id)
+
+
+async def _generate_session_artifacts(
+    turns: SessionTurns,
+    model: UserModel,
+    session_id: str,
+    *,
+    summarize: SummaryGenerator = _default_summary,
+    distill: DistillationGenerator = _default_distillation,
+    recap: TextArtifactGenerator = session_recap,
+    title: TextArtifactGenerator = entitle,
+) -> _SessionArtifacts:
+    """Generate independent finalization artifacts without failure coupling."""
+    summary_value: str | None = None
+    distilled = knowledge_distill.DistillResult(run_id="not-run")
+    recap_value: str | None = None
+    title_value: str | None = None
+    try:
+        summary_value = (await summarize(turns)).strip() or None
+    except Exception as exc:
+        logger.warning(
+            "Session summary failed for %s failure_type=%s",
+            session_id,
+            type(exc).__name__,
+        )
+    try:
+        distilled = await distill(model, turns, session_id)
+    except Exception as exc:
+        logger.warning(
+            "Session distillation failed for %s failure_type=%s",
+            session_id,
+            type(exc).__name__,
+        )
+    try:
+        recap_value = (await recap(turns)).strip() or None
+    except Exception as exc:
+        logger.warning(
+            "Session recap failed for %s failure_type=%s",
+            session_id,
+            type(exc).__name__,
+        )
+    try:
+        title_value = (await title(turns)).strip() or None
+    except Exception as exc:
+        logger.warning(
+            "Session title failed for %s failure_type=%s",
+            session_id,
+            type(exc).__name__,
+        )
+    return _SessionArtifacts(
+        summary=summary_value,
+        distillation=distilled,
+        recap=recap_value,
+        title=title_value,
+    )
+
+
+async def drain_session_finalizers(timeout: float) -> None:
+    """Wait boundedly for all session-finalization writes to finish."""
+    tasks = tuple(_finalizers.values())
+    if not tasks:
+        return
+    _, pending = await asyncio.wait(tasks, timeout=timeout)
+    if pending:
+        raise TimeoutError("Session finalization did not finish in time")
+    await asyncio.sleep(0)
 
 
 def vad_params() -> VADParams:
@@ -298,11 +395,17 @@ class TurnRelay(FrameProcessor):
     a pin constrains replies only, STT stays auto.
     """
 
-    def __init__(self, modality: ReplyModality, reply_language: ReplyLanguage) -> None:
+    def __init__(
+        self,
+        modality: ReplyModality,
+        reply_language: ReplyLanguage,
+        memory_refresher: Callable[[str], Awaitable[str | None]] | None = None,
+    ) -> None:
         super().__init__()
         self._language: str | None = None
         self._modality = modality
         self._reply_language = reply_language
+        self._memory_refresher = memory_refresher
         self._last_note_at: float = 0.0
 
     async def _note(self, content: str) -> None:
@@ -330,6 +433,16 @@ class TurnRelay(FrameProcessor):
     async def process_frame(self, frame: Frame, direction: FrameDirection) -> None:
         await super().process_frame(frame, direction)
         if isinstance(frame, TranscriptionFrame) and direction == FrameDirection.DOWNSTREAM:
+            if self._memory_refresher is not None:
+                memory_note = await self._memory_refresher(frame.text)
+                await self.push_frame(
+                    LLMMessagesTransformFrame(
+                        transform=lambda messages: replace_longitudinal_context(
+                            messages, memory_note
+                        ),
+                        run_llm=False,
+                    )
+                )
             raw = frame.language.value if frame.language else None
             base = raw.lower().split("-")[0] if raw else None
             if base and not is_supported(base):
@@ -399,6 +512,42 @@ class BotTextRelay(FrameProcessor):
                             }
                         )
                     )
+        await self.push_frame(frame, direction)
+
+
+class _DeterministicTestLLM(FrameProcessor):
+    """Test-only Pipecat LLM boundary; exercises framing without a provider."""
+
+    async def process_frame(self, frame: Frame, direction: FrameDirection) -> None:
+        await super().process_frame(frame, direction)
+        if isinstance(frame, LLMContextFrame):
+            await self.push_frame(LLMFullResponseStartFrame())
+            await self.push_frame(
+                LLMTextFrame(text="I’m with you. What feels most useful right now?")
+            )
+            await self.push_frame(LLMFullResponseEndFrame())
+            return
+        await self.push_frame(frame, direction)
+
+
+class _DeterministicTestAudioInput(FrameProcessor):
+    """Test-only STT/VAD boundary that consumes fake-browser microphone audio."""
+
+    async def process_frame(self, frame: Frame, direction: FrameDirection) -> None:
+        await super().process_frame(frame, direction)
+        if not isinstance(frame, InputAudioRawFrame):
+            await self.push_frame(frame, direction)
+
+
+class _DeterministicTestPassthrough(FrameProcessor):
+    """Test-only lightweight processor preserving real Pipecat frame flow."""
+
+    def __init__(self, language: str = DEFAULT_LANGUAGE) -> None:
+        super().__init__()
+        self.current_language = language
+
+    async def process_frame(self, frame: Frame, direction: FrameDirection) -> None:
+        await super().process_frame(frame, direction)
         await self.push_frame(frame, direction)
 
 
@@ -511,6 +660,8 @@ def make_llm_service():
     `openrouter` and `ollama` share an OpenAI-compatible surface — the
     former gives hosted free models for dev, the latter fully-local models.
     """
+    if os.environ.get("THERAPY_TEST_MODE") == "1":
+        return _DeterministicTestLLM()
     provider = os.environ.get("THERAPY_LLM", "anthropic")
     model = os.environ.get("THERAPY_LLM_MODEL")
     if provider == "anthropic":
@@ -532,9 +683,9 @@ def make_llm_service():
         from pipecat.services.ollama.llm import OLLamaLLMService
 
         return OLLamaLLMService(
-            # gemma3:4b — best es/en/pt quality that still streams fast enough
+            # pedrolucas/smollm3:3b-q4_k_m — best es/en/pt quality that still streams fast enough
             # for voice on a CPU-only host; override via THERAPY_LLM_MODEL.
-            settings=OLLamaLLMService.Settings(model=model or "gemma3:4b"),
+            settings=OLLamaLLMService.Settings(model=model or "pedrolucas/smollm3:3b-q4_k_m"),
             # In Docker, Ollama runs on the host: host.docker.internal.
             base_url=os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434/v1"),
         )
@@ -564,10 +715,15 @@ async def run_bot(
             audio_out_enabled=True,
         ),
     )
+    test_mode = os.environ.get("THERAPY_TEST_MODE") == "1"
     # Pipecat ≥1.x: VAD is an explicit pipeline stage. `TransportParams`
     # still accepts a `vad_analyzer` but non-Daily transports ignore it —
     # without this processor no speech is ever detected.
-    vad = VADProcessor(vad_analyzer=SileroVADAnalyzer(params=vad_params()))
+    vad: FrameProcessor = (
+        _DeterministicTestAudioInput()
+        if test_mode
+        else VADProcessor(vad_analyzer=SileroVADAnalyzer(params=vad_params()))
+    )
 
     store = MemoryStore()
     # The property-graph user model shares the store's data dir (SPEC Appendix
@@ -614,6 +770,20 @@ async def run_bot(
     reply_language = ReplyLanguage(
         initial=initial_language, established=bool(resumed_turns)
     )
+    if test_mode:
+        from therapy.acceptance import AcceptanceEmbedding
+
+        context_assembler = ContextAssembler(
+            user_model, store, embedder=AcceptanceEmbedding()
+        )
+    else:
+        context_assembler = ContextAssembler(user_model, store)
+
+    async def refresh_memory(text: str) -> str | None:
+        turn_context = await asyncio.to_thread(
+            context_assembler.assemble, text, session_id
+        )
+        return turn_context["note"]
 
     def record_user_voice(audio: bytes, text: str, language: str) -> None:
         store.add_turn(
@@ -632,19 +802,27 @@ async def run_bot(
             text,
         )
 
-    stt = MultilingualWhisperSTTService(recorder=record_user_voice)
+    stt = (
+        _DeterministicTestPassthrough(initial_language)
+        if test_mode
+        else MultilingualWhisperSTTService(recorder=record_user_voice)
+    )
     stt.current_language = initial_language
-    turn_relay = TurnRelay(modality, reply_language)
-    tts = KokoroTTSService(
-        settings=KokoroTTSSettings(
-            voice=voice_for(initial_language),
-            language=LANGUAGE_ENUM[initial_language],
+    turn_relay = TurnRelay(modality, reply_language, refresh_memory)
+    tts: FrameProcessor = (
+        _DeterministicTestPassthrough()
+        if test_mode
+        else KokoroTTSService(
+            settings=KokoroTTSSettings(
+                voice=voice_for(initial_language),
+                language=LANGUAGE_ENUM[initial_language],
+            )
         )
     )
     llm = make_llm_service()
 
-    # Continuity (SPEC §8): the current conversation goes verbatim; the past
-    # arrives only as distilled summaries + the user model. A resumed
+    # Continuity (SPEC §8): current conversation stays verbatim; past context
+    # is bounded, semantic, role-separated, and refreshed on every turn. A resumed
     # session IS the current conversation — its turns are rehydrated
     # verbatim after the reconnect marker. (recent_summaries already
     # excludes it: reopen_session cleared its ended_at.)
@@ -660,9 +838,7 @@ async def run_bot(
         ),
         "",
     )
-    memory_note = graph_continuity_note(
-        user_model, topic=opening_topic, summaries=store.recent_summaries()
-    )
+    memory_note = context_assembler.assemble(opening_topic, session_id)["note"]
     if memory_note:
         messages.append({"role": "system", "content": memory_note})
     if resumed_turns:
@@ -794,6 +970,15 @@ async def run_bot(
         await asyncio.to_thread(
             user_model.add_observation, text, session_id=session_id, language=label
         )
+        turn_memory = await refresh_memory(text)
+        frames.append(
+            LLMMessagesTransformFrame(
+                transform=lambda messages: replace_longitudinal_context(
+                    messages, turn_memory
+                ),
+                run_llm=False,
+            )
+        )
         # Typed turn → silent reply unless the user overrode the speaker.
         speak = modality.note_turn(TEXT)
         frames.append(LLMConfigureOutputFrame(skip_tts=not speak))
@@ -822,27 +1007,46 @@ async def run_bot(
         finalized = True
         turns = await asyncio.to_thread(store.session_turns, session_id)
         summary: str | None = None
-        distilled = knowledge_distill.DistillResult()
+        distilled = knowledge_distill.DistillResult(run_id="not-run")
         title: str | None = None
+        recap: str | None = None
         if turns:
-            try:
-                summary = (await make_summarizer().summarize(turns)).strip() or None
-                # Between-session distillation (W2): inbox + transcript -> graph
-                # nodes/edges, then the graduation floor. Replaces the Phase-2
-                # flat-fact extraction.
+            if test_mode:
+                from therapy.acceptance import ScriptedLLM
+
+                scripted = ScriptedLLM()
+                last_user_text = next(
+                    (
+                        str(turn["text"])
+                        for turn in reversed(turns)
+                        if turn["role"] == "user"
+                    ),
+                    "Conversation",
+                )
+                summary = f"The user said: {last_user_text}"
                 distilled = await knowledge_distill.distill_session(
-                    user_model, turns, session_id
-                )
-                title = await entitle(turns)
-            except Exception as exc:  # LLM down ≠ lost session; keep the turns.
-                logger.warning(
-                    "Session distillation failed for %s failure_type=%s",
+                    user_model,
+                    turns,
                     session_id,
-                    type(exc).__name__,
+                    extractor=scripted.extract,
+                    judger=scripted.judge,
+                    extractor_version="pipecat-acceptance-v1",
                 )
+                recap = f"You reflected on: {last_user_text}"
+                title = "Acceptance conversation"
+            else:
+                artifacts = await _generate_session_artifacts(
+                    turns, user_model, session_id
+                )
+                summary = artifacts.summary
+                distilled = artifacts.distillation
+                recap = artifacts.recap
+                title = artifacts.title
         if title:
             # Fill-only: a user's rename (or an earlier generation) wins.
             await asyncio.to_thread(store.ensure_title, session_id, title)
+        if recap:
+            await asyncio.to_thread(store.ensure_recap, session_id, recap)
         await asyncio.to_thread(store.end_session, session_id, summary)
         live.release(session_id, owner)
         logger.info(
@@ -869,6 +1073,17 @@ async def run_bot(
         _finalizers[session_id] = finalize_task
 
         def _forget(done: asyncio.Task[None]) -> None:
+            try:
+                failure = done.exception()
+            except asyncio.CancelledError:
+                failure = None
+            if failure is not None:
+                logger.error(
+                    "Session finalization failed for %s failure_type=%s",
+                    session_id,
+                    type(failure).__name__,
+                )
+            live.release(session_id, owner)
             if _finalizers.get(session_id) is done:
                 del _finalizers[session_id]
 
