@@ -1,11 +1,14 @@
 # TheraPy
 
 A voice-first personal assistant for **self-understanding** — CBT/OT-informed
-coaching that listens to *how* you speak, not just what you say.
+coaching around what you say today, with a committed SER roadmap for how you
+speak over time.
 
-Speech emotion recognition is provided by [`ser`](https://github.com/jsugg/ser);
-every conversation builds an emotional timeline and a personal knowledge graph
-that compound into longitudinal self-insight.
+Speech emotion recognition is a committed roadmap layer via
+[`ser`](https://github.com/jsugg/ser). TheraPy already reserves the product
+boundary in `perception/emotion.py` and `session/timeline.py`, and local raw
+utterance audio is retained so the SER adapter can analyze future turns and
+retroactively re-analyze history once the integration lands.
 
 > Not therapy, not a therapist replacement, no diagnoses. A therapy-*informed*
 > tool for getting to know yourself.
@@ -99,6 +102,13 @@ export/delete — **the delete step wipes the data volume**):
 
 ```sh
 docker compose exec therapy uv run --no-dev python scripts/phase2_acceptance.py
+```
+
+Longitudinal self-knowledge verification (offline/host-only; uses isolated test
+data and no live server, LLM, or network):
+
+```sh
+make verify-longitudinal-loop
 ```
 
 PWA browser end-to-end (Playwright + headless Chromium — the only tests that
