@@ -6,11 +6,11 @@
 #
 #   UI edit (JS/CSS/HTML) → just reload the browser
 #   Python edit           → `make restart`
-#   Test edit             → `make test` / `make e2e`  (pytest reads it directly)
+#   Test edit             → `make test` / `make test-e2e`  (pytest reads it directly)
 #
 # Tests live under tests/suites/{unit,integration,e2e} and are auto-marked by
 # folder. Select any subset with ARGS, e.g.:
-#   make test ARGS="-k memory -x"      make e2e ARGS="-k hold"      make unit
+#   make test ARGS="-k memory -x"  make test-e2e ARGS="-k hold"  make test-unit
 
 COMPOSE := docker compose
 SVC     := therapy
@@ -25,7 +25,7 @@ ARGS    ?=
 help: ## List available targets
 	@grep -hE '^[a-zA-Z0-9_-]+:.*?## ' $(MAKEFILE_LIST) \
 		| sort \
-		| awk 'BEGIN{FS=":.*?## "}{printf "  \033[36m%-12s\033[0m %s\n", $$1, $$2}'
+		| awk 'BEGIN{FS=":.*?## "}{printf "  \033[36m%-30s\033[0m %s\n", $$1, $$2}'
 
 # ---- Container lifecycle ----------------------------------------------------
 
@@ -59,24 +59,30 @@ shell: ## Open an interactive shell in the running container
 	$(COMPOSE) exec $(SVC) bash
 
 # ---- Tests & quality --------------------------------------------------------
-# ARGS passes extra pytest flags: `make test ARGS="-k memory"`, `make e2e ARGS="-k hold"`.
+# ARGS passes extra pytest flags: `make test ARGS="-k memory"`, `make test-e2e ARGS="-k hold"`.
 
 .PHONY: test
 test: ## Unit + integration in the container (the real test bed)
 	$(RUN) pytest $(ARGS)
 
-.PHONY: unit
-unit: ## Just the unit suite
+.PHONY: test-unit unit
+test-unit: ## Just the unit suite
 	$(RUN) pytest -m unit $(ARGS)
 
-.PHONY: integration
-integration: ## Just the integration suite
+unit: test-unit
+
+.PHONY: test-integration integration
+test-integration: ## Just the integration suite
 	$(RUN) pytest -m integration $(ARGS)
 
-.PHONY: e2e
-e2e: ## ALL browser e2e (auto-installs Chromium if missing)
+integration: test-integration
+
+.PHONY: test-e2e e2e
+test-e2e: ## ALL browser e2e (auto-installs Chromium if missing)
 	$(RUN) playwright install chromium >/dev/null
 	$(RUN) pytest -m e2e $(ARGS)
+
+e2e: test-e2e
 
 .PHONY: test-fast
 test-fast: ## Quick framework-free run on the host slim venv
@@ -86,9 +92,9 @@ test-fast: ## Quick framework-free run on the host slim venv
 lint: ## Ruff lint (host)
 	$(VENV)/ruff check .
 
-.PHONY: acceptance
-acceptance: ## Run the phase-4 acceptance script (host)
-	$(VENV)/python scripts/phase4_acceptance.py
+.PHONY: verify-longitudinal-loop
+verify-longitudinal-loop: ## Verify longitudinal self-knowledge loop (host, isolated data)
+	$(VENV)/python scripts/verify_longitudinal_loop.py
 
 .PHONY: check
 check: lint test-fast ## Fast pre-push gate: lint + framework-free tests (host)
