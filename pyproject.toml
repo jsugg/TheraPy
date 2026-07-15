@@ -13,9 +13,8 @@ dependencies = [
   "fastapi>=0.115,<1.0",
   "httpx>=0.28.1",
   "kokoro-onnx>=0.5.0",
-  "lingua-language-detector>=2.1.1",  # phase 1: word-level reply-language choice (SPEC §7)
+  "lingua-language-detector>=2.1.1",
   "pipecat-ai[silero,webrtc,whisper]>=1.5.0",
-  "requests>=2.34.2",
   "uvicorn[standard]>=0.30,<1.0",
 ]
 
@@ -39,10 +38,6 @@ packages = ["src/therapy"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests/suites"]
-# Suites live under tests/suites/{unit,integration,e2e} and are auto-marked by
-# folder (tests/conftest.py). Browser E2E is slow (real Chromium + a live server
-# + model loading) and opt-in: the default gate skips it, `pytest -m e2e` runs
-# only it, and `pytest -m e2e -k <name>` iterates on a subset.
 addopts = ["-m", "not e2e"]
 markers = [
     "unit: fast single-module tests, no external I/O (framework-free)",
