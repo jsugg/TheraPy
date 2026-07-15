@@ -49,7 +49,7 @@ Fully-local LLM via Ollama (host-side, so the container reaches it at
 
 ```sh
 ollama serve                # on the host
-ollama pull gemma3:4b       # default model — decent es/en/pt, CPU-friendly
+ollama pull pedrolucas/smollm3:3b-q4_k_m       # default model — decent es/en/pt, CPU-friendly
 # .env: THERAPY_LLM=ollama
 #       OLLAMA_BASE_URL=http://host.docker.internal:11434/v1
 ```
@@ -62,6 +62,17 @@ re-renders the resumed transcript on connect (server truth), and the 📖
 history browser can start a fresh conversation, continue any past
 session, rename it (titles are auto-generated from the topic at session
 end), or delete one (turns + archived audio) outright.
+
+### Crisis contacts
+
+Crisis contacts are deliberately environment-only so safety configuration
+cannot depend on insight, research, or proactivity. Set
+`THERAPY_CRISIS_CONTACTS` to a JSON array of at most 20 objects containing
+exactly `label` and `value` string fields; see `.env.example`. Invalid JSON or
+schema is reported by `/api/crisis-resources`, while the live crisis protocol
+continues with its built-in emergency-services/trusted-person fallback. Restart
+after changing contacts. `THERAPY_CRISIS_RESOURCES` remains a legacy
+plain-string fallback.
 
 The 2024 prototype lives at
 [`jsugg/TheraPy-legacy`](https://github.com/jsugg/TheraPy-legacy) (archived);
@@ -89,7 +100,7 @@ docker compose exec therapy uv run --no-dev python scripts/verify_voice_text_loo
 docker compose logs therapy | grep TTFA   # server-side numbers (risk R1)
 ```
 
-Latest dry-run result (2026-07-10, shipped image, fully-local gemma3:4b):
+Latest dry-run result (2026-07-10, shipped image, fully-local pedrolucas/smollm3:3b-q4_k_m):
 all ten scenarios green — trilingual turns, typed-turn silence, barge-in,
 both SPEC §7 normative code-switched phrases, pin/unpin. Client-side TTFA
 9.2–32.5 s on a warm container (whisper, Kokoro, and the LLM share this

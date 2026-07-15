@@ -1,8 +1,8 @@
 # TheraPy — Project Specification
 
-**Status:** v0.8 — phases 0–2 complete and human-accepted (phase-1 acceptance passed 2026-07-12); companion UX phases A–C shipped; Phase 4 has a partial engineering slice landed
+**Status:** v0.9 — phases 0–2 complete and human-accepted (phase-1 acceptance passed 2026-07-12); companion UX phases A–C shipped; Phase 4 has a partial engineering slice landed
 **Owner:** Juan Pedro Sugg
-**Date:** 2026-07-12
+**Date:** 2026-07-15
 **Supersedes:** the 2024 `TheraPy` prototype (to be archived; no code carried over)
 
 ---
@@ -161,6 +161,7 @@ A second knowledge store, deliberately separate from the user model: the user mo
 - All persistent data (audio, transcripts, timelines, user model) stays **on infrastructure the user controls**: own machine for the MVP (mobile access via Tailscale — no public exposure, VPN identity doubles as auth), later a personal VPS (requires real authentication on the PWA and encryption at rest before migration).
 - **Raw utterance audio is retained indefinitely** (decision, §10): it makes the timeline retroactively upgradable with each ser release and provides eval data for ser. It is the most sensitive data in the system — encrypted at rest is a hard prerequisite for the VPS migration, and audio never goes to any cloud service.
 - Cloud LLM receives transcript text + emotion annotations — not raw audio. **Context depth:** the current conversation goes verbatim; everything older arrives only as distilled summaries + the structured user model. This is the accepted privacy trade-off of the "cloud, swappable" decision; the provider interface keeps a fully-local future open.
+- Observability has two correlated planes: a restricted, full-fidelity interaction/evaluation journal and content-free operational logs, metrics, and traces. Once genuine data exists, the restricted plane stays on user-controlled infrastructure; only synthetic fixtures may enter managed backend comparisons. Broad telemetry never contains raw audio, conversation or model context, credentials, or SDP/ICE/network-endpoint identifiers.
 - One-command export and delete of all stored personal data from day one (it's the owner's own data — make it inspectable).
 
 ## 9. Roadmap
@@ -172,7 +173,8 @@ A second knowledge store, deliberately separate from the user model: the user mo
 | 2 | **Memory + timeline + review UI**: SQLite store, transcripts, session summaries, continuity, user-model v1; browse transcripts in the PWA | Assistant correctly references something from a previous session | ✅ Done — scripted verification green; continuity, reconnect-resume + transcript replay, and export/delete round-trip verified. |
 | 3 | **ser integration** (P2 begins): per-turn emotion in context + timeline; emotion recap; review UI shows emotion alongside transcript (validates ser accuracy early) | Recap matches user's own read of the session | Not started |
 | 4 | **Longitudinal insight + proactivity + research KB v1**: cross-session pattern queries, reflections; check-ins/digest channels; corpus ingest + both retrieval modes | North-star test: one true non-obvious self-insight | Partial engineering slice landed; not product-complete. See [phase4-goal.md](phase4-goal.md) and [phase4-impl-log.md](phase4-impl-log.md). |
-| 5 | P3 rehearsal mode / P4 daily structure; VPS migration when uptime starts to matter | Prioritize based on lived usage | Not started |
+| 5 | **Observability + evaluation foundation**: an owned, durable interaction journal for exact reconstruction and replay; correlated content-free operational telemetry across voice, web, storage, knowledge, outreach, and supervisors; dashboards, alerts, and runbooks | A versioned synthetic corpus round-trips and replays losslessly; leak tests keep restricted content and secrets out of broad telemetry; critical-path SLIs and actionable failure alerts stay within measured voice-latency and host-resource budgets | Not started |
+| 6 | P3 rehearsal mode / P4 daily structure; VPS migration when uptime starts to matter | Prioritize based on lived usage | Not started |
 
 Detailed July 2026 field-test and hardening chronology lives in [docs/evidence/field-tests-2026-07.md](evidence/field-tests-2026-07.md).
 
@@ -207,6 +209,10 @@ Detailed July 2026 field-test and hardening chronology lives in [docs/evidence/f
 - Raw utterance audio: **kept indefinitely** (encrypted at rest before any VPS move). Each ser upgrade re-analyzes history — the emotional timeline gets retroactively smarter, and the archive doubles as eval data for ser itself.
 
 - User model: **property graph** (nodes + edges in SQLite) with extensible type registries; node types include strengths, strategies (OT toolkit), people, CBT thought records; edges carry the claim lifecycle too; optional freeform observation inbox feeding distillation; canonical-English statements with original-language verbatim quotes; two-tier boundaries (`never_store` / `never_initiate`); counts instead of confidence floats; per-type decay. Full schema: Appendix A.
+
+**Settled (2026-07-15):**
+- Observability uses two correlated planes: a restricted full-fidelity interaction/evaluation journal, owned as the durable source of truth, and content-free operational telemetry. It measures safety, quality, and reliability — never engagement. Interaction-backend selection is gated by the same versioned synthetic corpus; no backend may weaken journal reconstruction, replay, or export.
+- Before genuine personal data enters the observability system, re-run the threat model and approve storage, access, retention, export, and recovery controls under §8.
 
 **Open:** none at the strategic level. Remaining refinement (exact table DDL, type-registry format, graph-walk relevance scoring) happens against implementation in phases 2–4.
 
