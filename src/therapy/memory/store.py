@@ -1,7 +1,7 @@
-"""SQLite session memory and local audio archive (SPEC §8).
+"""SQLite session/episodic memory and local audio archive (SPEC §8).
 
 This module is framework-free storage for the local-first privacy model:
-session transcripts and user-model v1 facts stay in SQLite, while raw
+session transcripts and summaries stay in SQLite, while raw
 utterance audio is archived under the same owner-controlled data directory.
 Each public method opens its own SQLite connection, so calls from asyncio
 callbacks do not share connections across threads.
@@ -76,7 +76,8 @@ class MemoryStore:
                     started_at TEXT NOT NULL,
                     ended_at TEXT,
                     summary TEXT,
-                    title TEXT
+                    title TEXT,
+                    recap TEXT
                 );
 
                 CREATE TABLE IF NOT EXISTS turns (
@@ -91,14 +92,6 @@ class MemoryStore:
                     audio_path TEXT
                 );
 
-                CREATE TABLE IF NOT EXISTS facts (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    statement TEXT NOT NULL UNIQUE,
-                    kind TEXT NOT NULL DEFAULT 'observation',
-                    first_seen TEXT NOT NULL,
-                    last_seen TEXT NOT NULL,
-                    n_occurrences INTEGER NOT NULL DEFAULT 1
-                );
                 """
             )
             # Databases created before titles existed (2026-07-10) lack the
@@ -110,6 +103,9 @@ class MemoryStore:
             if "title" not in columns:
                 with connection:
                     connection.execute("ALTER TABLE sessions ADD COLUMN title TEXT")
+            if "recap" not in columns:
+                with connection:
+                    connection.execute("ALTER TABLE sessions ADD COLUMN recap TEXT")
 
     def create_session(self) -> str:
         """Create a session row and return its UUID4 hex id."""
@@ -312,7 +308,7 @@ class MemoryStore:
         with self._connect() as connection:
             rows = connection.execute(
                 """
-                SELECT id, started_at, ended_at, summary, title
+                SELECT id, started_at, ended_at, summary, title, recap
                 FROM sessions
                 ORDER BY started_at DESC, rowid DESC
                 """
@@ -340,6 +336,15 @@ class MemoryStore:
                 connection.execute(
                     "UPDATE sessions SET title = COALESCE(title, ?) WHERE id = ?",
                     (title, session_id),
+                )
+
+    def ensure_recap(self, session_id: str, recap: str) -> None:
+        """Fill user-facing recap once, independently of internal summary."""
+        with self._connect() as connection:
+            with connection:
+                connection.execute(
+                    "UPDATE sessions SET recap = COALESCE(recap, ?) WHERE id = ?",
+                    (recap, session_id),
                 )
 
     def session_turns(self, session_id: str) -> list[RowDict]:
@@ -373,38 +378,30 @@ class MemoryStore:
             ).fetchall()
         return [_row_dict(row) for row in reversed(rows)]
 
-    def upsert_fact(self, statement: str, kind: str = "observation") -> None:
-        """Insert or reinforce a canonical-English user-model fact."""
-        now = _utc_now()
-        with self._connect() as connection:
-            with connection:
-                connection.execute(
-                    """
-                    INSERT INTO facts (
-                        statement, kind, first_seen, last_seen, n_occurrences
-                    )
-                    VALUES (?, ?, ?, ?, 1)
-                    ON CONFLICT(statement) DO UPDATE SET
-                        last_seen = excluded.last_seen,
-                        n_occurrences = facts.n_occurrences + 1
-                    """,
-                    (statement, kind, now, now),
-                )
-
-    def facts(self) -> list[RowDict]:
-        """Return all user-model facts in first-seen order."""
+    def episodic_summaries(self) -> list[RowDict]:
+        """Return all active episodic summaries for relevance retrieval."""
         with self._connect() as connection:
             rows = connection.execute(
                 """
-                SELECT id, statement, kind, first_seen, last_seen, n_occurrences
-                FROM facts
-                ORDER BY first_seen ASC, id ASC
+                SELECT id, started_at, ended_at, summary, recap
+                FROM sessions
+                WHERE ended_at IS NOT NULL AND summary IS NOT NULL
+                ORDER BY started_at DESC, rowid DESC
                 """
             ).fetchall()
         return [_row_dict(row) for row in rows]
 
+    def upsert_fact(self, statement: str, kind: str = "observation") -> None:
+        """Reject retired Phase-2 flat-fact writes."""
+        del statement, kind
+        raise RuntimeError("flat facts are retired; use UserModel graph writes")
+
+    def facts(self) -> list[RowDict]:
+        """Reject retired Phase-2 flat-fact reads."""
+        raise RuntimeError("flat facts are retired; use UserModel.nodes")
+
     def export_all(self) -> dict[str, object]:
-        """Return a JSON-serializable snapshot of sessions, turns, and facts."""
+        """Return a JSON-serializable snapshot of sessions and turns."""
         sessions = []
         for session in self.sessions():
             session_export: dict[str, object] = dict(session)
@@ -413,14 +410,12 @@ class MemoryStore:
         return {
             "exported_at": _utc_now(),
             "sessions": sessions,
-            "facts": self.facts(),
         }
 
     def delete_all(self) -> None:
         """Delete stored rows and remove the audio archive tree."""
         with self._connect() as connection:
             with connection:
-                connection.execute("DELETE FROM facts")
                 connection.execute("DELETE FROM turns")
                 connection.execute("DELETE FROM sessions")
         shutil.rmtree(self._audio_dir, ignore_errors=True)

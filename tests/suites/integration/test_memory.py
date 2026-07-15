@@ -4,6 +4,8 @@ import wave
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+import pytest
+
 from therapy.memory import MemoryStore
 from therapy.memory.summarizer import LLMSummarizer, render_transcript
 
@@ -176,16 +178,13 @@ def test_recent_summaries_chronological_with_limit(tmp_path: Path) -> None:
     assert all(set(summary) == {"started_at", "ended_at", "summary"} for summary in summaries)
 
 
-def test_upsert_fact_dedupes_exact_statement(tmp_path: Path) -> None:
+def test_flat_fact_surface_is_retired_after_graph_migration(tmp_path: Path) -> None:
     store = MemoryStore(tmp_path)
-    store.upsert_fact("The user prefers morning walks.")
-    store.upsert_fact("The user prefers morning walks.")
 
-    facts = store.facts()
-    assert len(facts) == 1
-    assert facts[0]["statement"] == "The user prefers morning walks."
-    assert facts[0]["kind"] == "observation"
-    assert facts[0]["n_occurrences"] == 2
+    with pytest.raises(RuntimeError, match="flat facts are retired"):
+        store.upsert_fact("The user prefers morning walks.")
+    with pytest.raises(RuntimeError, match="flat facts are retired"):
+        store.facts()
 
 
 def test_export_all_json_round_trips(tmp_path: Path) -> None:
@@ -193,15 +192,13 @@ def test_export_all_json_round_trips(tmp_path: Path) -> None:
     session_id = store.create_session()
     store.add_turn(session_id, "user", "text", "en", "I called Ana.")
     store.end_session(session_id, "The user said they called Ana.")
-    store.upsert_fact("The user knows Ana.", kind="relationship")
 
     snapshot = store.export_all()
     loaded = json.loads(json.dumps(snapshot))
 
-    assert set(loaded) == {"exported_at", "sessions", "facts"}
+    assert set(loaded) == {"exported_at", "sessions"}
     assert loaded["sessions"][0]["id"] == session_id
     assert loaded["sessions"][0]["turns"][0]["text"] == "I called Ana."
-    assert loaded["facts"][0]["statement"] == "The user knows Ana."
 
 
 def test_delete_all_clears_tables_and_audio_but_store_still_works(
@@ -218,14 +215,12 @@ def test_delete_all_clears_tables_and_audio_but_store_still_works(
         audio=b"\x00\x00",
     )
     store.end_session(session_id, "Summary")
-    store.upsert_fact("A fact.")
     assert (tmp_path / "audio").is_dir()
 
     store.delete_all()
 
     assert store.sessions() == []
     assert store.session_turns(session_id) == []
-    assert store.facts() == []
     assert not (tmp_path / "audio").exists()
     new_session_id = store.create_session()
     assert store.sessions()[0]["id"] == new_session_id
