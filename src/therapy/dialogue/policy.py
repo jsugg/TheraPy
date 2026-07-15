@@ -13,8 +13,14 @@ Safety (SPEC §4): therapy-informed, never therapy — no diagnoses; crisis
 language stops coaching and surfaces human resources.
 """
 
+from __future__ import annotations
+
 import json
 import os
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from therapy.knowledge.user_model import GraphContextProvider
 
 CRISIS_RESOURCES_DEFAULT = (
     "local emergency services (911 / 112 / 190), or a trusted person nearby"
@@ -138,21 +144,21 @@ def continuity_note(summaries: list[dict], facts: list[dict]) -> str | None:
 
 
 def graph_continuity_note(
-    model: object, *, topic: str = "", summaries: list[dict] | None = None
+    model: GraphContextProvider, *, topic: str = "", summaries: list[dict] | None = None
 ) -> str | None:
     """Graph-aware continuity for a new conversation (SPEC §8, W3).
 
     Replaces the Phase-2 "flat facts + summaries" injection: identity,
     preferences and the `never_initiate` list are always present, and a graph
     walk from the opening `topic` pulls in the most relevant confirmed/pattern
-    claims with their confirmed edges. `model` is a
-    `knowledge.user_model.UserModel` (typed loosely to keep this framework-free
-    module free of a hard import). Recent session summaries, when supplied, are
-    appended as narrative colour. Returns None when there is nothing to inject.
+    claims with their confirmed edges. The model is protocol-typed to keep this
+    framework-free module free of a runtime user-model import. Recent session
+    summaries, when supplied, are appended as narrative colour. Returns None
+    when there is nothing to inject.
     """
     from therapy.knowledge.user_model import render_context
 
-    note = render_context(model.assemble_context(topic))  # type: ignore[attr-defined]
+    note = render_context(model.assemble_context(topic))
     parts = [note] if note else []
     if summaries:
         rendered = "\n".join(

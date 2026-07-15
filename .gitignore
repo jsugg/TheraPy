@@ -29,5 +29,5 @@ data/
 .serena/
 .local/
 
-# local data-volume backups (owner personal data — never commit)
+# local data-volume backups (my personal test data -- never EVER commit)
 data-backup-*.tgz

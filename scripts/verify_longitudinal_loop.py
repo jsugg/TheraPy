@@ -1,8 +1,8 @@
-"""Phase-4 acceptance (SPEC §9): the longitudinal self-knowledge loop.
+"""Longitudinal self-knowledge verification (SPEC §9).
 
 Deterministic and offline — no live server, no LLM, no network. Everything runs
-against an *isolated* `THERAPY_DATA_DIR` (a fresh temp dir), so the acceptance
-never touches the real `/data` (the Hardening 7-9 lesson). A stubbed distillation
+against an *isolated* `THERAPY_DATA_DIR` (a fresh temp dir), so the run never
+touches the real `/data` (the Hardening 7-9 lesson). A stubbed distillation
 extractor stands in for the cloud LLM so the run is reproducible.
 
 Proves, on seeded multi-session data:
@@ -21,7 +21,7 @@ Proves, on seeded multi-session data:
 
 Run (framework-free venv is enough):
 
-    .venv/bin/python scripts/phase4_acceptance.py
+    .venv/bin/python scripts/verify_longitudinal_loop.py
 """
 
 from __future__ import annotations
@@ -66,7 +66,7 @@ async def _seed_and_graduate(model, distill) -> int:
 
 
 async def main() -> int:
-    with tempfile.TemporaryDirectory(prefix="therapy-phase4-") as tmp:
+    with tempfile.TemporaryDirectory(prefix="therapy-longitudinal-") as tmp:
         os.environ["THERAPY_DATA_DIR"] = tmp
 
         from datetime import datetime
@@ -201,11 +201,11 @@ async def main() -> int:
         )
         check("crisis-config", crisis_contacts()[0]["value"] == "135", "configurable")
 
-    print("\n=== Phase-4 acceptance summary ===")
+    print("\n=== Longitudinal self-knowledge verification summary ===")
     for line in RESULTS:
         print(line)
     if any("FAIL" in line for line in RESULTS):
-        print("\nFAIL — phase-4 acceptance not green.")
+        print("\nFAIL — longitudinal self-knowledge verification not green.")
         return 1
     print("\nPASS — longitudinal loop, graph walk, proactivity, research KB verified.")
     return 0

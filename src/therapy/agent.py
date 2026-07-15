@@ -40,12 +40,12 @@ session is summarized and distilled in the background.
 """
 
 import asyncio
+import logging
 import os
 import time
 from typing import Any
 
 import numpy as np
-from loguru import logger
 from pipecat.audio.vad.silero import SileroVADAnalyzer
 from pipecat.audio.vad.vad_analyzer import VADParams
 from pipecat.frames.frames import (
@@ -112,6 +112,8 @@ from therapy.perception.stt import (
 from therapy.server import live
 from therapy.server.protocol import presence_message, session_state_message
 from therapy.speech.tts import voice_for
+
+logger = logging.getLogger(__name__)
 
 LANGUAGE_ENUM = {"en": Language.EN, "es": Language.ES, "pt": Language.PT}
 

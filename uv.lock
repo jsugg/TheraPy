@@ -1979,7 +1979,6 @@ dependencies = [
     { name = "kokoro-onnx" },
     { name = "lingua-language-detector" },
     { name = "pipecat-ai", extra = ["webrtc", "whisper"] },
-    { name = "requests" },
     { name = "uvicorn", extra = ["standard"] },
 ]
 
@@ -1999,14 +1998,13 @@ requires-dist = [
     { name = "kokoro-onnx", specifier = ">=0.5.0" },
     { name = "lingua-language-detector", specifier = ">=2.1.1" },
     { name = "pipecat-ai", extras = ["silero", "webrtc", "whisper"], specifier = ">=1.5.0" },
-    { name = "requests", specifier = ">=2.34.2" },
     { name = "uvicorn", extras = ["standard"], specifier = ">=0.30,<1.0" },
 ]
 
 [package.metadata.requires-dev]
 dev = [
     { name = "httpx", specifier = ">=0.27,<1.0" },
-    { name = "pytest", specifier = ">=8,<9" },
+    { name = "pytest", specifier = ">=8,<10" },
     { name = "pytest-playwright", specifier = ">=0.5" },
     { name = "ruff", specifier = ">=0.6" },
 ]

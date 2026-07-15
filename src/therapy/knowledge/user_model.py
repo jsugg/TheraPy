@@ -30,7 +30,7 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol, TypedDict, cast
 
 # Extensible registries — adding a type is configuration, not a schema change.
 # The 11 starter node types (SPEC Appendix A); `note` is the general bucket the
@@ -88,6 +88,72 @@ _DECAY_HALF_LIFE_DAYS: dict[str, float] = {
 _DEFAULT_HALF_LIFE_DAYS = 180.0
 
 _TOKEN_RE = re.compile(r"[a-z0-9]+")
+
+
+type GraphQuote = dict[str, str]
+
+
+class GraphNode(TypedDict):
+    """Decoded graph node row returned by the user model."""
+
+    id: int
+    type: str
+    statement: str
+    quotes: list[GraphQuote]
+    n_occurrences: int
+    n_sessions: int
+    sessions: list[str]
+    status: str
+    source: str
+    never_initiate: bool
+    user_edited: bool
+    first_seen: str
+    last_seen: str
+
+
+class GraphEdge(TypedDict):
+    """Decoded graph edge row returned by the user model."""
+
+    id: int
+    src: int
+    dst: int
+    type: str
+    statement: str
+    quotes: list[GraphQuote]
+    n_occurrences: int
+    n_sessions: int
+    sessions: list[str]
+    status: str
+    source: str
+    user_edited: bool
+    first_seen: str
+    last_seen: str
+
+
+class GraphWalk(TypedDict):
+    """Topic-relevant graph slice plus initiation boundaries."""
+
+    nodes: list[GraphNode]
+    edges: list[GraphEdge]
+    never_initiate: list[str]
+
+
+class GraphContext(TypedDict):
+    """Continuity context rendered into the LLM system prompt."""
+
+    identity: list[GraphNode]
+    preferences: list[GraphNode]
+    never_initiate: list[str]
+    walk_nodes: list[GraphNode]
+    walk_edges: list[GraphEdge]
+
+
+class GraphContextProvider(Protocol):
+    """Object that can assemble graph continuity context."""
+
+    def assemble_context(self, topic: str = "") -> GraphContext:
+        """Build graph continuity context for `topic`."""
+        ...
 
 
 def _utc_now() -> str:
@@ -442,7 +508,7 @@ class UserModel:
             ),
         )
 
-    def get_node(self, node_id: int) -> dict[str, Any] | None:
+    def get_node(self, node_id: int) -> GraphNode | None:
         """Return one node as a dict, or None."""
         with self._connect() as connection:
             row = connection.execute(
@@ -452,7 +518,7 @@ class UserModel:
 
     def nodes(
         self, *, type_: str | None = None, status: str | None = None
-    ) -> list[dict[str, Any]]:
+    ) -> list[GraphNode]:
         """Return nodes, optionally filtered by type and/or status."""
         query = "SELECT * FROM nodes"
         clauses: list[str] = []
@@ -576,7 +642,7 @@ class UserModel:
                 )
                 return int(existing["id"])
 
-    def edges(self, *, status: str | None = None) -> list[dict[str, Any]]:
+    def edges(self, *, status: str | None = None) -> list[GraphEdge]:
         """Return edges, optionally filtered by status."""
         query = "SELECT * FROM edges"
         params: tuple[str, ...] = ()
@@ -665,7 +731,7 @@ class UserModel:
                 )
         return cursor.rowcount > 0
 
-    def pending_insights(self) -> list[dict[str, Any]]:
+    def pending_insights(self) -> list[GraphNode]:
         """Proposed patterns awaiting the user's confirm/reject (W4 inbox)."""
         return self.nodes(status="pattern")
 
@@ -673,7 +739,7 @@ class UserModel:
     # Decay + graph walk (W3): relevance-scored context assembly
     # ------------------------------------------------------------------ #
 
-    def _decay_weight(self, node: dict[str, Any], now: datetime) -> float:
+    def _decay_weight(self, node: GraphNode, now: datetime) -> float:
         """Recency weight in (0, 1]; per-type half-life sets the fade rate."""
         half_life = _DECAY_HALF_LIFE_DAYS.get(str(node["type"]), _DEFAULT_HALF_LIFE_DAYS)
         try:
@@ -685,7 +751,7 @@ class UserModel:
 
     def graph_walk(
         self, topic: str, *, k: int = 5, now: datetime | None = None
-    ) -> dict[str, Any]:
+    ) -> GraphWalk:
         """Walk from `topic` to the top-K relevant nodes with confirmed edges.
 
         Relevance = token overlap with the topic, weighted by status priority
@@ -699,7 +765,7 @@ class UserModel:
         """
         now = now or datetime.now(UTC)
         topic_tokens = _tokens(topic)
-        scored: list[tuple[float, dict[str, Any]]] = []
+        scored: list[tuple[float, GraphNode]] = []
         for node in self.nodes():
             if node["never_initiate"]:
                 continue
@@ -725,7 +791,7 @@ class UserModel:
 
     def assemble_context(
         self, topic: str = "", *, k: int = 5, now: datetime | None = None
-    ) -> dict[str, Any]:
+    ) -> GraphContext:
         """Build the graph-aware continuity payload for a conversation (W3).
 
         Always present: identity, standing preferences, and the
@@ -742,7 +808,7 @@ class UserModel:
         if topic:
             walk = self.graph_walk(topic, k=k, now=now)
         else:
-            walk = {
+            walk: GraphWalk = {
                 "nodes": [],
                 "edges": [],
                 "never_initiate": self.never_initiate_topics(),
@@ -839,37 +905,37 @@ def _fact_kind_to_type(kind: str) -> str:
     return kind if kind in NODE_TYPES else "note"
 
 
-def _node_dict(row: sqlite3.Row) -> dict[str, Any]:
+def _node_dict(row: sqlite3.Row) -> GraphNode:
     """Shape a node row for callers, decoding JSON columns and the flags."""
     node = dict(row)
     node["quotes"] = json.loads(node["quotes"])
     node["sessions"] = json.loads(node["sessions"])
     node["never_initiate"] = bool(node["never_initiate"])
     node["user_edited"] = bool(node["user_edited"])
-    return node
+    return cast(GraphNode, node)
 
 
-def _edge_dict(row: sqlite3.Row) -> dict[str, Any]:
+def _edge_dict(row: sqlite3.Row) -> GraphEdge:
     """Shape an edge row for callers, decoding JSON columns."""
     edge = dict(row)
     edge["quotes"] = json.loads(edge["quotes"])
     edge["sessions"] = json.loads(edge["sessions"])
     edge["user_edited"] = bool(edge["user_edited"])
-    return edge
+    return cast(GraphEdge, edge)
 
 
-def render_context(assembled: dict[str, Any]) -> str | None:
+def render_context(assembled: GraphContext) -> str | None:
     """Render assembled graph context as the LLM continuity system message.
 
     Older history reaches the model only as this distilled, graph-derived
     context — never verbatim transcripts (SPEC §8). Returns None when the model
     is empty so a first conversation carries no scaffolding.
     """
-    identity = list(assembled.get("identity", []))  # type: ignore[arg-type]
-    preferences = list(assembled.get("preferences", []))  # type: ignore[arg-type]
-    never_initiate = list(assembled.get("never_initiate", []))  # type: ignore[arg-type]
-    walk_nodes = list(assembled.get("walk_nodes", []))  # type: ignore[arg-type]
-    walk_edges = list(assembled.get("walk_edges", []))  # type: ignore[arg-type]
+    identity = assembled["identity"]
+    preferences = assembled["preferences"]
+    never_initiate = assembled["never_initiate"]
+    walk_nodes = assembled["walk_nodes"]
+    walk_edges = assembled["walk_edges"]
     if not any([identity, preferences, never_initiate, walk_nodes]):
         return None
 
