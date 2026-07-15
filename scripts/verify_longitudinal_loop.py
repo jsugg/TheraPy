@@ -1,215 +1,387 @@
-"""Longitudinal self-knowledge verification (SPEC §9).
+"""Phase 4 longitudinal acceptance against a real isolated HTTP server.
 
-Deterministic and offline — no live server, no LLM, no network. Everything runs
-against an *isolated* `THERAPY_DATA_DIR` (a fresh temp dir), so the run never
-touches the real `/data` (the Hardening 7-9 lesson). A stubbed distillation
-extractor stands in for the cloud LLM so the run is reproducible.
-
-Proves, on seeded multi-session data:
-
-  1. A claim graduates observation -> pattern -> confirmed **only** after
-     explicit user validation; the mechanical floor alone never mints
-     `confirmed` (SPEC §3, R1).
-  2. Graph-walk context assembly includes confirmed edges and omits
-     `never_initiate` nodes (W3).
-  3. One proactive channel respects quiet hours — suppressed inside the quiet
-     window, cleared to fire outside it — and defers to `never_initiate` (W5).
-  4. A research-KB query grounds a technique choice (silent grounding) and
-     returns a source citation on demand (W6).
-  5. Former v1 flat `facts` migrate into the property graph as `observation`
-     nodes with zero loss (W1 migration).
-
-Run (framework-free venv is enough):
-
-    .venv/bin/python scripts/verify_longitudinal_loop.py
+The subprocess uses the production FastAPI lifespan, persistence services,
+context assembler, distillation transaction, scheduler, and public owner APIs.
+Only the LLM/embedding boundary is deterministic under ``THERAPY_TEST_MODE``.
+No domain service is imported or orchestrated by this verifier.
 """
 
 from __future__ import annotations
 
-import asyncio
+import json
 import os
+import socket
+import subprocess
 import sys
 import tempfile
+import time
+from collections.abc import Iterator
+from contextlib import contextmanager
+from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, cast
+from typing import BinaryIO
+
+import httpx
 
 RESULTS: list[str] = []
 
 
-def check(label: str, ok: bool, detail: str = "") -> None:
-    """Record a pass/fail line."""
-    mark = "✓" if ok else "FAIL"
-    suffix = f" — {detail}" if detail else ""
-    RESULTS.append(f"[{label}] {'' if ok else 'FAIL: '}{mark}{suffix}")
+def _pass(label: str, detail: str) -> None:
+    RESULTS.append(f"[{label}] PASS — {detail}")
 
 
-async def _seed_and_graduate(model, distill) -> int:
-    """Seed three sessions of a recurring claim and run distillation each time.
+def _require(label: str, condition: bool, detail: str) -> None:
+    if not condition:
+        raise AssertionError(f"[{label}] {detail}")
+    _pass(label, detail)
 
-    Returns the node id of the recurring claim after graduation.
-    """
-    statement = "Skips lunch when the day gets busy."
 
-    async def stub_extract(transcript: str, observations: list[str]) -> list[dict]:
-        # Stands in for the cloud LLM: promotes the recurring observation into a
-        # routine node (and never invents `confirmed`).
-        return [{"kind": "node", "type": "routine", "statement": statement}]
+def _free_port() -> int:
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        return int(sock.getsockname()[1])
 
-    for session in ("s1", "s2", "s3"):
-        model.add_observation(
-            f"I keep skipping lunch, session {session}.", session_id=session
+
+@dataclass(slots=True)
+class ServerProcess:
+    """One isolated uvicorn process and its diagnostics sink."""
+
+    process: subprocess.Popen[bytes]
+    base_url: str
+    log_path: Path
+    log_file: BinaryIO
+
+    def stop(self) -> None:
+        """Stop lifespan cleanly, escalating only after a bounded wait."""
+        self.process.terminate()
+        try:
+            self.process.wait(timeout=15)
+        except subprocess.TimeoutExpired:
+            self.process.kill()
+            self.process.wait(timeout=5)
+        finally:
+            self.log_file.close()
+
+
+def _await_health(server: ServerProcess, timeout: float = 30.0) -> None:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if server.process.poll() is not None:
+            log = server.log_path.read_text(encoding="utf-8", errors="replace")
+            raise RuntimeError(
+                f"isolated server exited {server.process.returncode}:\n{log[-4_000:]}"
+            )
+        try:
+            response = httpx.get(f"{server.base_url}/health", timeout=1.0)
+            if response.status_code == 200:
+                return
+        except httpx.HTTPError:
+            pass
+        time.sleep(0.1)
+    raise TimeoutError("isolated server did not become healthy")
+
+
+@contextmanager
+def _server(data_dir: Path, log_path: Path) -> Iterator[ServerProcess]:
+    port = _free_port()
+    log_file = log_path.open("wb")
+    environment = {
+        **os.environ,
+        "THERAPY_DATA_DIR": str(data_dir),
+        "THERAPY_TEST_MODE": "1",
+        "THERAPY_CRISIS_CONTACTS": json.dumps(
+            [{"label": "Línea 135", "value": "135"}]
+        ),
+    }
+    process = subprocess.Popen(
+        [
+            sys.executable,
+            "-m",
+            "uvicorn",
+            "therapy.server.app:app",
+            "--host",
+            "127.0.0.1",
+            "--port",
+            str(port),
+            "--log-level",
+            "warning",
+        ],
+        env=environment,
+        stdout=log_file,
+        stderr=subprocess.STDOUT,
+    )
+    server = ServerProcess(process, f"http://127.0.0.1:{port}", log_path, log_file)
+    try:
+        _await_health(server)
+        yield server
+    finally:
+        server.stop()
+
+
+def _json(response: httpx.Response) -> dict[str, object]:
+    if response.status_code >= 400:
+        raise AssertionError(
+            f"{response.request.method} {response.request.url.path} -> "
+            f"{response.status_code}: {response.text}"
         )
-        await distill.distill_session(model, [], session, extractor=stub_extract)
+    payload = response.json()
+    if not isinstance(payload, dict):
+        raise AssertionError("API response root must be an object")
+    return payload
 
-    matches = [n for n in model.nodes() if n["statement"] == statement]
-    return int(matches[0]["id"]) if matches else -1
+
+def _agent_turn(
+    client: httpx.Client,
+    text: str,
+    *,
+    session_id: str | None = None,
+    language: str = "en",
+    finalize: bool = False,
+) -> dict[str, object]:
+    body: dict[str, object] = {
+        "text": text,
+        "language": language,
+        "finalize": finalize,
+    }
+    if session_id is not None:
+        body["session_id"] = session_id
+    return _json(client.post("/api/testing/agent/turn", json=body))
 
 
-async def main() -> int:
-    with tempfile.TemporaryDirectory(prefix="therapy-longitudinal-") as tmp:
-        os.environ["THERAPY_DATA_DIR"] = tmp
+def _confirm_next(client: httpx.Client, topic: str) -> dict[str, object]:
+    raised = _agent_turn(client, topic)
+    insight = raised.get("insight")
+    _require("adjacent-reflection", isinstance(insight, dict), topic)
+    resolution = _agent_turn(
+        client,
+        "yes",
+        session_id=str(raised["session_id"]),
+    )
+    recorded = resolution.get("resolution")
+    _require(
+        "conversational-confirmation",
+        isinstance(recorded, dict) and recorded.get("state") == "confirmed",
+        "explicit yes resolves only the insight raised in this session",
+    )
+    return insight if isinstance(insight, dict) else {}
 
-        from datetime import datetime
 
-        from therapy.dialogue import proactive
-        from therapy.dialogue.policy import crisis_contacts
-        from therapy.knowledge import distill
-        from therapy.knowledge.research import ResearchKB
-        from therapy.knowledge.user_model import UserModel, render_context
-        from therapy.memory import MemoryStore
-
-        assert Path(tmp).resolve() != Path("/data"), "must never touch real /data"
-
-        # --- 5. v1 facts migrate as observation nodes (seed BEFORE UserModel) ---
-        store = MemoryStore()
-        store.upsert_fact("Has a dog named Bruno.")
-        store.upsert_fact("Has a dog named Bruno.")  # reinforced
-        store.upsert_fact("Knows Ana.", kind="relationship")
-        n_facts = len(store.facts())
-
-        model = UserModel()  # migration runs on init
-        migrated = [n for n in model.nodes() if n["source"] == "conversation"]
-        migrated_stmts = {n["statement"] for n in migrated}
-        check(
-            "migration",
-            len(migrated) == n_facts
-            and all(n["status"] == "observation" for n in migrated)
-            and "Has a dog named Bruno." in migrated_stmts,
-            f"{n_facts} v1 facts -> {len(migrated)} observation nodes (zero loss)",
+def _verify_agent_graph_context_research(client: httpx.Client) -> None:
+    last_distillation: dict[str, object] | None = None
+    for index in range(3):
+        result = _agent_turn(
+            client,
+            f"Late meeting {index} drains my energy.",
+            finalize=True,
         )
+        candidate = result.get("distillation")
+        if isinstance(candidate, dict):
+            last_distillation = candidate
+    _require(
+        "distillation",
+        bool(last_distillation)
+        and bool(last_distillation.get("proposed_nodes"))
+        and bool(last_distillation.get("proposed_edges")),
+        "three real finalized sessions reach the node and edge proposal floor",
+    )
 
-        # --- 1. graduation only via explicit validation ---
-        node_id = await _seed_and_graduate(model, distill)
-        node = model.get_node(node_id)
-        floor_ok = node is not None and node["status"] == "pattern"
-        # The floor alone must NOT have produced `confirmed`.
-        no_premature_confirm = node is not None and node["status"] != "confirmed"
-        model.confirm_node(node_id)  # explicit user validation
-        confirmed_node = model.get_node(node_id)
-        confirmed_ok = confirmed_node is not None and (
-            confirmed_node["status"] == "confirmed"
-        )
-        check(
-            "graduation",
-            floor_ok and no_premature_confirm and confirmed_ok,
-            "observation -> pattern (floor) -> confirmed (only after validation)",
-        )
+    proposed = _json(client.get("/api/graph"))
+    nodes = proposed.get("nodes")
+    edges = proposed.get("edges")
+    _require(
+        "no-premature-confirmation",
+        isinstance(nodes, list)
+        and isinstance(edges, list)
+        and nodes
+        and edges
+        and all(item["status"] == "proposed" for item in [*nodes, *edges]),
+        "mechanical eligibility plus judgment produces proposals, never confirmation",
+    )
 
-        # --- 2. graph walk includes confirmed edges, omits never_initiate ---
-        caffeine = model.upsert_node("trigger", "Drinks coffee late in the day.")
-        sleep = model.upsert_node("thread", "Sleep has been poor lately.")
-        assert caffeine is not None and sleep is not None
-        model.confirm_node(caffeine)
-        model.confirm_node(sleep)
-        edge = model.upsert_edge(
-            caffeine, sleep, "causes", statement="late caffeine worsens sleep"
-        )
-        assert edge is not None
-        model.confirm_edge(edge)
-        model.add_boundary("never_initiate", "my brother")
-        secret = model.upsert_node(
-            "thread", "A private worry about sleep and my brother.",
-            never_initiate=True,
-        )
-        walk = model.graph_walk("coffee and sleep")
-        walk_nodes = cast("list[dict[str, Any]]", walk["nodes"])
-        walk_edges = cast("list[dict[str, Any]]", walk["edges"])
-        walk_ids = {int(n["id"]) for n in walk_nodes}
-        edge_present = any(int(e["id"]) == edge for e in walk_edges)
-        secret_omitted = secret not in walk_ids
-        rendered = render_context(model.assemble_context("coffee and sleep")) or ""
-        check(
-            "graph-walk",
-            edge_present and secret_omitted and "my brother" in rendered,
-            "confirmed edge included; never_initiate node omitted; boundary in context",
-        )
+    first = _confirm_next(client, "Late meetings drained my energy again.")
+    second = _confirm_next(client, "Energy drops after late meetings.")
+    third = _confirm_next(client, "Late meetings trigger an energy drop.")
+    _require(
+        "node-edge-lifecycle",
+        first.get("claim_kind") == "node"
+        and second.get("claim_kind") == "node"
+        and third.get("claim_kind") == "edge",
+        "conversation confirms two nodes and their relationship edge",
+    )
+    confirmed = _json(client.get("/api/graph"))
+    confirmed_nodes = confirmed.get("nodes")
+    confirmed_edges = confirmed.get("edges")
+    _require(
+        "confirmed-graph",
+        isinstance(confirmed_nodes, list)
+        and isinstance(confirmed_edges, list)
+        and all(node["status"] == "confirmed" for node in confirmed_nodes)
+        and all(edge["status"] == "confirmed" for edge in confirmed_edges),
+        "HTTP graph reports confirmed node and edge state",
+    )
 
-        # --- 3. proactive channel respects quiet hours + never_initiate ---
-        config = proactive.ProactivityConfig(
-            channels={
-                proactive.CHECK_IN: proactive.ChannelConfig(
-                    enabled=True, quiet_hours=proactive.QuietHours(start=22, end=8)
+    refreshed = _agent_turn(client, "A late meeting drained my energy today.")
+    _require(
+        "per-turn-context",
+        "Late meetings trigger an energy drop" in str(refreshed.get("memory_note")),
+        "new-conversation topic refresh includes the confirmed relationship",
+    )
+
+    for index in range(3):
+        _agent_turn(
+            client,
+            f"My brother is a sensitive ongoing thread {index}.",
+            finalize=True,
+        )
+    _json(
+        client.post(
+            "/api/graph/boundaries",
+            json={"kind": "never_initiate", "value": "brother"},
+        )
+    )
+    unsolicited = _agent_turn(client, "How should I plan tomorrow?")
+    user_raised = _agent_turn(client, "My brother is on my mind today.")
+    _require(
+        "never-initiate",
+        "brother" not in str(unsolicited.get("memory_note")).casefold()
+        and "brother" in str(user_raised.get("memory_note")).casefold(),
+        "private topic stays out unsolicited and returns only when user-raised",
+    )
+
+    upload = _json(
+        client.post(
+            "/api/research/ingest",
+            files={
+                "file": (
+                    "planning.md",
+                    b"# Planning transitions\n\nA visible checklist reduces planning load.",
+                    "text/markdown",
                 )
-            }
+            },
+            data={
+                "source_title": "Planning transitions",
+                "source_ref": "Owner guide",
+            },
         )
-        at_night = datetime(2026, 7, 12, 2, 0)
-        at_day = datetime(2026, 7, 12, 14, 0)
-        suppressed = not proactive.should_fire(proactive.CHECK_IN, at_night, config)
-        fires = proactive.should_fire(proactive.CHECK_IN, at_day, config)
-        boundary_blocks = not proactive.should_fire(
-            proactive.CHECK_IN, at_day, config,
-            topic="a check-in about my brother",
-            never_initiate=model.never_initiate_topics(),
+    )
+    _require("research-ingest", "document" in upload, "local source indexed through API")
+    grounded = _agent_turn(client, "Help me with planning a task transition.")
+    citation = _json(
+        client.get(
+            "/api/research/query",
+            params={"q": "planning checklist", "k": 1, "threshold": 0.1},
         )
-        check(
-            "proactive",
-            suppressed and fires and boundary_blocks,
-            "suppressed 02:00, fires 14:00, defers to never_initiate",
-        )
+    )
+    sources = citation.get("sources")
+    source = sources[0] if isinstance(sources, list) and sources else {}
+    _require(
+        "research-grounding",
+        "visible checklist" in str(grounded.get("reply")).casefold()
+        and source.get("section") == "Planning transitions"
+        and source.get("anchor") == "section-planning-transitions-block-1",
+        "retrieval changes technique choice and returns exact section/block anchor",
+    )
 
-        # --- 4. research KB: silent grounding + cited psychoeducation ---
-        kb = ResearchKB()
-        kb.ingest(
-            "Body doubling for task initiation",
-            "Brown 2021, ADHD Practice Review",
-            "Body doubling supports task initiation in ADHD. Working beside "
-            "another person makes it easier to start a task when you cannot get "
-            "going.",
-        )
-        kb.ingest(
-            "Deep pressure for sensory regulation",
-            "Lee 2020, Occupational Therapy Review",
-            "Deep pressure input can reduce sensory overload and support a "
-            "calmer level of alertness during transitions.",
-        )
-        grounded = kb.ground("how do I start a task when I can't get going?")
-        grounding_ok = grounded is not None and "body doubling" in grounded.lower()
-        answer = kb.psychoeducation("what helps with task initiation?")
-        sources = cast("list[dict[str, str]]", answer["sources"])
-        cite_ok = bool(answer["answer"]) and any(
-            s["ref"] == "Brown 2021, ADHD Practice Review" for s in sources
-        )
-        check(
-            "research-kb",
-            grounding_ok and cite_ok,
-            "silent grounding picks body-doubling; psychoeducation cites its source",
-        )
+    crisis = _json(client.get("/api/crisis-resources"))
+    _require(
+        "crisis-config",
+        crisis.get("editing") == "environment-only"
+        and isinstance(crisis.get("contacts"), list),
+        "validated contacts remain independent and environment-owned",
+    )
 
-        # Crisis-resource config is exercised as a smoke check (W8).
-        os.environ["THERAPY_CRISIS_CONTACTS"] = (
-            '[{"label": "Línea 135", "value": "135"}]'
-        )
-        check("crisis-config", crisis_contacts()[0]["value"] == "135", "configurable")
 
-    print("\n=== Longitudinal self-knowledge verification summary ===")
+def _quiet_delivery(client: httpx.Client) -> dict[str, object]:
+    _json(
+        client.put(
+            "/api/proactivity/check_in",
+            json={
+                "enabled": True,
+                "timezone": "UTC",
+                "quiet_start": "22:00",
+                "quiet_end": "08:00",
+                "schedule_time": "18:00",
+                "schedule_day": 0,
+                "frequency": "weekly",
+                "topic": "planning",
+            },
+        )
+    )
+    future_night = datetime(2036, 7, 15, 2, tzinfo=UTC)
+    request: dict[str, object] = {
+        "channel": "check_in",
+        "due_at": future_night.isoformat(),
+        "now": future_night.isoformat(),
+        "idempotency_key": "verify-restart",
+        "topic": "planning",
+    }
+    quiet = _json(client.post("/api/testing/proactivity/run", json=request))["job"]
+    _require(
+        "quiet-hours",
+        isinstance(quiet, dict)
+        and quiet.get("state") == "retry"
+        and quiet.get("result") == {"reason": "quiet_hours"},
+        "delivery is durably postponed inside overnight quiet hours",
+    )
+    request["now"] = future_night.replace(hour=14).isoformat()
+    return request
+
+
+def _restart_delivery(client: httpx.Client, request: dict[str, object]) -> None:
+    delivered = _json(client.post("/api/testing/proactivity/run", json=request))["job"]
+    jobs = _json(client.get("/api/proactivity/jobs"))["jobs"]
+    messages = _json(client.get("/api/proactivity/in-app?consume=false"))["messages"]
+    _require(
+        "restart-idempotency",
+        isinstance(delivered, dict)
+        and delivered.get("state") == "delivered"
+        and isinstance(jobs, list)
+        and sum(job["idempotency_key"] == "verify-restart" for job in jobs) == 1
+        and isinstance(messages, list)
+        and any(message["channel"] == "check_in" for message in messages),
+        "same persisted job delivers once after a full server restart",
+    )
+
+
+def main() -> int:
+    try:
+        with tempfile.TemporaryDirectory(prefix="therapy-longitudinal-") as tmp:
+            root = Path(tmp)
+            data_dir = root / "data"
+            data_dir.mkdir(mode=0o700)
+            if data_dir.resolve() == Path("/data"):
+                raise AssertionError("acceptance must never touch real /data")
+
+            with _server(data_dir, root / "server-first.log") as first:
+                with httpx.Client(base_url=first.base_url, timeout=30.0) as client:
+                    _verify_agent_graph_context_research(client)
+                    restart_request = _quiet_delivery(client)
+
+            with _server(data_dir, root / "server-restart.log") as restarted:
+                with httpx.Client(base_url=restarted.base_url, timeout=30.0) as client:
+                    _restart_delivery(client, restart_request)
+                    exported = client.get("/api/data/export")
+                    _require(
+                        "sovereignty-smoke",
+                        exported.status_code == 200
+                        and exported.headers.get("content-type", "").startswith(
+                            "application/json"
+                        ),
+                        "complete owner export remains reachable after restart",
+                    )
+    except Exception as exc:
+        print(f"FAIL — {exc}", file=sys.stderr)
+        for line in RESULTS:
+            print(line)
+        return 1
+
+    print("=== Phase 4 longitudinal server/agent acceptance ===")
     for line in RESULTS:
         print(line)
-    if any("FAIL" in line for line in RESULTS):
-        print("\nFAIL — longitudinal self-knowledge verification not green.")
-        return 1
-    print("\nPASS — longitudinal loop, graph walk, proactivity, research KB verified.")
+    print("PASS — every automated longitudinal acceptance in this verifier is green.")
     return 0
 
 
 if __name__ == "__main__":
-    sys.exit(asyncio.run(main()))
+    raise SystemExit(main())

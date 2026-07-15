@@ -2,7 +2,8 @@
 
 *(Phase 4 + the Appendix A user-model foundation it depends on)*
 
-**Status:** partial engineering slice landed
+**Status:** automated implementation complete; manual multi-week north-star
+dogfood confirmation pending
 **Implementation log:** [phase4-impl-log.md](phase4-impl-log.md)
 **Owner:** Juan Pedro Sugg
 **Date:** 2026-07-12
@@ -25,7 +26,7 @@ The SPEC's **north-star test, text-only variant**: after regular dogfooding, the
 | In scope | Out of scope |
 |----------|--------------|
 | Appendix A property-graph user model (nodes + edges + claim lifecycle) | **`ser` / Phase 3** — per-turn emotion, emotion recap, emotion in review UI, retroactive re-analysis, two-layer emotion representation, ser-driven register modulation, avatar-register reactions |
-| Distillation, observation inbox, graduation engine | **Phase 5** — P3 rehearsal, P4 daily-structure/OT, VPS migration |
+| Distillation, observation inbox, graduation engine | **Phase 6** — P3 rehearsal, P4 daily-structure/OT, VPS migration |
 | Graph-walk context assembly | VPS prerequisites deferred with it: **encryption at rest, real PWA auth, `hostwatch` launchd daemon** |
 | Cross-session insight + reflections/recaps (text-derived) | Streaming SER, ambient devices (parked) |
 | Proactivity engine — all four channels, quiet hours, `never_initiate` | |
@@ -104,10 +105,10 @@ The SPEC's **north-star test, text-only variant**: after regular dogfooding, the
 
 - **Pattern over-minting from sparse data** → mechanical floor (≥3/≥2) + LLM judgment + user confirmation.
 - **Graph-walk relevance scoring is unspecified** (SPEC §10 leaves it to implementation) → ship a simple first cut, iterate against lived use.
-- **Distillation quality on the local dev LLM** (gemma3:4b is weak at structured extraction) → schema-constrained output + validate on the target provider.
+- **Distillation quality on the local dev LLM** (pedrolucas/smollm3:3b-q4_k_m is weak at structured extraction) → schema-constrained output + validate on the target provider.
 - **Pseudo-clinical drift (R3)** → observations phrased as data, not diagnosis; enforced in policy.
 - **Privacy regressions** → `never_store` enforced at the single write path; tombstones prevent re-learning.
 
 ## Scoping decisions
 
-The VPS-prerequisite safety items — encryption at rest, real PWA auth, `hostwatch` launchd — travel *with* Phase 5's VPS migration, so they are out. The only safety item kept in scope is the small, non-VPS crisis-resource config. Existing v1 facts are **migrated** into the graph (as observations) rather than discarded.
+The VPS-prerequisite safety items — encryption at rest, real PWA auth, `hostwatch` launchd — travel *with* Phase 6's VPS migration, so they are out. The only safety item kept in scope is the small, non-VPS crisis-resource config. Existing v1 facts are **migrated** into the graph (as observations) rather than discarded.

@@ -34,6 +34,7 @@ def e2e_server(tmp_path_factory: pytest.TempPathFactory) -> Iterator[str]:
         **_os_environ(),
         "THERAPY_DATA_DIR": str(data_dir),
         "THERAPY_RESUME_WINDOW_SECS": "900",
+        "THERAPY_TEST_MODE": "1",
     }
     proc = subprocess.Popen(
         [
@@ -92,4 +93,4 @@ def browser_type_launch_args(browser_type_launch_args: dict) -> dict:
 
 @pytest.fixture
 def browser_context_args(browser_context_args: dict) -> dict:
-    return {**browser_context_args, "permissions": ["microphone"]}
+    return {**browser_context_args, "permissions": ["microphone", "notifications"]}

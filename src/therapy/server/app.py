@@ -1,19 +1,34 @@
 """FastAPI backend: WebRTC signaling + PWA static serving (SPEC §5)."""
 
+import asyncio
 import json
 import os
+import sqlite3
 from collections.abc import Sequence
 from contextlib import asynccontextmanager
 from functools import lru_cache
 from pathlib import Path
-from typing import TYPE_CHECKING, Annotated
+from typing import TYPE_CHECKING, Annotated, Literal
 
 if TYPE_CHECKING:
+    from therapy.acceptance import AcceptanceAgent
+    from therapy.data import DataSovereignty
+    from therapy.dialogue.outreach import ProactivityService
+    from therapy.knowledge.insight import InsightService
     from therapy.knowledge.research import ResearchKB
     from therapy.knowledge.user_model import UserModel
 
-from fastapi import Depends, FastAPI, HTTPException, Request
-from fastapi.responses import FileResponse
+from fastapi import (
+    Depends,
+    FastAPI,
+    File,
+    Form,
+    HTTPException,
+    Query,
+    Request,
+    UploadFile,
+)
+from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 
 from therapy import __version__
@@ -21,6 +36,19 @@ from therapy.memory import MemoryStore
 from therapy.memory.store import RowDict, resume_window_secs
 from therapy.server import live
 from therapy.server.protocol import session_state_message
+from therapy.server.schemas import (
+    AcceptanceAgentTurn,
+    AcceptanceOutreachRun,
+    BoundaryRequest,
+    DeleteAllRequest,
+    GraphEdgePatch,
+    GraphNodePatch,
+    InsightSnoozeRequest,
+    ProactivityChannelPatch,
+    PushSubscriptionRequest,
+    RenameSessionRequest,
+    ResearchBlockCorrection,
+)
 from therapy.voice.contracts import (
     ConnectionConflict,
     InvalidOffer,
@@ -39,10 +67,18 @@ _voice_gateway: VoiceGateway | None = None
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global _voice_gateway
-    yield
-    gateway, _voice_gateway = _voice_gateway, None
-    if gateway is not None:
-        await gateway.close()
+    from therapy.dialogue.outreach import ProactivityScheduler
+
+    scheduler = ProactivityScheduler(_proactivity())
+    scheduler_task = asyncio.create_task(scheduler.run(), name="therapy-proactivity")
+    try:
+        yield
+    finally:
+        scheduler.stop()
+        await scheduler_task
+        gateway, _voice_gateway = _voice_gateway, None
+        if gateway is not None:
+            await gateway.close()
 
 
 app = FastAPI(title="TheraPy", version=__version__, lifespan=lifespan)
@@ -69,9 +105,48 @@ def _model() -> "UserModel":
 @lru_cache(maxsize=1)
 def _research() -> "ResearchKB":
     """Return the lazily initialized curated research knowledge base."""
+    if os.getenv("THERAPY_TEST_MODE") == "1":
+        return _acceptance_agent().research
     from therapy.knowledge.research import ResearchKB
 
     return ResearchKB()
+
+
+@lru_cache(maxsize=1)
+def _insights() -> "InsightService":
+    """Return the durable insight queue service."""
+    from therapy.knowledge.insight import InsightService
+
+    return InsightService(_model())
+
+
+@lru_cache(maxsize=1)
+def _proactivity() -> "ProactivityService":
+    """Return the persistent outreach service used by API and scheduler."""
+    from therapy.dialogue.outreach import ProactivityService
+
+    return ProactivityService(model=_model())
+
+
+@lru_cache(maxsize=1)
+def _data() -> "DataSovereignty":
+    """Return the complete owner-data coordinator over shared services."""
+    from therapy.data import DataSovereignty
+
+    return DataSovereignty(
+        store=_store(),
+        model=_model(),
+        research=_research(),
+        proactivity=_proactivity(),
+    )
+
+
+@lru_cache(maxsize=1)
+def _acceptance_agent() -> "AcceptanceAgent":
+    """Return the deterministic agent only when explicit test mode is active."""
+    from therapy.acceptance import AcceptanceAgent
+
+    return AcceptanceAgent(_model().data_dir)
 
 
 def get_voice_gateway() -> VoiceGateway:
@@ -135,7 +210,9 @@ async def offer(
             if int(content_length) > MAX_OFFER_BODY_BYTES:
                 raise HTTPException(status_code=413, detail="Offer body is too large")
         except ValueError:
-            raise HTTPException(status_code=400, detail="Invalid Content-Length") from None
+            raise HTTPException(
+                status_code=400, detail="Invalid Content-Length"
+            ) from None
     body = await request.body()
     if len(body) > MAX_OFFER_BODY_BYTES:
         raise HTTPException(status_code=413, detail="Offer body is too large")
@@ -179,6 +256,19 @@ async def offer(
         "resumed": state["resumed"],
         "turns": state["turns"],
     }
+
+
+@app.post("/api/voice/disconnect")
+async def disconnect_voice(
+    pc_id: Annotated[str, Query(min_length=1, max_length=256)],
+    gateway: Annotated[VoiceGateway, Depends(get_voice_gateway)],
+) -> dict[str, bool]:
+    """End only the caller's current peer, leaving the voice runtime reusable."""
+    try:
+        disconnected = await gateway.disconnect(pc_id)
+    except VoiceUnavailable as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    return {"disconnected": disconnected}
 
 
 @app.get("/api/ice-config")
@@ -265,24 +355,19 @@ def turn_audio(session_id: str, turn_id: int) -> FileResponse:
 
 
 @app.patch("/api/sessions/{session_id}")
-async def rename_session(session_id: str, request: Request) -> dict[str, str]:
+def rename_session(session_id: str, body: RenameSessionRequest) -> dict[str, str]:
     """Rename a session (user edit of the auto-generated title)."""
-    body = await request.json()
-    title = str(body.get("title", "")).strip()[:80]
-    if not title:
-        raise HTTPException(status_code=400, detail="Title must not be empty")
-    if not _store().set_title(session_id, title):
+    if not _store().set_title(session_id, body.title):
         raise HTTPException(status_code=404, detail="Session not found")
-    return {"id": session_id, "title": title}
+    return {"id": session_id, "title": body.title}
 
 
 @app.delete("/api/sessions/{session_id}")
-def delete_session(session_id: str) -> dict[str, str]:
-    """Delete one session (turns + archived audio) from the review UI.
-
-    Wholesale wipe stays a deliberate CLI act (`python -m therapy.memory
-    delete --yes`); this is the per-conversation eraser.
-    """
+def delete_session(
+    session_id: str,
+    mode: Literal["keep_knowledge", "remove_derived"] = "keep_knowledge",
+) -> dict[str, object]:
+    """Delete conversation artifacts under the owner's selected knowledge policy."""
     store = _store()
     if not store.has_session(session_id):
         raise HTTPException(status_code=404, detail="Session not found")
@@ -290,8 +375,16 @@ def delete_session(session_id: str) -> dict[str, str]:
         raise HTTPException(
             status_code=409, detail="Session is live — disconnect first"
         )
+    provenance = _model().delete_session_evidence(
+        session_id, remove_derived=mode == "remove_derived"
+    )
     store.delete_session(session_id)
-    return {"deleted": session_id}
+    return {
+        "deleted": session_id,
+        "mode": mode,
+        "learned_knowledge_survives": mode == "keep_knowledge",
+        "provenance": provenance,
+    }
 
 
 # --------------------------------------------------------------------- #
@@ -301,55 +394,121 @@ def delete_session(session_id: str) -> dict[str, str]:
 
 
 @app.get("/api/graph")
-def graph() -> dict[str, object]:
-    """Return the whole user-model graph plus boundaries and pending inbox."""
+def graph(
+    node_type: str | None = None,
+    edge_type: str | None = None,
+    status: str | None = None,
+    source: str | None = None,
+) -> dict[str, object]:
+    """Return filterable graph data and the durable review queue."""
     model = _model()
+    try:
+        nodes = model.nodes(type_=node_type, status=status)
+        edges = model.edges(type_=edge_type, status=status)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    if source is not None:
+        if source not in {"conversation", "distilled", "user-stated", "inferred"}:
+            raise HTTPException(status_code=422, detail="Unknown claim source")
+        nodes = [node for node in nodes if node["source"] == source]
+        edges = [edge for edge in edges if edge["source"] == source]
+    insights = _insights()
+    insights.sync_proposals()
     return {
-        "nodes": model.nodes(),
-        "edges": model.edges(),
+        "nodes": nodes,
+        "edges": edges,
         "boundaries": model.boundaries(),
-        "pending_insights": model.pending_insights(),
+        "pending_insights": insights.list(),
     }
 
 
 @app.get("/api/graph/pending")
-def pending_insights() -> dict[str, object]:
-    """Proposed patterns awaiting the user's confirm/reject (W4 inbox)."""
-    return {"pending_insights": _model().pending_insights()}
+def pending_insights(
+    state: Literal[
+        "queued", "delivered", "snoozed", "confirmed", "rejected", "dismissed"
+    ]
+    | None = None,
+) -> dict[str, object]:
+    """Return durable pending insight queue records."""
+    service = _insights()
+    service.sync_proposals()
+    return {"pending_insights": service.list(state=state)}
+
+
+@app.get("/api/graph/nodes/{node_id}")
+def node_detail(node_id: int) -> dict[str, object]:
+    """Return a node with normalized evidence and lifecycle audit."""
+    model = _model()
+    node = model.get_node(node_id)
+    if node is None:
+        raise HTTPException(status_code=404, detail="Node not found")
+    return {
+        "node": node,
+        "evidence": model.evidence("node", node_id),
+        "lifecycle": model.lifecycle_events("node", node_id),
+    }
+
+
+@app.get("/api/graph/edges/{edge_id}")
+def edge_detail(edge_id: int) -> dict[str, object]:
+    """Return an edge with normalized evidence and lifecycle audit."""
+    model = _model()
+    edge = model.get_edge(edge_id)
+    if edge is None:
+        raise HTTPException(status_code=404, detail="Edge not found")
+    return {
+        "edge": edge,
+        "evidence": model.evidence("edge", edge_id),
+        "lifecycle": model.lifecycle_events("edge", edge_id),
+    }
 
 
 @app.patch("/api/graph/nodes/{node_id}")
-async def edit_node(node_id: int, request: Request) -> dict[str, object]:
+def edit_node(node_id: int, body: GraphNodePatch) -> dict[str, object]:
     """Edit a node's statement or its `never_initiate` flag (user sovereignty)."""
-    body = await request.json()
-    statement = body.get("statement")
-    never_initiate = body.get("never_initiate")
-    if statement is None and never_initiate is None:
-        raise HTTPException(status_code=400, detail="Nothing to update")
+    insights = _insights()
+    insights.sync_proposals()
     ok = _model().edit_node(
         node_id,
-        statement=str(statement).strip() if statement is not None else None,
-        never_initiate=bool(never_initiate) if never_initiate is not None else None,
+        statement=body.statement,
+        never_initiate=body.never_initiate,
     )
     if not ok:
         raise HTTPException(status_code=404, detail="Node not found")
+    insights.dismiss_claim("node", node_id)
     return {"node": _model().get_node(node_id)}
 
 
 @app.post("/api/graph/nodes/{node_id}/confirm")
 def confirm_node(node_id: int) -> dict[str, object]:
     """Explicitly validate a claim — the only path to `confirmed` (SPEC §3)."""
-    if not _model().confirm_node(node_id):
+    model = _model()
+    node = model.get_node(node_id)
+    if node is None:
         raise HTTPException(status_code=404, detail="Node not found")
-    return {"node": _model().get_node(node_id)}
+    if node["status"] != "proposed":
+        raise HTTPException(
+            status_code=409, detail="Only proposed nodes can be confirmed"
+        )
+    if not _insights().resolve_claim("node", node_id, "confirmed"):
+        raise HTTPException(status_code=409, detail="Node state changed")
+    return {"node": model.get_node(node_id)}
 
 
 @app.post("/api/graph/nodes/{node_id}/reject")
 def reject_node(node_id: int) -> dict[str, object]:
-    """Reject a proposed pattern, demoting it back to an observation."""
-    if not _model().reject_node(node_id):
+    """Durably reject one proposed node at its evidence snapshot."""
+    model = _model()
+    node = model.get_node(node_id)
+    if node is None:
         raise HTTPException(status_code=404, detail="Node not found")
-    return {"node": _model().get_node(node_id)}
+    if node["status"] != "proposed":
+        raise HTTPException(
+            status_code=409, detail="Only proposed nodes can be rejected"
+        )
+    if not _insights().resolve_claim("node", node_id, "rejected"):
+        raise HTTPException(status_code=409, detail="Node state changed")
+    return {"node": model.get_node(node_id)}
 
 
 @app.delete("/api/graph/nodes/{node_id}")
@@ -358,6 +517,49 @@ def delete_node(node_id: int) -> dict[str, object]:
     if not _model().delete_node(node_id):
         raise HTTPException(status_code=404, detail="Node not found")
     return {"deleted": node_id}
+
+
+@app.patch("/api/graph/edges/{edge_id}")
+def edit_edge(edge_id: int, body: GraphEdgePatch) -> dict[str, object]:
+    """Apply an authoritative owner edit to an edge statement."""
+    insights = _insights()
+    insights.sync_proposals()
+    if not _model().edit_edge(edge_id, statement=body.statement):
+        raise HTTPException(status_code=404, detail="Edge not found")
+    insights.dismiss_claim("edge", edge_id)
+    return {"edge": _model().get_edge(edge_id)}
+
+
+@app.post("/api/graph/edges/{edge_id}/confirm")
+def confirm_edge(edge_id: int) -> dict[str, object]:
+    """Explicitly validate one proposed edge."""
+    model = _model()
+    edge = model.get_edge(edge_id)
+    if edge is None:
+        raise HTTPException(status_code=404, detail="Edge not found")
+    if edge["status"] != "proposed":
+        raise HTTPException(
+            status_code=409, detail="Only proposed edges can be confirmed"
+        )
+    if not _insights().resolve_claim("edge", edge_id, "confirmed"):
+        raise HTTPException(status_code=409, detail="Edge state changed")
+    return {"edge": model.get_edge(edge_id)}
+
+
+@app.post("/api/graph/edges/{edge_id}/reject")
+def reject_edge(edge_id: int) -> dict[str, object]:
+    """Durably reject one proposed edge at its evidence snapshot."""
+    model = _model()
+    edge = model.get_edge(edge_id)
+    if edge is None:
+        raise HTTPException(status_code=404, detail="Edge not found")
+    if edge["status"] != "proposed":
+        raise HTTPException(
+            status_code=409, detail="Only proposed edges can be rejected"
+        )
+    if not _insights().resolve_claim("edge", edge_id, "rejected"):
+        raise HTTPException(status_code=409, detail="Edge state changed")
+    return {"edge": model.get_edge(edge_id)}
 
 
 @app.delete("/api/graph/edges/{edge_id}")
@@ -375,26 +577,64 @@ def boundaries() -> dict[str, object]:
 
 
 @app.post("/api/graph/boundaries")
-async def add_boundary(request: Request) -> dict[str, object]:
+def add_boundary(body: BoundaryRequest) -> dict[str, object]:
     """Add a `never_store` pattern or `never_initiate` topic."""
-    body = await request.json()
-    kind = str(body.get("kind", ""))
-    value = str(body.get("value", "")).strip()
-    if kind not in {"never_store", "never_initiate"} or not value:
-        raise HTTPException(status_code=400, detail="kind and value required")
-    _model().add_boundary(kind, value)
+    _model().add_boundary(body.kind, body.value)
     return {"boundaries": _model().boundaries()}
 
 
 @app.delete("/api/graph/boundaries")
-async def remove_boundary(request: Request) -> dict[str, object]:
+def remove_boundary(body: BoundaryRequest) -> dict[str, object]:
     """Remove a boundary by kind + value."""
-    body = await request.json()
-    kind = str(body.get("kind", ""))
-    value = str(body.get("value", ""))
-    if not _model().remove_boundary(kind, value):
+    if not _model().remove_boundary(body.kind, body.value):
         raise HTTPException(status_code=404, detail="Boundary not found")
     return {"boundaries": _model().boundaries()}
+
+
+@app.post("/api/insights/{insight_id}/confirm")
+def confirm_insight(insight_id: str) -> dict[str, object]:
+    """Confirm the exact durable queue record selected by the owner."""
+    insight = _insights().resolve(insight_id, "confirmed")
+    if insight is None:
+        raise HTTPException(
+            status_code=409, detail="Insight is missing or not resolvable"
+        )
+    return {"insight": insight}
+
+
+@app.post("/api/insights/{insight_id}/reject")
+def reject_insight(insight_id: str) -> dict[str, object]:
+    """Reject the exact durable queue record selected by the owner."""
+    insight = _insights().resolve(insight_id, "rejected")
+    if insight is None:
+        raise HTTPException(
+            status_code=409, detail="Insight is missing or not resolvable"
+        )
+    return {"insight": insight}
+
+
+@app.post("/api/insights/{insight_id}/snooze")
+def snooze_insight(insight_id: str, body: InsightSnoozeRequest) -> dict[str, object]:
+    """Snooze an unresolved insight for an owner-selected duration."""
+    if not _insights().snooze(insight_id, days=body.days):
+        raise HTTPException(
+            status_code=409, detail="Insight is missing or not snoozable"
+        )
+    return {"insight_id": insight_id, "state": "snoozed", "days": body.days}
+
+
+@app.post("/api/insights/{insight_id}/dismiss")
+def dismiss_insight(insight_id: str) -> dict[str, object]:
+    """Dismiss a delivery without mutating the graph claim."""
+    if not _insights().dismiss(insight_id):
+        raise HTTPException(status_code=409, detail="Insight is missing or resolved")
+    return {"insight_id": insight_id, "state": "dismissed"}
+
+
+@app.get("/api/insights/{insight_id}/history")
+def insight_history(insight_id: str) -> dict[str, object]:
+    """Return delivery and owner-resolution audit events."""
+    return {"history": _insights().history(insight_id)}
 
 
 @app.get("/api/research")
@@ -403,20 +643,276 @@ def research_documents() -> dict[str, object]:
     return {"documents": _research().documents()}
 
 
+@app.post("/api/research/ingest")
+async def research_ingest(
+    file: Annotated[UploadFile, File(description="Owner-local research source")],
+    source_title: Annotated[str | None, Form(max_length=300)] = None,
+    source_ref: Annotated[str | None, Form(max_length=1_000)] = None,
+    force: Annotated[bool, Form()] = False,
+) -> dict[str, object]:
+    """Validate, extract/OCR, preserve, and index one local source."""
+    from therapy.knowledge.research_ingest import MAX_SOURCE_BYTES
+
+    filename = file.filename or ""
+    payload = await file.read(MAX_SOURCE_BYTES + 1)
+    await file.close()
+    try:
+        result = _research().ingest_bytes(
+            payload,
+            filename,
+            file.content_type,
+            source_title=source_title,
+            source_ref=source_ref,
+            force=force,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    return {"ingest": result, "document": _research().document(result["document_id"])}
+
+
 @app.get("/api/research/query")
-def research_query(q: str, k: int = 3) -> dict[str, object]:
+def research_query(
+    q: Annotated[str, Query(min_length=1, max_length=2_000)],
+    k: Annotated[int, Query(ge=1, le=20)] = 3,
+    threshold: Annotated[float, Query(ge=0, le=1)] = 0.28,
+) -> dict[str, object]:
     """Answer a psychoeducation query from the literature, with citations."""
-    if not q.strip():
-        raise HTTPException(status_code=400, detail="Query must not be empty")
-    return _research().psychoeducation(q, k=k)
+    results = _research().query(q, k=k, threshold=threshold)
+    return {
+        "answer": "\n\n".join(
+            f"{result['text']} {result['citation']}" for result in results
+        ),
+        "sources": [
+            {
+                "document_id": result["document_id"],
+                "title": result["source_title"],
+                "ref": result["source_ref"],
+                "page": result["page"],
+                "section": result["heading"],
+                "anchor": result["anchor"],
+                "citation": result["citation"],
+            }
+            for result in results
+        ],
+    }
+
+
+@app.get("/api/research/{document_id}")
+def research_document(document_id: int) -> dict[str, object]:
+    """Return source metadata and OCR/digital block preview."""
+    document = _research().document(document_id)
+    if document is None:
+        raise HTTPException(status_code=404, detail="Research document not found")
+    return {"document": document}
+
+
+@app.patch("/api/research/{document_id}/blocks/{anchor}")
+def correct_research_block(
+    document_id: int, anchor: str, body: ResearchBlockCorrection
+) -> dict[str, object]:
+    """Apply one owner OCR correction and rebuild the semantic index."""
+    try:
+        changed = _research().correct_block(document_id, anchor, body.text)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    if not changed:
+        raise HTTPException(status_code=404, detail="Research block not found")
+    return {"document": _research().document(document_id)}
+
+
+@app.post("/api/research/{document_id}/reindex")
+def reindex_research(document_id: int) -> dict[str, int]:
+    """Rebuild one document using the configured model/policy version."""
+    if _research().document(document_id) is None:
+        raise HTTPException(status_code=404, detail="Research document not found")
+    return {"chunks_indexed": _research().reindex(document_id)}
+
+
+@app.delete("/api/research/{document_id}")
+def delete_research(document_id: int) -> dict[str, int]:
+    """Delete one source artifact, extraction, and semantic index."""
+    if not _research().delete_document(document_id):
+        raise HTTPException(status_code=404, detail="Research document not found")
+    return {"deleted": document_id}
+
+
+@app.get("/api/proactivity")
+def proactivity_settings() -> dict[str, object]:
+    """Return all four opt-in channel settings."""
+    return {"channels": _proactivity().settings()}
+
+
+@app.put("/api/proactivity/{channel}")
+def update_proactivity(
+    channel: Literal["push", "greeting", "check_in", "digest"],
+    body: ProactivityChannelPatch,
+) -> dict[str, object]:
+    """Validate and persist one channel's owner controls."""
+    try:
+        settings = _proactivity().update_settings(
+            channel,
+            enabled=body.enabled,
+            timezone=body.timezone,
+            quiet_start=body.quiet_start,
+            quiet_end=body.quiet_end,
+            schedule_time=body.schedule_time,
+            schedule_day=body.schedule_day,
+            frequency=body.frequency,
+            topic=body.topic,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return {"channel": settings}
+
+
+@app.get("/api/proactivity/jobs")
+def proactivity_jobs() -> dict[str, object]:
+    """Return the observable persistent outreach ledger."""
+    return {"jobs": _proactivity().jobs()}
+
+
+@app.get("/api/push/public-key")
+def push_public_key() -> dict[str, str]:
+    """Return the local VAPID application-server public key."""
+    return {"public_key": _proactivity().vapid.public_key()}
+
+
+@app.post("/api/push/subscriptions")
+def add_push_subscription(body: PushSubscriptionRequest) -> dict[str, str]:
+    """Persist an encrypted Web Push subscription endpoint and keys."""
+    subscription_id = _proactivity().subscribe(body.endpoint, body.p256dh, body.auth)
+    return {"subscription_id": subscription_id}
+
+
+@app.delete("/api/push/subscriptions/{subscription_id}")
+def remove_push_subscription(subscription_id: str) -> dict[str, str]:
+    """Deactivate a browser subscription."""
+    if not _proactivity().unsubscribe(subscription_id):
+        raise HTTPException(status_code=404, detail="Push subscription not found")
+    return {"deleted": subscription_id}
+
+
+@app.get("/api/proactivity/in-app")
+def in_app_outreach(consume: bool = True) -> dict[str, object]:
+    """Queue today's opted-in greeting and return local unseen outreach."""
+    service = _proactivity()
+    job_id = service.queue_greeting()
+    if job_id is not None:
+        service.deliver(job_id)
+    return {"messages": service.in_app_messages(consume=consume)}
+
+
+@app.get("/api/proactivity/digests")
+def proactivity_digests() -> dict[str, object]:
+    """Return owner-local written daily/weekly reflection digests."""
+    return {"digests": _proactivity().digests()}
+
+
+def _assert_no_live_sessions() -> None:
+    if any(live.is_active(str(session["id"])) for session in _store().sessions()):
+        raise HTTPException(
+            status_code=409,
+            detail="Disconnect live conversations before data restore/delete",
+        )
+
+
+@app.get("/api/data/export")
+def export_owner_data() -> Response:
+    """Download one complete inspectable owner-data JSON snapshot."""
+    payload = _data().export_json()
+    return Response(
+        payload,
+        media_type="application/json",
+        headers={"Content-Disposition": 'attachment; filename="therapy-export.json"'},
+    )
+
+
+@app.post("/api/data/restore")
+async def restore_owner_data(
+    file: Annotated[UploadFile, File(description="TheraPy owner-data JSON export")],
+) -> dict[str, object]:
+    """Validate completely and restore a prior owner snapshot with rollback."""
+    _assert_no_live_sessions()
+    maximum_upload = 720 * 1024 * 1024
+    payload = await file.read(maximum_upload + 1)
+    await file.close()
+    if len(payload) > maximum_upload:
+        raise HTTPException(status_code=413, detail="Restore snapshot is too large")
+    try:
+        decoded = json.loads(payload)
+        if not isinstance(decoded, dict):
+            raise ValueError("restore snapshot root must be an object")
+        result = _data().restore_snapshot(decoded)
+    except (json.JSONDecodeError, ValueError, sqlite3.IntegrityError) as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return {"restored": result}
+
+
+@app.delete("/api/data")
+def delete_owner_data(body: DeleteAllRequest) -> dict[str, bool]:
+    """Erase every Phase 4 personal/corpus store after exact confirmation."""
+    del body
+    _assert_no_live_sessions()
+    _data().delete_all()
+    return {"deleted": True}
+
+
+@app.post("/api/testing/agent/turn")
+async def acceptance_agent_turn(body: AcceptanceAgentTurn) -> dict[str, object]:
+    """Run a deterministic production-shaped agent turn in explicit test mode."""
+    if os.getenv("THERAPY_TEST_MODE") != "1":
+        raise HTTPException(status_code=404, detail="Not found")
+    try:
+        result = await _acceptance_agent().turn(
+            body.text,
+            body.language,
+            session_id=body.session_id,
+            finalize=body.finalize,
+        )
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="Session not found") from exc
+    return dict(result)
+
+
+@app.post("/api/testing/proactivity/run")
+def acceptance_proactivity_run(body: AcceptanceOutreachRun) -> dict[str, object]:
+    """Exercise persistent enqueue/delivery with an explicit acceptance clock."""
+    if os.getenv("THERAPY_TEST_MODE") != "1":
+        raise HTTPException(status_code=404, detail="Not found")
+    service = _proactivity()
+    try:
+        job_id = service.enqueue(
+            body.channel,
+            body.due_at,
+            idempotency_key=body.idempotency_key,
+            topic=body.topic,
+        )
+        job = service.deliver(job_id, now=body.now)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return {"job": job}
 
 
 @app.get("/api/crisis-resources")
 def crisis_resources_config() -> dict[str, object]:
     """The configurable crisis hotlines/contacts surfaced in the UI (W8)."""
-    from therapy.dialogue.policy import crisis_contacts, crisis_resources
+    from therapy.dialogue.policy import (
+        CrisisConfigurationError,
+        crisis_contacts,
+        crisis_resources,
+    )
 
-    return {"contacts": crisis_contacts(), "resources": crisis_resources()}
+    try:
+        contacts = crisis_contacts()
+    except CrisisConfigurationError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    return {
+        "contacts": contacts,
+        "resources": crisis_resources(),
+        "editing": "environment-only",
+    }
 
 
 @app.get("/")

@@ -10,12 +10,20 @@ requires-python = ">=3.12,<3.14"
 keywords = ["voice", "assistant", "speech", "emotion", "neurodiversity"]
 dependencies = [
   "anthropic>=0.116.0",
+  "cryptography>=49,<50",
   "fastapi>=0.115,<1.0",
+  "fastembed>=0.8,<0.9",
   "httpx>=0.28.1",
   "kokoro-onnx>=0.5.0",
   "lingua-language-detector>=2.1.1",
   "loguru>=0.7,<1.0",
-  "pipecat-ai[kokoro,silero,webrtc,whisper]~=1.5.0",
+  "numpy>=1.26,<3.0",
+  "pillow>=11,<13",
+  "pipecat-ai[silero,webrtc,whisper]~=1.5.0; sys_platform != 'darwin' or platform_machine != 'x86_64'",
+  "pymupdf>=1.26,<2.0",
+  "python-multipart>=0.0.20,<1.0",
+  "pytesseract>=0.3.13,<1.0",
+  "pywebpush>=2.3,<3.0",
   "uvicorn[standard]>=0.30,<1.0",
 ]
 
@@ -36,6 +44,12 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/therapy"]
+
+[tool.uv]
+override-dependencies = [
+  "onnxruntime==1.23.2; sys_platform == 'darwin' and platform_machine == 'x86_64'",
+  "onnxruntime==1.24.4; sys_platform != 'darwin' or platform_machine != 'x86_64'",
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests/suites"]

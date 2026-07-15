@@ -16,6 +16,7 @@ language stops coaching and surfaces human resources.
 from __future__ import annotations
 
 import json
+import logging
 import os
 from typing import TYPE_CHECKING
 
@@ -25,6 +26,11 @@ if TYPE_CHECKING:
 CRISIS_RESOURCES_DEFAULT = (
     "local emergency services (911 / 112 / 190), or a trusted person nearby"
 )
+logger = logging.getLogger(__name__)
+
+
+class CrisisConfigurationError(ValueError):
+    """Malformed owner-provided crisis contact configuration."""
 
 
 def crisis_contacts() -> list[dict[str, str]]:
@@ -32,22 +38,51 @@ def crisis_contacts() -> list[dict[str, str]]:
 
     Read from `THERAPY_CRISIS_CONTACTS` (a JSON array of `{"label","value"}`),
     so the owner can localize the safety protocol's resources without code
-    changes. Malformed or empty config yields an empty list — the caller then
-    falls back to the plain-string resource.
+    changes. Malformed configuration raises clearly; the independent crisis
+    response path catches it and retains the safe default.
     """
     raw = os.environ.get("THERAPY_CRISIS_CONTACTS", "").strip()
     if not raw:
         return []
+    if len(raw) > 10_000:
+        raise CrisisConfigurationError("THERAPY_CRISIS_CONTACTS exceeds 10 KB")
     try:
         parsed = json.loads(raw)
-    except json.JSONDecodeError:
-        return []
+    except json.JSONDecodeError as exc:
+        raise CrisisConfigurationError(
+            f"THERAPY_CRISIS_CONTACTS is invalid JSON: {exc.msg}"
+        ) from exc
+    if not isinstance(parsed, list) or len(parsed) > 20:
+        raise CrisisConfigurationError(
+            "THERAPY_CRISIS_CONTACTS must be a JSON array with at most 20 entries"
+        )
     contacts: list[dict[str, str]] = []
-    for entry in parsed if isinstance(parsed, list) else []:
-        if isinstance(entry, dict) and entry.get("label") and entry.get("value"):
-            contacts.append(
-                {"label": str(entry["label"]), "value": str(entry["value"])}
+    seen: set[tuple[str, str]] = set()
+    for index, entry in enumerate(parsed):
+        if not isinstance(entry, dict) or set(entry) != {"label", "value"}:
+            raise CrisisConfigurationError(
+                f"crisis contact {index} must contain only label and value"
             )
+        label = entry["label"]
+        value = entry["value"]
+        if not isinstance(label, str) or not isinstance(value, str):
+            raise CrisisConfigurationError(
+                f"crisis contact {index} label/value must be strings"
+            )
+        label = label.strip()
+        value = value.strip()
+        if not 1 <= len(label) <= 100 or not 1 <= len(value) <= 300:
+            raise CrisisConfigurationError(
+                f"crisis contact {index} label/value length is invalid"
+            )
+        if any(ord(character) < 32 for character in label + value):
+            raise CrisisConfigurationError(
+                f"crisis contact {index} contains control characters"
+            )
+        key = (label.casefold(), value.casefold())
+        if key not in seen:
+            contacts.append({"label": label, "value": value})
+            seen.add(key)
     return contacts
 
 
@@ -57,10 +92,19 @@ def crisis_resources() -> str:
     Priority: the structured `crisis_contacts()` config (rendered as a list),
     then the `THERAPY_CRISIS_RESOURCES` string override, then a safe default.
     """
-    contacts = crisis_contacts()
+    try:
+        contacts = crisis_contacts()
+    except CrisisConfigurationError as exc:
+        logger.error("Invalid crisis contact configuration: %s", exc)
+        contacts = []
     if contacts:
         return "; ".join(f"{c['label']}: {c['value']}" for c in contacts)
-    return os.environ.get("THERAPY_CRISIS_RESOURCES", CRISIS_RESOURCES_DEFAULT)
+    fallback = os.environ.get("THERAPY_CRISIS_RESOURCES", "").strip()
+    if fallback and len(fallback) <= 2_000:
+        return fallback
+    if fallback:
+        logger.error("THERAPY_CRISIS_RESOURCES exceeds 2000 characters; using default")
+    return CRISIS_RESOURCES_DEFAULT
 
 
 _SYSTEM_PROMPT_TEMPLATE = """\

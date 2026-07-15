@@ -121,7 +121,7 @@ async def complete(
             or "http://localhost:11434/v1"
         )
         headers = None
-        default_model = "gemma3:4b"
+        default_model = "pedrolucas/smollm3:3b-q4_k_m"
     elif provider == "openrouter":
         base_url = base_url or "https://openrouter.ai/api/v1"
         headers = {"Authorization": f"Bearer {os.environ['OPENROUTER_API_KEY']}"}

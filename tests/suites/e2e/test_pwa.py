@@ -183,6 +183,9 @@ def test_live_connection_renders_transcript_presence_and_resume_flow(
     expect(page.locator("#chat .msg.user").first).to_contain_text(
         "Hello from the browser test.", timeout=60_000
     )
+    # End the real peer deterministically; browser-context teardown does not
+    # guarantee a pagehide event before the next test starts.
+    page.evaluate("() => disconnectVoice()")
 
 
 def test_avatar_picker_swaps_and_persists_selected_skin(
@@ -357,3 +360,271 @@ def test_composer_stays_sticky_at_viewport_bottom(
     expect(composer).to_be_visible()
     assert composer.evaluate("el => getComputedStyle(el).position") == "sticky"
     assert composer.evaluate("el => getComputedStyle(el).bottom") == "0px"
+
+
+def _agent_turn(page: Page, e2e_server: str, text: str, *, finalize: bool) -> dict:
+    response = page.request.post(
+        f"{e2e_server}/api/testing/agent/turn",
+        data={"text": text, "language": "en", "finalize": finalize},
+    )
+    assert response.ok, response.text()
+    return response.json()
+
+
+def test_model_workspace_graph_pending_corpus_and_sovereignty(
+    page: Page, e2e_server: str
+) -> None:
+    page_errors: list[str] = []
+    page.on("pageerror", lambda error: page_errors.append(str(error)))
+    for index in range(3):
+        _agent_turn(
+            page,
+            e2e_server,
+            f"Late meeting {index} drains my energy.",
+            finalize=True,
+        )
+        _agent_turn(
+            page,
+            e2e_server,
+            f"My brother is a sensitive ongoing thread {index}.",
+            finalize=True,
+        )
+
+    page.goto(f"{e2e_server}/#model")
+    workspace = page.locator("#model-workspace")
+    expect(workspace).to_be_visible(timeout=15_000)
+    expect(page.locator("#model-nodes .model-item")).to_have_count(3)
+    expect(page.locator("#model-edges .model-item")).to_have_count(1)
+    assert page_errors == []
+
+    channel_settings = {
+        "enabled": True,
+        "timezone": "UTC",
+        "quiet_start": "00:00",
+        "quiet_end": "00:00",
+        "schedule_time": "12:00",
+        "schedule_day": 2,
+        "frequency": "weekly",
+        "topic": None,
+    }
+    for channel in ("greeting", "digest"):
+        response = page.request.put(
+            f"{e2e_server}/api/proactivity/{channel}", data=channel_settings
+        )
+        assert response.ok, response.text()
+    digest = page.request.post(
+        f"{e2e_server}/api/testing/proactivity/run",
+        data={
+            "channel": "digest",
+            "due_at": "2036-07-15T14:00:00+00:00",
+            "now": "2036-07-15T14:00:00+00:00",
+            "idempotency_key": "browser-digest",
+        },
+    )
+    assert digest.ok, digest.text()
+    page.reload()
+    expect(page.locator("#in-app-outreach")).to_contain_text(
+        "One observation is waiting for your take"
+    )
+    expect(page.locator("#digest-list")).to_contain_text("Late meetings recur.")
+
+    page.locator("#graph-type").select_option("thread")
+    page.get_by_role("button", name="Apply").click()
+    expect(page.locator("#model-nodes .model-item")).to_have_count(1)
+    expect(page.locator("#model-nodes")).to_contain_text(
+        "My brother is a sensitive ongoing thread."
+    )
+    page.locator("#graph-type").select_option("")
+    page.locator("#graph-status").select_option("proposed")
+    page.get_by_role("button", name="Apply").click()
+    expect(page.locator("#model-edges .model-item")).to_have_count(1)
+    page.locator("#graph-status").select_option("")
+    page.get_by_role("button", name="Apply").click()
+
+    late_claim = page.locator("#model-nodes .model-item").filter(
+        has_text="Late meetings recur."
+    )
+    late_claim.get_by_role("button", name="Audit").click()
+    expect(page.locator("#model-detail")).to_be_visible()
+    expect(page.locator("#model-detail-body")).to_contain_text(
+        "Evidence and provenance"
+    )
+    expect(page.locator("#model-detail-body ul li")).to_have_count(3)
+    page.locator("#model-detail .dialog-close").click()
+    expect(page.locator("#model-detail")).to_be_hidden()
+
+    page.locator("#graph-view-toggle").click()
+    assert page_errors == []
+    expect(page.locator("#model-graph")).to_be_visible()
+    expect(page.locator("#model-graph .graph-node")).to_have_count(3)
+    page.locator("#graph-view-toggle").click()
+
+    pending_late = page.locator("#pending-insights .model-item").filter(
+        has_text="Late meetings recur."
+    )
+    pending_late.get_by_role("button", name="Confirm").click()
+    expect(late_claim).to_contain_text("confirmed")
+
+    brother_pending = page.locator("#pending-insights .model-item").filter(
+        has_text="My brother is a sensitive ongoing thread."
+    )
+    brother_pending.get_by_role("button", name="Reject").click()
+    brother_claim = page.locator("#model-nodes .model-item").filter(
+        has_text="My brother is a sensitive ongoing thread."
+    )
+    expect(brother_claim).to_contain_text("rejected")
+    page.once("dialog", lambda dialog: dialog.accept())
+    brother_claim.get_by_role("button", name="Delete").click()
+    expect(page.locator("#model-nodes")).not_to_contain_text(
+        "My brother is a sensitive ongoing thread."
+    )
+
+    energy_claim = page.locator("#model-nodes .model-item").filter(
+        has_text="Energy drops after late meetings."
+    )
+    page.once("dialog", lambda dialog: dialog.accept("Energy drops after late meetings end."))
+    energy_claim.get_by_role("button", name="Edit").click()
+    expect(page.locator("#model-nodes")).to_contain_text(
+        "Energy drops after late meetings end."
+    )
+
+    pending_edge = page.locator("#pending-insights .model-item").filter(
+        has_text="edge ·"
+    )
+    pending_edge.get_by_role("button", name="Confirm").click()
+    relationship = page.locator("#model-edges .model-item").first
+    expect(relationship).to_contain_text("confirmed")
+    page.once("dialog", lambda dialog: dialog.accept())
+    relationship.get_by_role("button", name="Delete").click()
+    expect(page.locator("#model-edges")).to_contain_text("No matching relationships.")
+
+    page.locator("#boundary-kind").select_option("never_initiate")
+    page.locator("#boundary-value").fill("private topic")
+    page.get_by_role("button", name="Add boundary").click()
+    expect(page.locator("#boundary-list")).to_contain_text(
+        "never_initiate: private topic"
+    )
+    boundary = page.locator("#boundary-list .boundary-row").filter(
+        has_text="never_initiate: private topic"
+    )
+    boundary.get_by_role("button", name="Remove").click()
+    expect(page.locator("#boundary-list")).to_contain_text(
+        "No boundaries configured."
+    )
+
+    page.locator("#research-file").set_input_files(
+        {
+            "name": "planning.md",
+            "mimeType": "text/markdown",
+            "buffer": b"# Planning transitions\n\nA visible checklist reduces planning load.",
+        }
+    )
+    page.get_by_role("button", name="Import locally").click()
+    research = page.locator("#research-documents .model-item").filter(
+        has_text="planning"
+    )
+    expect(research).to_be_visible()
+    research.get_by_role("button", name="Preview / correct").click()
+    expect(page.locator("#model-detail-body")).to_contain_text(
+        "section-planning-transitions-block-1"
+    )
+    page.once(
+        "dialog",
+        lambda dialog: dialog.accept(
+            "A visible checklist can reduce planning load during transitions."
+        ),
+    )
+    page.locator("#model-detail-body").get_by_role("button", name="Correct").click()
+    expect(research).to_be_visible()
+
+    page.once("dialog", lambda dialog: dialog.accept())
+    research.get_by_role("button", name="Delete").click()
+    expect(page.locator("#research-documents")).to_contain_text(
+        "No local research imported."
+    )
+
+    expect(page.locator("#data-export")).to_be_visible()
+    expect(page.locator("#data-restore-file")).to_be_visible()
+    expect(page.locator("#data-restore")).to_be_visible()
+    expect(page.locator("#data-delete")).to_be_visible()
+
+    with page.expect_download() as download_info:
+        page.locator("#data-export").click()
+    export_path = download_info.value.path()
+    assert export_path is not None
+
+    page.once("dialog", lambda dialog: dialog.accept("DELETE EVERYTHING"))
+    page.locator("#data-delete").click()
+    expect(page.locator("#model-nodes")).to_contain_text("No matching claims.")
+
+    page.locator("#data-restore-file").set_input_files(export_path)
+    page.once("dialog", lambda dialog: dialog.accept("RESTORE"))
+    page.locator("#data-restore").click()
+    expect(page.locator("#model-nodes")).to_contain_text("Late meetings recur.")
+
+
+def test_registered_service_worker_handles_push_and_notification_click(
+    page: Page, e2e_server: str
+) -> None:
+    page.goto(f"{e2e_server}/")
+    page.wait_for_function(
+        "navigator.serviceWorker.ready.then(r => !!r.active)", timeout=20_000
+    )
+    page.wait_for_function("!!navigator.serviceWorker.controller", timeout=10_000)
+    workers = page.context.service_workers
+    assert workers, "registered service worker is not available to Playwright"
+    worker = workers[0]
+
+    shown = worker.evaluate(
+        """async () => {
+          const calls = [];
+          Object.defineProperty(self.registration, "showNotification", {
+            configurable: true,
+            value: async (title, options) => calls.push({title, options}),
+          });
+          let settled;
+          const event = new Event("push");
+          Object.defineProperties(event, {
+            data: {value: {json: () => ({
+              title: "TheraPy", url: "/#model", secret: "private reflection text",
+            })}},
+            waitUntil: {value: (promise) => { settled = Promise.resolve(promise); }},
+          });
+          self.dispatchEvent(event);
+          await settled;
+          return calls;
+        }"""
+    )
+    assert shown[0]["title"] == "TheraPy"
+    assert shown[0]["options"]["body"] == (
+        "A reflection is available whenever you want it."
+    )
+    assert "private reflection text" not in str(shown)
+
+    click = worker.evaluate(
+        """async () => {
+          const result = {closed: false, navigated: null, focused: false};
+          const client = {
+            url: self.location.origin + "/",
+            navigate: async (url) => { result.navigated = url; },
+            focus: async () => { result.focused = true; },
+          };
+          Object.defineProperty(self.clients, "matchAll", {
+            configurable: true, value: async () => [client],
+          });
+          let settled;
+          const event = new Event("notificationclick");
+          Object.defineProperties(event, {
+            notification: {value: {
+              data: {url: "/#model"}, close: () => { result.closed = true; },
+            }},
+            waitUntil: {value: (promise) => { settled = Promise.resolve(promise); }},
+          });
+          self.dispatchEvent(event);
+          await settled;
+          return result;
+        }"""
+    )
+    assert click["closed"] is True
+    assert click["focused"] is True
+    assert click["navigated"].endswith("/#model")
