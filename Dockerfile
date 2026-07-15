@@ -6,7 +6,9 @@ ENV UV_COMPILE_BYTECODE=1 UV_LINK_MODE=copy
 # Shared libraries required by opencv-python (a pipecat[webrtc] dependency)
 # that the slim image lacks.
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends libgl1 libglib2.0-0 libxcb1 \
+    && apt-get install -y --no-install-recommends \
+        libgl1 libglib2.0-0 libxcb1 \
+        tesseract-ocr tesseract-ocr-eng tesseract-ocr-spa tesseract-ocr-por \
     && rm -rf /var/lib/apt/lists/*
 
 # System libraries for headless Chromium (the PWA browser E2E, `pytest -m e2e`).
