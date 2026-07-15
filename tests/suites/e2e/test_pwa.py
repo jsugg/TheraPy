@@ -42,7 +42,7 @@ else:
 pytestmark = pytest.mark.skipif(not _HAS_PLAYWRIGHT, reason="playwright not installed")
 
 
-def test_1_pwa_is_installable(page: Page, e2e_server: str) -> None:
+def test_chrome_reports_pwa_installable(page: Page, e2e_server: str) -> None:
     # Capture the install signal if the headless build fires it (it often
     # suppresses the event, so this is reported, not asserted).
     page.add_init_script(
@@ -104,7 +104,7 @@ def test_1_pwa_is_installable(page: Page, e2e_server: str) -> None:
         assert got == want, f"{icon['src']} decoded as {got}, expected {want}"
 
 
-def test_2_connect_typed_turn_transcript_and_resume_label(
+def test_live_connection_renders_transcript_presence_and_resume_flow(
     page: Page, e2e_server: str
 ) -> None:
     # Prove presence is *server-pushed*, not merely inferred (phase C): tap the
@@ -186,7 +186,9 @@ def test_2_connect_typed_turn_transcript_and_resume_label(
     )
 
 
-def test_3_companion_avatar_renders_and_swaps(page: Page, e2e_server: str) -> None:
+def test_avatar_picker_swaps_and_persists_selected_skin(
+    page: Page, e2e_server: str
+) -> None:
     # No WebRTC needed — the companion presence is header chrome, always on.
     page.goto(f"{e2e_server}/")
 
@@ -217,7 +219,9 @@ def test_3_companion_avatar_renders_and_swaps(page: Page, e2e_server: str) -> No
     assert page.evaluate("() => localStorage.getItem('avatar')") == "luna"
 
 
-def test_5_focus_mode_opens_decodes_and_closes(page: Page, e2e_server: str) -> None:
+def test_focus_mode_opens_scroll_locks_and_closes(
+    page: Page, e2e_server: str
+) -> None:
     # Tapping the portrait enters the immersive, voice-first fullscreen view
     # (phase C). No WebRTC needed — it's presentation over the always-on
     # companion; barge-in still works by speaking, so there is no interrupt
@@ -260,7 +264,7 @@ def test_5_focus_mode_opens_decodes_and_closes(page: Page, e2e_server: str) -> N
     )
 
 
-def test_4_history_view_hides_the_start_cta(page: Page, e2e_server: str) -> None:
+def test_history_view_hides_composer_start_cta(page: Page, e2e_server: str) -> None:
     # Landing shows the composer CTA; opening history must not leave a second
     # "start" button alongside its own "New conversation" (field report
     # 2026-07-11 — two buttons doing the same thing).
@@ -278,7 +282,7 @@ def test_4_history_view_hides_the_start_cta(page: Page, e2e_server: str) -> None
     expect(page.locator("#connect")).to_be_visible()
 
 
-def test_6_hold_to_talk_survives_longpress_and_multitouch(
+def test_hold_to_talk_handles_longpress_and_pointer_lifecycle(
     page: Page, e2e_server: str
 ) -> None:
     # The field bug: on a phone, press-and-hold pops the native selection menu
@@ -344,7 +348,9 @@ def test_6_hold_to_talk_survives_longpress_and_multitouch(
     expect(talk).to_have_attribute("aria-pressed", "false")
 
 
-def test_7_composer_footer_is_frozen(page: Page, e2e_server: str) -> None:
+def test_composer_stays_sticky_at_viewport_bottom(
+    page: Page, e2e_server: str
+) -> None:
     # The composer (buttons + text input) must stay pinned to the bottom, mirroring
     # the sticky header — field report: the footer scrolled away.
     page.goto(f"{e2e_server}/")
