@@ -81,11 +81,11 @@ The SPEC's **north-star test, text-only variant**: after regular dogfooding, the
 
 ## Invariants to hold (from SPEC + project memory)
 
-- **Dependency/framework boundary**: all `knowledge/` code stays framework-free; only `agent.py` imports Pipecat. TheraPy → ser, never the reverse.
+- **Dependency/framework boundary**: all direct Pipecat imports stay under `therapy.integrations.pipecat`; FastAPI and domain modules depend on the owned `VoiceGateway` contract. TheraPy → ser, never the reverse.
 - **Local-first privacy (§8)**: graph, inbox, and corpus are all local; the cloud LLM receives distilled context + current conversation, never raw history or audio; `never_store` is bulletproof before any inbox write.
 - **Emotion-source-agnostic**: the graph accepts `source = ser` later with no schema change.
 - **No engagement mechanics (§4)**; proactivity gated by quiet hours + `never_initiate`.
-- **Isolated test data** (`THERAPY_DATA_DIR`); acceptance/E2E never touch real `/data` — the Hardening 7–9 lesson.
+- **Isolated test data** (`THERAPY_DATA_DIR`); verification/E2E never touch real `/data` — the Hardening 7–9 lesson.
 
 ## Acceptance criteria
 

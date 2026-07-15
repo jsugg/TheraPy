@@ -1,6 +1,6 @@
 """Data-channel message payloads shared by the pipeline and its clients.
 
-Framework-free: agent.py wraps these dicts in transport frames, the PWA
+Framework-free: the Pipecat adapter wraps these dicts in transport frames, the PWA
 and test clients parse them as JSON. Keeping the shapes here (with tests)
 is what keeps the client and server from drifting apart.
 """
