@@ -76,7 +76,7 @@ uv run uvicorn therapy.server.app:app --reload   # dev server
 docker compose up  # containerized
 ```
 
-Phase-1 instrumented dry run (no microphone needed — a scripted WebRTC
+Voice/text loop verification (no microphone needed — a scripted WebRTC
 client speaks synthesized es/en/pt utterances at the live server and checks
 language detection, reply-language choice per SPEC §7 (both normative
 code-switched phrases spoken, plus pin/unpin over the data channel),
@@ -85,7 +85,7 @@ exits non-zero if any scenario fails):
 
 ```sh
 docker compose up -d
-docker compose exec therapy uv run --no-dev python scripts/phase1_dryrun.py
+docker compose exec therapy uv run --no-dev python scripts/verify_voice_text_loop.py
 docker compose logs therapy | grep TTFA   # server-side numbers (risk R1)
 ```
 
@@ -93,15 +93,14 @@ Latest dry-run result (2026-07-10, shipped image, fully-local gemma3:4b):
 all ten scenarios green — trilingual turns, typed-turn silence, barge-in,
 both SPEC §7 normative code-switched phrases, pin/unpin. Client-side TTFA
 9.2–32.5 s on a warm container (whisper, Kokoro, and the LLM share this
-CPU) — to be re-measured with the target provider during the acceptance
-run.
+CPU) — to be re-measured with the target provider during verification.
 
-Phase-2 acceptance (continuity + data round-trip; runs a scripted
+Memory-continuity verification (continuity + data round-trip; runs a scripted
 two-session conversation against the live server, then exercises
 export/delete — **the delete step wipes the data volume**):
 
 ```sh
-docker compose exec therapy uv run --no-dev python scripts/phase2_acceptance.py
+docker compose exec therapy uv run --no-dev python scripts/verify_memory_continuity.py
 ```
 
 Longitudinal self-knowledge verification (offline/host-only; uses isolated test
@@ -167,8 +166,8 @@ relay path from any client machine (this simulates the phone by offering
 only relay candidates):
 
 ```sh
-python scripts/netcheck.py --relay-only        # against http://localhost:8000
-python scripts/netcheck.py --server http://<host>:8000 --relay-only
+python scripts/verify_relay_connectivity.py --relay-only        # against http://localhost:8000
+python scripts/verify_relay_connectivity.py --server http://<host>:8000 --relay-only
 ```
 
 **Reliability (three layers):** both services restart automatically

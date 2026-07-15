@@ -26,6 +26,7 @@ data/
 *.swp
 
 # Tooling state
+.claude/
 .serena/
 .local/
 

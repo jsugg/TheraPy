@@ -5,7 +5,7 @@ from inside the network the server advertises). This probe runs where a real
 client runs — the host, or any tailnet machine with the repo — and verifies
 the handshake end to end: signaling, ICE, data channel.
 
-    python scripts/netcheck.py [--server URL] [--relay-only]
+    python scripts/verify_relay_connectivity.py [--server URL] [--relay-only]
 
 `--relay-only` strips every non-relay candidate from the client's offer, so
 the connection can only succeed through the TURN relay (compose `turn`
