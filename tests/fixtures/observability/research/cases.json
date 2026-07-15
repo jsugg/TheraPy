@@ -1,0 +1,56 @@
+{
+  "schema_version": 1,
+  "notes": [
+    "Synthetic research/OCR/embedding/retrieval fixtures (plan O0.2 item 4).",
+    "Documents are wholly synthetic; no genuine clinical material.",
+    "Generated indexes/vectors are never committed; only definitions and expected results are."
+  ],
+  "documents": [
+    {
+      "id": "research-doc-01",
+      "source_file": "sleep_hygiene_synthetic.txt",
+      "format": "txt",
+      "title": "Synthetic notes on sleep hygiene routines",
+      "expected": {"block_count": 4, "page_count": 1, "ocr_required": false}
+    },
+    {
+      "id": "research-doc-02",
+      "source_file": "boundaries_worksheet_synthetic.txt",
+      "format": "txt",
+      "title": "Synthetic worksheet on interpersonal boundaries",
+      "expected": {"block_count": 5, "page_count": 1, "ocr_required": false}
+    }
+  ],
+  "ocr_cases": [
+    {
+      "id": "ocr-01",
+      "generator": "render_text_png",
+      "text": "Wind-down routine: dim lights one hour before bed.",
+      "image_spec": {"width": 800, "height": 200, "dpi": 150, "font": "default"},
+      "expected": {"min_confidence": 0.6, "contains": ["Wind-down routine"]}
+    }
+  ],
+  "embedding": {
+    "model_contract": "pinned model/revision/dimension recorded at run time; cold and warm load measured separately",
+    "cases": [
+      {"id": "embed-01", "text": "Evening wind-down routines reduce sleep latency.", "expect": {"finite": true, "nonzero": true}}
+    ]
+  },
+  "retrieval_cases": [
+    {
+      "id": "retrieval-01",
+      "query": "what helps me fall asleep faster",
+      "expected": {"top_document": "research-doc-01", "min_results": 1}
+    },
+    {
+      "id": "retrieval-02",
+      "query": "how do I say no at work without guilt",
+      "expected": {"top_document": "research-doc-02", "min_results": 1}
+    },
+    {
+      "id": "retrieval-nohit-01",
+      "query": "carburetor timing for a 1974 motorcycle",
+      "expected": {"no_hit": true}
+    }
+  ]
+}

@@ -1,0 +1,281 @@
+{
+  "metrics_data_classes": {
+    "LLMTokenUsage": [
+      "cache_creation_input_tokens",
+      "cache_read_input_tokens",
+      "completion_tokens",
+      "prompt_tokens",
+      "reasoning_tokens",
+      "total_tokens"
+    ],
+    "LLMUsageMetricsData": [
+      "model",
+      "processor",
+      "value"
+    ],
+    "MetricsData": [
+      "model",
+      "processor"
+    ],
+    "ProcessingMetricsData": [
+      "model",
+      "processor",
+      "value"
+    ],
+    "SmartTurnMetricsData": [
+      "e2e_processing_time_ms",
+      "inference_time_ms",
+      "is_complete",
+      "model",
+      "probability",
+      "processor",
+      "server_total_time_ms"
+    ],
+    "TTFAMetricsData": [
+      "leading_silence",
+      "model",
+      "processor",
+      "ttfa",
+      "ttfb"
+    ],
+    "TTFBMetricsData": [
+      "model",
+      "processor",
+      "value"
+    ],
+    "TTSUsageMetricsData": [
+      "model",
+      "processor",
+      "value"
+    ],
+    "TextAggregationMetricsData": [
+      "model",
+      "processor",
+      "value"
+    ],
+    "TurnMetricsData": [
+      "e2e_processing_time_ms",
+      "is_complete",
+      "model",
+      "probability",
+      "processor"
+    ]
+  },
+  "pipecat_version": "1.5.0",
+  "pipeline_params_fields": [
+    "audio_in_sample_rate",
+    "audio_out_sample_rate",
+    "enable_heartbeats",
+    "enable_metrics",
+    "enable_usage_metrics",
+    "heartbeats_monitor_secs",
+    "heartbeats_period_secs",
+    "report_only_initial_ttfb",
+    "send_initial_empty_metrics",
+    "start_metadata"
+  ],
+  "pipeline_task_parameters": [
+    "active",
+    "additional_span_attributes",
+    "app_resources",
+    "bridged",
+    "cancel_on_idle_timeout",
+    "cancel_runner_on_idle_timeout",
+    "cancel_timeout_secs",
+    "check_dangling_tasks",
+    "clock",
+    "conversation_id",
+    "enable_rtvi",
+    "enable_tracing",
+    "enable_turn_tracking",
+    "exclude_frames",
+    "idle_timeout_frames",
+    "idle_timeout_secs",
+    "name",
+    "observers",
+    "params",
+    "pipeline",
+    "rtvi_observer_params",
+    "rtvi_processor",
+    "task_manager",
+    "tool_resources"
+  ],
+  "python_version": "3.12.12",
+  "tracing": {
+    "pipecat.utils.tracing.service_attributes": {
+      "attribute_keys": [
+        "audio.data_size_bytes",
+        "function",
+        "function_calls.count",
+        "function_calls.first_name",
+        "gen_ai.operation.name",
+        "gen_ai.output.type",
+        "gen_ai.provider.name",
+        "gen_ai.request.model",
+        "gen_ai.system_instructions",
+        "input",
+        "is_final",
+        "language",
+        "metrics.character_count",
+        "metrics.ttfb",
+        "modalities",
+        "name",
+        "output",
+        "service.operation",
+        "session.turn_detection.enabled",
+        "settings.vad.disabled",
+        "settings.vad.end_sensitivity",
+        "settings.vad.start_sensitivity",
+        "stream",
+        "text",
+        "text_output",
+        "tool_choice",
+        "tool_count",
+        "tools",
+        "tools.available",
+        "tools.count",
+        "tools.definitions",
+        "tools.names",
+        "transcript",
+        "transcript.is_input",
+        "user_id",
+        "vad_enabled",
+        "voice_id"
+      ],
+      "functions": [
+        "_get_provider_name_from_service_name",
+        "add_gemini_live_span_attributes",
+        "add_llm_span_attributes",
+        "add_openai_realtime_span_attributes",
+        "add_stt_span_attributes",
+        "add_tts_span_attributes"
+      ],
+      "span_names": [],
+      "tracer_scopes": []
+    },
+    "pipecat.utils.tracing.service_decorators": {
+      "attribute_keys": [
+        "arguments",
+        "cache_creation_input_tokens",
+        "cache_read_input_tokens",
+        "call_id",
+        "completion_tokens",
+        "context_messages",
+        "context_system_instruction",
+        "description",
+        "function_calls",
+        "function_calls.all_names",
+        "function_calls.count",
+        "gen_ai.usage.cache_creation.input_tokens",
+        "gen_ai.usage.cache_read.input_tokens",
+        "gen_ai.usage.input_tokens",
+        "gen_ai.usage.output_tokens",
+        "gen_ai.usage.reasoning_tokens",
+        "instructions",
+        "is_final",
+        "language",
+        "messages",
+        "metrics.character_count",
+        "metrics.ttfb",
+        "model",
+        "name",
+        "output",
+        "output_modality",
+        "parameters",
+        "prompt_tokens",
+        "properties",
+        "reasoning_tokens",
+        "required",
+        "response.id",
+        "response.output_items",
+        "response.status",
+        "segment_start_time",
+        "segments",
+        "service_name",
+        "session_properties",
+        "span",
+        "stream",
+        "stt.incomplete",
+        "system_instruction",
+        "system_instructions",
+        "text",
+        "tokens.completion",
+        "tokens.prompt",
+        "tokens.total",
+        "tool.all_function_names",
+        "tool.arguments",
+        "tool.call_id",
+        "tool.calls_count",
+        "tool.function_name",
+        "tool.result",
+        "tool.result_status",
+        "tool_count",
+        "tools",
+        "tools_serialized",
+        "transcript",
+        "ttfb_recorded",
+        "tts.interrupted",
+        "turn_complete",
+        "user_id"
+      ],
+      "functions": [
+        "_add_token_usage_to_span",
+        "_get_model_name",
+        "_get_parent_service_context",
+        "_get_turn_context",
+        "_noop_decorator",
+        "traced_gemini_live",
+        "traced_llm",
+        "traced_openai_realtime",
+        "traced_stt",
+        "traced_tts"
+      ],
+      "span_names": [
+        "stt",
+        "tts"
+      ],
+      "tracer_scopes": [
+        "pipecat"
+      ]
+    },
+    "pipecat.utils.tracing.setup": {
+      "attribute_keys": [
+        "deployment.environment",
+        "service.instance.id",
+        "service.name"
+      ],
+      "functions": [
+        "is_tracing_available",
+        "setup_tracing"
+      ],
+      "span_names": [],
+      "tracer_scopes": []
+    },
+    "pipecat.utils.tracing.tracing_context": {
+      "attribute_keys": [],
+      "functions": [],
+      "span_names": [],
+      "tracer_scopes": []
+    },
+    "pipecat.utils.tracing.turn_trace_observer": {
+      "attribute_keys": [
+        "conversation.id",
+        "conversation.type",
+        "turn.duration_seconds",
+        "turn.ended_by_conversation_end",
+        "turn.number",
+        "turn.type",
+        "turn.user_bot_latency_seconds",
+        "turn.was_interrupted"
+      ],
+      "functions": [],
+      "span_names": [
+        "conversation",
+        "turn"
+      ],
+      "tracer_scopes": [
+        "pipecat.turn"
+      ]
+    }
+  }
+}
