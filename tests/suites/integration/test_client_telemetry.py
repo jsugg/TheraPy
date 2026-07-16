@@ -6,8 +6,11 @@ import pytest
 
 
 @pytest.fixture
-def enabled(monkeypatch: pytest.MonkeyPatch):
+def enabled(client, monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setenv("THERAPY_CLIENT_TELEMETRY", "1")
+    # Same-origin is mandatory (O4 audit F-03): the shared test client
+    # presents its own origin so accept-path tests exercise the happy path.
+    client.headers["Origin"] = "http://testserver"
     from therapy.server import app as app_mod
 
     app_mod._client_bucket["tokens"] = 60.0
@@ -100,6 +103,166 @@ def test_cross_origin_rejected(client, enabled) -> None:
         headers={"Origin": "https://evil.example"},
     )
     assert response.status_code == 403
+
+
+@pytest.mark.parametrize(
+    "headers",
+    [
+        {},  # Origin is required, not optional (O4 audit probe)
+        {"Origin": "null"},  # opaque origin
+        {"Origin": "::::"},  # malformed origin
+        {"Origin": "https://testserver"},  # same netloc, wrong scheme
+        {"Origin": "http://testserver/path"},  # an origin has no path
+    ],
+)
+def test_missing_null_malformed_or_wrong_scheme_origin_rejected(
+    client, enabled, headers
+) -> None:
+    request_headers = dict(headers) or {"Origin": ""}
+    response = client.post(
+        "/api/telemetry/client",
+        json=_batch([{"name": "shell_fetch"}]),
+        headers=request_headers,
+    )
+    assert response.status_code == 403
+
+
+def test_forwarded_proto_defines_the_expected_scheme(client, enabled) -> None:
+    """Behind the HTTPS proxy the browser origin is https; the forwarded
+    scheme must win over the socket scheme."""
+    response = client.post(
+        "/api/telemetry/client",
+        json=_batch([{"name": "shell_fetch"}]),
+        headers={
+            "Origin": "https://testserver",
+            "X-Forwarded-Proto": "https",
+        },
+    )
+    assert response.status_code == 200
+    mismatched = client.post(
+        "/api/telemetry/client",
+        json=_batch([{"name": "shell_fetch"}]),
+        headers={
+            "Origin": "http://testserver",
+            "X-Forwarded-Proto": "https",
+        },
+    )
+    assert mismatched.status_code == 403
+
+
+@pytest.mark.parametrize(
+    "event_override",
+    [
+        {"rtt_ms": "12.5"},  # numeric string
+        {"bytes_delta": True},  # boolean as integer
+        {"bytes_delta": 1.0},  # integral float as integer
+        {"jitter_ms": False},  # boolean as float
+    ],
+)
+def test_lax_type_coercions_rejected(client, enabled, event_override) -> None:
+    event = {"name": "webrtc_sample", **event_override}
+    response = client.post("/api/telemetry/client", json=_batch([event]))
+    assert response.status_code == 422
+
+
+def test_boolean_schema_version_rejected(client, enabled) -> None:
+    payload = {"schema_version": True, "events": [{"name": "shell_fetch"}]}
+    response = client.post("/api/telemetry/client", json=payload)
+    assert response.status_code == 422
+
+
+def test_malformed_content_length_is_controlled_client_error(
+    client, enabled
+) -> None:
+    response = client.post(
+        "/api/telemetry/client",
+        content=b"{}",
+        headers={
+            "Content-Length": "invalid",
+            "Content-Type": "application/json",
+        },
+    )
+    assert response.status_code == 400
+
+
+def test_rejections_emit_fixed_schema_event_without_payload_values(
+    client, enabled
+) -> None:
+    import io
+    import json
+    import logging
+
+    from therapy.observability.logging import BroadJsonFormatter
+
+    stream = io.StringIO()
+    handler = logging.StreamHandler(stream)
+    handler.setFormatter(
+        BroadJsonFormatter(service_version="0.1.0", environment="test")
+    )
+    logger = logging.getLogger("therapy.broad")
+    previous_handlers = logger.handlers
+    logger.handlers = [handler]
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
+    try:
+        marker = "sk-secret-payload-value"
+        response = client.post(
+            "/api/telemetry/client",
+            json=_batch([{"name": "webrtc_sample", "url": marker}]),
+        )
+    finally:
+        logger.handlers = previous_handlers
+    assert response.status_code == 422
+    assert response.json() == {"detail": "invalid telemetry batch"}
+    lines = stream.getvalue().splitlines()
+    events = [json.loads(line) for line in lines]
+    rejected = [e for e in events if e["event.name"] == "client_telemetry_rejected"]
+    assert [e["outcome"] for e in rejected] == ["schema_error"]
+    assert marker not in stream.getvalue()
+
+
+def test_all_accepted_webrtc_fields_feed_metrics(
+    client, enabled, monkeypatch
+) -> None:
+    """O4 audit F-06: accepted diagnostics must never be silently discarded."""
+    from therapy.observability import telemetry
+
+    recorded: list[tuple[str, float, dict]] = []
+    monkeypatch.setattr(
+        telemetry,
+        "record_metric",
+        lambda name, value, attrs=None: recorded.append((name, value, attrs or {})),
+    )
+    response = client.post(
+        "/api/telemetry/client",
+        json=_batch(
+            [
+                {
+                    "name": "webrtc_sample",
+                    "rtt_ms": 42.5,
+                    "jitter_ms": 3.1,
+                    "packet_loss_ratio": 0.01,
+                    "bitrate_kbps": 128.0,
+                    "bytes_delta": 20_000,
+                    "concealed_samples": 12,
+                    "candidate_type": "relay",
+                    "dropped_events": 3,
+                }
+            ]
+        ),
+    )
+    assert response.status_code == 200
+    names = {name for name, _, _ in recorded}
+    assert {
+        "therapy_webrtc_rtt_seconds",
+        "therapy_webrtc_jitter_seconds",
+        "therapy_webrtc_packet_loss_ratio",
+        "therapy_webrtc_bitrate_kbps",
+        "therapy_webrtc_bytes_total",
+        "therapy_webrtc_concealed_samples_total",
+        "therapy_client_dropped_events_total",
+        "therapy_client_events_total",
+    } <= names
 
 
 def test_rate_limit_is_process_wide_not_ip_keyed(client, enabled) -> None:

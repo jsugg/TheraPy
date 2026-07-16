@@ -133,7 +133,12 @@ class ClientTelemetryEvent(APIRequest):
 
     Names/enums are finite; numbers are finite and range-bound; free text,
     URLs, IDs, stacks, SDP, and media/device data are unrepresentable.
+    Strict mode: lax coercions (numeric strings, booleans as numbers,
+    integral floats as ints) are rejected at this untrusted boundary
+    (O4 audit F-03).
     """
+
+    model_config = ConfigDict(strict=True)
 
     name: Literal[
         "media_permission",
@@ -192,5 +197,15 @@ class ClientTelemetryEvent(APIRequest):
 class ClientTelemetryBatch(APIRequest):
     """Bounded batch: schema v1, at most 20 events (obs plan O4.1)."""
 
+    model_config = ConfigDict(strict=True)
+
     schema_version: Literal[1]
     events: list[ClientTelemetryEvent] = Field(min_length=1, max_length=20)
+
+    @field_validator("schema_version", mode="before")
+    @classmethod
+    def reject_boolean_version(cls, value: object) -> object:
+        """`Literal[1]` admits `True` (bool subclasses int) even in strict mode."""
+        if isinstance(value, bool):
+            raise ValueError("schema_version must be the integer 1")
+        return value

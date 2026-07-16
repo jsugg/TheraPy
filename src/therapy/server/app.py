@@ -4,8 +4,8 @@ import asyncio
 import json
 import os
 import sqlite3
-from collections.abc import Sequence
-from contextlib import asynccontextmanager
+from collections.abc import Iterator, Sequence
+from contextlib import asynccontextmanager, contextmanager
 from functools import lru_cache
 from pathlib import Path
 from typing import TYPE_CHECKING, Annotated, Literal
@@ -250,17 +250,32 @@ def ready() -> dict[str, object]:
     }
 
 
-def _audit(operation: str, component: str = "data") -> None:
+@contextmanager
+def _audit(operation: str, component: str = "data") -> Iterator[None]:
     """Minimal content-free audit event for destructive/research/data
-    operations (obs plan O3.1); never IDs, names, paths, or payloads."""
+    operations (obs plan O3.1); never IDs, names, paths, or payloads.
+
+    Exactly one terminal event fires AFTER the wrapped operation resolves,
+    with a bounded outcome — a validation reject or crash must never be
+    recorded as success (O3 audit finding)."""
     from therapy.observability.logging import emit_event
 
-    emit_event(
-        "owner.audit",
-        component=component,
-        operation=operation,
-        outcome="success",
-    )
+    outcome = "success"
+    try:
+        yield
+    except HTTPException as exc:
+        outcome = "rejected" if exc.status_code < 500 else "error"
+        raise
+    except Exception:
+        outcome = "error"
+        raise
+    finally:
+        emit_event(
+            "owner.audit",
+            component=component,
+            operation=operation,
+            outcome=outcome,
+        )
 
 
 def _resolve_session(
@@ -471,24 +486,24 @@ def delete_session(
     mode: Literal["keep_knowledge", "remove_derived"] = "keep_knowledge",
 ) -> dict[str, object]:
     """Delete conversation artifacts under the owner's selected knowledge policy."""
-    _audit("delete_session", "memory")
-    store = _store()
-    if not store.has_session(session_id):
-        raise HTTPException(status_code=404, detail="Session not found")
-    if live.is_active(session_id):
-        raise HTTPException(
-            status_code=409, detail="Session is live — disconnect first"
+    with _audit("delete_session", "memory"):
+        store = _store()
+        if not store.has_session(session_id):
+            raise HTTPException(status_code=404, detail="Session not found")
+        if live.is_active(session_id):
+            raise HTTPException(
+                status_code=409, detail="Session is live — disconnect first"
+            )
+        provenance = _model().delete_session_evidence(
+            session_id, remove_derived=mode == "remove_derived"
         )
-    provenance = _model().delete_session_evidence(
-        session_id, remove_derived=mode == "remove_derived"
-    )
-    store.delete_session(session_id)
-    return {
-        "deleted": session_id,
-        "mode": mode,
-        "learned_knowledge_survives": mode == "keep_knowledge",
-        "provenance": provenance,
-    }
+        store.delete_session(session_id)
+        return {
+            "deleted": session_id,
+            "mode": mode,
+            "learned_knowledge_survives": mode == "keep_knowledge",
+            "provenance": provenance,
+        }
 
 
 # --------------------------------------------------------------------- #
@@ -618,10 +633,10 @@ def reject_node(node_id: int) -> dict[str, object]:
 @app.delete("/api/graph/nodes/{node_id}")
 def delete_node(node_id: int) -> dict[str, object]:
     """Delete a node (tombstoned so distillation cannot re-learn it)."""
-    _audit("delete_node", "knowledge")
-    if not _model().delete_node(node_id):
-        raise HTTPException(status_code=404, detail="Node not found")
-    return {"deleted": node_id}
+    with _audit("delete_node", "knowledge"):
+        if not _model().delete_node(node_id):
+            raise HTTPException(status_code=404, detail="Node not found")
+        return {"deleted": node_id}
 
 
 @app.patch("/api/graph/edges/{edge_id}")
@@ -670,10 +685,10 @@ def reject_edge(edge_id: int) -> dict[str, object]:
 @app.delete("/api/graph/edges/{edge_id}")
 def delete_edge(edge_id: int) -> dict[str, object]:
     """Delete an edge (tombstoned against re-learning)."""
-    _audit("delete_edge", "knowledge")
-    if not _model().delete_edge(edge_id):
-        raise HTTPException(status_code=404, detail="Edge not found")
-    return {"deleted": edge_id}
+    with _audit("delete_edge", "knowledge"):
+        if not _model().delete_edge(edge_id):
+            raise HTTPException(status_code=404, detail="Edge not found")
+        return {"deleted": edge_id}
 
 
 @app.get("/api/graph/boundaries")
@@ -692,10 +707,10 @@ def add_boundary(body: BoundaryRequest) -> dict[str, object]:
 @app.delete("/api/graph/boundaries")
 def remove_boundary(body: BoundaryRequest) -> dict[str, object]:
     """Remove a boundary by kind + value."""
-    _audit("remove_boundary", "knowledge")
-    if not _model().remove_boundary(body.kind, body.value):
-        raise HTTPException(status_code=404, detail="Boundary not found")
-    return {"boundaries": _model().boundaries()}
+    with _audit("remove_boundary", "knowledge"):
+        if not _model().remove_boundary(body.kind, body.value):
+            raise HTTPException(status_code=404, detail="Boundary not found")
+        return {"boundaries": _model().boundaries()}
 
 
 @app.post("/api/insights/{insight_id}/confirm")
@@ -758,26 +773,29 @@ async def research_ingest(
     force: Annotated[bool, Form()] = False,
 ) -> dict[str, object]:
     """Validate, extract/OCR, preserve, and index one local source."""
-    _audit("research_ingest", "research")
     from therapy.knowledge.research_ingest import MAX_SOURCE_BYTES
 
-    filename = file.filename or ""
-    payload = await file.read(MAX_SOURCE_BYTES + 1)
-    await file.close()
-    try:
-        result = _research().ingest_bytes(
-            payload,
-            filename,
-            file.content_type,
-            source_title=source_title,
-            source_ref=source_ref,
-            force=force,
-        )
-    except ValueError as exc:
-        raise HTTPException(status_code=422, detail=str(exc)) from exc
-    except RuntimeError as exc:
-        raise HTTPException(status_code=503, detail=str(exc)) from exc
-    return {"ingest": result, "document": _research().document(result["document_id"])}
+    with _audit("research_ingest", "research"):
+        filename = file.filename or ""
+        payload = await file.read(MAX_SOURCE_BYTES + 1)
+        await file.close()
+        try:
+            result = _research().ingest_bytes(
+                payload,
+                filename,
+                file.content_type,
+                source_title=source_title,
+                source_ref=source_ref,
+                force=force,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        except RuntimeError as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+        return {
+            "ingest": result,
+            "document": _research().document(result["document_id"]),
+        }
 
 
 @app.get("/api/research/query")
@@ -821,32 +839,36 @@ def correct_research_block(
     document_id: int, anchor: str, body: ResearchBlockCorrection
 ) -> dict[str, object]:
     """Apply one owner OCR correction and rebuild the semantic index."""
-    _audit("correct_research_block", "research")
-    try:
-        changed = _research().correct_block(document_id, anchor, body.text)
-    except ValueError as exc:
-        raise HTTPException(status_code=422, detail=str(exc)) from exc
-    if not changed:
-        raise HTTPException(status_code=404, detail="Research block not found")
-    return {"document": _research().document(document_id)}
+    with _audit("correct_research_block", "research"):
+        try:
+            changed = _research().correct_block(document_id, anchor, body.text)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        if not changed:
+            raise HTTPException(status_code=404, detail="Research block not found")
+        return {"document": _research().document(document_id)}
 
 
 @app.post("/api/research/{document_id}/reindex")
 def reindex_research(document_id: int) -> dict[str, int]:
     """Rebuild one document using the configured model/policy version."""
-    _audit("reindex_research", "research")
-    if _research().document(document_id) is None:
-        raise HTTPException(status_code=404, detail="Research document not found")
-    return {"chunks_indexed": _research().reindex(document_id)}
+    with _audit("reindex_research", "research"):
+        if _research().document(document_id) is None:
+            raise HTTPException(
+                status_code=404, detail="Research document not found"
+            )
+        return {"chunks_indexed": _research().reindex(document_id)}
 
 
 @app.delete("/api/research/{document_id}")
 def delete_research(document_id: int) -> dict[str, int]:
     """Delete one source artifact, extraction, and semantic index."""
-    _audit("delete_research", "research")
-    if not _research().delete_document(document_id):
-        raise HTTPException(status_code=404, detail="Research document not found")
-    return {"deleted": document_id}
+    with _audit("delete_research", "research"):
+        if not _research().delete_document(document_id):
+            raise HTTPException(
+                status_code=404, detail="Research document not found"
+            )
+        return {"deleted": document_id}
 
 
 @app.get("/api/proactivity")
@@ -932,13 +954,15 @@ def _assert_no_live_sessions() -> None:
 @app.get("/api/data/export")
 def export_owner_data() -> Response:
     """Download one complete inspectable owner-data JSON snapshot."""
-    _audit("export_owner_data", "data")
-    payload = _data().export_json()
-    return Response(
-        payload,
-        media_type="application/json",
-        headers={"Content-Disposition": 'attachment; filename="therapy-export.json"'},
-    )
+    with _audit("export_owner_data", "data"):
+        payload = _data().export_json()
+        return Response(
+            payload,
+            media_type="application/json",
+            headers={
+                "Content-Disposition": 'attachment; filename="therapy-export.json"'
+            },
+        )
 
 
 @app.post("/api/data/restore")
@@ -946,31 +970,33 @@ async def restore_owner_data(
     file: Annotated[UploadFile, File(description="TheraPy owner-data JSON export")],
 ) -> dict[str, object]:
     """Validate completely and restore a prior owner snapshot with rollback."""
-    _audit("restore_owner_data", "data")
-    _assert_no_live_sessions()
-    maximum_upload = 720 * 1024 * 1024
-    payload = await file.read(maximum_upload + 1)
-    await file.close()
-    if len(payload) > maximum_upload:
-        raise HTTPException(status_code=413, detail="Restore snapshot is too large")
-    try:
-        decoded = json.loads(payload)
-        if not isinstance(decoded, dict):
-            raise ValueError("restore snapshot root must be an object")
-        result = _data().restore_snapshot(decoded)
-    except (json.JSONDecodeError, ValueError, sqlite3.IntegrityError) as exc:
-        raise HTTPException(status_code=422, detail=str(exc)) from exc
-    return {"restored": result}
+    with _audit("restore_owner_data", "data"):
+        _assert_no_live_sessions()
+        maximum_upload = 720 * 1024 * 1024
+        payload = await file.read(maximum_upload + 1)
+        await file.close()
+        if len(payload) > maximum_upload:
+            raise HTTPException(
+                status_code=413, detail="Restore snapshot is too large"
+            )
+        try:
+            decoded = json.loads(payload)
+            if not isinstance(decoded, dict):
+                raise ValueError("restore snapshot root must be an object")
+            result = _data().restore_snapshot(decoded)
+        except (json.JSONDecodeError, ValueError, sqlite3.IntegrityError) as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        return {"restored": result}
 
 
 @app.delete("/api/data")
 def delete_owner_data(body: DeleteAllRequest) -> dict[str, bool]:
     """Erase every Phase 4 personal/corpus store after exact confirmation."""
-    _audit("delete_owner_data", "data")
     del body
-    _assert_no_live_sessions()
-    _data().delete_all()
-    return {"deleted": True}
+    with _audit("delete_owner_data", "data"):
+        _assert_no_live_sessions()
+        _data().delete_all()
+        return {"deleted": True}
 
 
 def _require_acceptance_capture() -> None:
@@ -1048,37 +1074,90 @@ def _client_bucket_take() -> bool:
     return True
 
 
+def _client_telemetry_rejected(reason: str) -> None:
+    """Fixed-schema broad evidence for a rejected batch (O4.1) — a bounded
+    reason only, never payload values, headers, or origins."""
+    from therapy.observability.logging import emit_event
+
+    emit_event(
+        "client_telemetry_rejected",
+        component="server",
+        operation="client_telemetry",
+        outcome=reason,
+        rate_limited=True,
+    )
+
+
+def _client_origin_allowed(origin: str | None, request: Request) -> bool:
+    """Same-origin only: an Origin header is required, opaque/malformed
+    origins are rejected, and scheme + netloc must both match the request
+    (the proxy scheme wins when forwarded)."""
+    if not origin or origin == "null":
+        return False
+    from urllib.parse import urlsplit
+
+    try:
+        parsed = urlsplit(origin)
+    except ValueError:
+        return False
+    if parsed.scheme not in ("http", "https") or not parsed.netloc:
+        return False
+    if parsed.path or parsed.query or parsed.fragment:
+        return False
+    forwarded_proto = request.headers.get("x-forwarded-proto", "")
+    scheme = (
+        forwarded_proto.split(",")[0].strip().lower()
+        if forwarded_proto
+        else request.url.scheme
+    )
+    return (
+        parsed.netloc == request.headers.get("host", "")
+        and parsed.scheme == scheme
+    )
+
+
 @app.post("/api/telemetry/client")
 async def client_telemetry(request: Request) -> dict[str, str]:
     """Strict first-party browser telemetry (obs plan O4.1).
 
     Same-origin only; bounded size + token bucket BEFORE parsing; events
-    aggregate to metrics and are never persisted; only schema/rate errors
-    are logged."""
+    aggregate to metrics and are never persisted; only fixed-schema
+    rejection evidence is logged."""
     if os.environ.get("THERAPY_CLIENT_TELEMETRY", "0") != "1":
         raise HTTPException(status_code=404, detail="Not found")
     length = request.headers.get("content-length")
-    if length is not None and int(length) > MAX_CLIENT_TELEMETRY_BYTES:
-        raise HTTPException(status_code=413, detail="telemetry batch too large")
-    origin = request.headers.get("origin")
-    if origin:
-        from urllib.parse import urlsplit
-
-        origin_host = urlsplit(origin).netloc
-        if origin_host and origin_host != request.headers.get("host", ""):
-            raise HTTPException(status_code=403, detail="same-origin only")
+    if length is not None:
+        try:
+            declared_length = int(length)
+        except ValueError:
+            _client_telemetry_rejected("length_malformed")
+            raise HTTPException(
+                status_code=400, detail="malformed content-length"
+            ) from None
+        if declared_length > MAX_CLIENT_TELEMETRY_BYTES:
+            _client_telemetry_rejected("too_large")
+            raise HTTPException(status_code=413, detail="telemetry batch too large")
+    if not _client_origin_allowed(request.headers.get("origin"), request):
+        _client_telemetry_rejected("origin_rejected")
+        raise HTTPException(status_code=403, detail="same-origin only")
     if not _client_bucket_take():
+        _client_telemetry_rejected("rate_limited")
         raise HTTPException(status_code=429, detail="telemetry rate limited")
 
     raw = await request.body()
     if len(raw) > MAX_CLIENT_TELEMETRY_BYTES:
+        _client_telemetry_rejected("too_large")
         raise HTTPException(status_code=413, detail="telemetry batch too large")
     from pydantic import ValidationError
 
     try:
         body = ClientTelemetryBatch.model_validate_json(raw)
-    except ValidationError as exc:
-        raise HTTPException(status_code=422, detail=exc.errors()) from exc
+    except ValidationError:
+        # Never reflect payload-derived validation details back or into logs.
+        _client_telemetry_rejected("schema_error")
+        raise HTTPException(
+            status_code=422, detail="invalid telemetry batch"
+        ) from None
 
     from therapy.observability.telemetry import record_metric
 
@@ -1103,6 +1182,24 @@ async def client_telemetry(request: Request) -> dict[str, str]:
                     event.packet_loss_ratio,
                     {"candidate_type": candidate},
                 )
+            if event.bitrate_kbps is not None:
+                record_metric(
+                    "therapy_webrtc_bitrate_kbps",
+                    event.bitrate_kbps,
+                    {"candidate_type": candidate},
+                )
+            if event.bytes_delta is not None:
+                record_metric(
+                    "therapy_webrtc_bytes_total",
+                    event.bytes_delta,
+                    {"candidate_type": candidate},
+                )
+            if event.concealed_samples is not None:
+                record_metric(
+                    "therapy_webrtc_concealed_samples_total",
+                    event.concealed_samples,
+                    {"candidate_type": candidate},
+                )
         elif event.name in ("peer_state", "ice_state"):
             record_metric(
                 "therapy_webrtc_connection_total",
@@ -1114,6 +1211,12 @@ async def client_telemetry(request: Request) -> dict[str, str]:
                 "therapy_webrtc_data_channel_open_seconds",
                 event.duration_ms / 1000,
                 {"outcome": event.outcome},
+            )
+        if event.dropped_events:
+            record_metric(
+                "therapy_client_dropped_events_total",
+                event.dropped_events,
+                {"name": event.name},
             )
         record_metric(
             "therapy_client_events_total",

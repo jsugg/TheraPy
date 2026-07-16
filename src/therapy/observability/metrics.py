@@ -97,6 +97,12 @@ INSTRUMENTS: tuple[InstrumentSpec, ...] = (
                    {"candidate_type": ("relay", "host", "srflx")}),
     InstrumentSpec("therapy_webrtc_connection_total", InstrumentKind.COUNTER, "1",
                    {"candidate_type": ("relay", "host", "srflx"), "outcome": None}),
+    InstrumentSpec("therapy_webrtc_bitrate_kbps", InstrumentKind.HISTOGRAM, "1",
+                   {"candidate_type": ("relay", "host", "srflx")}),
+    InstrumentSpec("therapy_webrtc_bytes_total", InstrumentKind.COUNTER, "By",
+                   {"candidate_type": ("relay", "host", "srflx")}),
+    InstrumentSpec("therapy_webrtc_concealed_samples_total", InstrumentKind.COUNTER,
+                   "1", {"candidate_type": ("relay", "host", "srflx")}),
     # --- persistence/longitudinal ---
     InstrumentSpec("therapy_storage_operations_total", InstrumentKind.COUNTER, "1",
                    {"component": None, "operation": None, "outcome": None}),
@@ -146,6 +152,8 @@ INSTRUMENTS: tuple[InstrumentSpec, ...] = (
                    {"reason": ("unknown_scope", "forbidden_attribute", "queue_full")}),
     InstrumentSpec("therapy_client_events_total", InstrumentKind.COUNTER, "1",
                    {"name": None, "outcome": None}),
+    InstrumentSpec("therapy_client_dropped_events_total", InstrumentKind.COUNTER,
+                   "1", {"name": None}),
 )
 
 #: Fast lookup by name; duplicate names are a manifest bug caught by tests.

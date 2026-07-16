@@ -343,3 +343,44 @@ def test_crisis_resources_config_endpoint(
     malformed = client.get("/api/crisis-resources")
     assert malformed.status_code == 503
     assert "invalid JSON" in malformed.json()["detail"]
+
+
+def test_owner_audit_emits_terminal_bounded_outcomes(client) -> None:
+    """O3 audit: rejected destructive calls must never be audited as success."""
+    import io
+    import json
+    import logging
+
+    from therapy.observability.logging import BroadJsonFormatter
+
+    stream = io.StringIO()
+    handler = logging.StreamHandler(stream)
+    handler.setFormatter(
+        BroadJsonFormatter(service_version="0.1.0", environment="test")
+    )
+    logger = logging.getLogger("therapy.broad")
+    previous_handlers = logger.handlers
+    logger.handlers = [handler]
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
+    try:
+        assert client.delete("/api/graph/nodes/999999").status_code == 404
+        assert client.post(
+            "/api/graph/boundaries", json={"kind": "never_store", "value": "probe"}
+        ).status_code == 200
+        assert client.request(
+            "DELETE",
+            "/api/graph/boundaries",
+            json={"kind": "never_store", "value": "probe"},
+        ).status_code == 200
+    finally:
+        logger.handlers = previous_handlers
+
+    audits = [
+        event
+        for event in map(json.loads, stream.getvalue().splitlines())
+        if event.get("event.name") == "owner.audit"
+    ]
+    by_operation = {event["operation"]: event["outcome"] for event in audits}
+    assert by_operation["delete_node"] == "rejected"
+    assert by_operation["remove_boundary"] == "success"
