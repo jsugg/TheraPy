@@ -45,7 +45,7 @@ function reportShellFetches() {
   if (count > 0) {
     void postTelemetry({
       name: "shell_fetch", outcome: "success", dropped_events: count,
-    });
+    }).catch(() => {});
   }
 }
 

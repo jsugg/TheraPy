@@ -85,8 +85,8 @@ const telemetry = (() => {
     const event = sanitize(raw);
     if (!event) return false;
     if (queue.length === MAX_EVENTS) {
-      queue.shift();
-      droppedEvents += 1;
+      const dropped = queue.shift();
+      droppedEvents += 1 + (dropped.event.dropped_events || 0);
     }
     attachDroppedEvents(event);
     queue.push({ event, queuedAt: Date.now() });
@@ -96,9 +96,11 @@ const telemetry = (() => {
 
   function expireOldEvents() {
     const oldest = Date.now() - MAX_AGE_MS;
-    const previousLength = queue.length;
-    queue = queue.filter((entry) => entry.queuedAt >= oldest);
-    droppedEvents += previousLength - queue.length;
+    queue = queue.filter((entry) => {
+      if (entry.queuedAt >= oldest) return true;
+      droppedEvents += 1 + (entry.event.dropped_events || 0);
+      return false;
+    });
   }
 
   async function flush() {
@@ -437,7 +439,7 @@ function getStatsState(connection) {
   return state;
 }
 
-function selectedCandidateType(report) {
+function selectedCandidatePair(report) {
   let selectedPair = null;
   for (const stat of report.values()) {
     if (stat.type === "transport" && stat.selectedCandidatePairId) {
@@ -450,10 +452,7 @@ function selectedCandidateType(report) {
       selectedPair = stat;
     }
   }
-  if (!selectedPair?.localCandidateId) return null;
-  const candidate = report.get(selectedPair.localCandidateId);
-  return ["relay", "host", "srflx"].includes(candidate?.candidateType)
-    ? candidate.candidateType : null;
+  return selectedPair;
 }
 
 function buildWebRtcSample(report, state) {
@@ -465,16 +464,12 @@ function buildWebRtcSample(report, state) {
   let packetsLost = 0;
   let packetsReceived = 0;
   let hasPackets = false;
-  let rtt = null;
+  const selectedPair = selectedCandidatePair(report);
+  let rtt = Number.isFinite(selectedPair?.currentRoundTripTime)
+    ? selectedPair.currentRoundTripTime : null;
   let jitter = null;
 
   for (const stat of report.values()) {
-    if (
-      stat.type === "candidate-pair" && Number.isFinite(stat.currentRoundTripTime) &&
-      (stat.selected || (stat.nominated && stat.state === "succeeded"))
-    ) {
-      rtt = stat.currentRoundTripTime;
-    }
     if (stat.type === "remote-inbound-rtp" && Number.isFinite(stat.currentRoundTripTime)) {
       rtt ??= stat.currentRoundTripTime;
     }
@@ -520,8 +515,12 @@ function buildWebRtcSample(report, state) {
     state.previousBytes = bytesReceived;
     state.previousAt = sampledAt;
   }
-  const candidateType = selectedCandidateType(report);
-  if (candidateType) event.candidate_type = candidateType;
+  const localCandidate = selectedPair?.localCandidateId
+    ? report.get(selectedPair.localCandidateId) : null;
+  const candidateType = localCandidate?.candidateType;
+  if (["relay", "host", "srflx"].includes(candidateType)) {
+    event.candidate_type = candidateType;
+  }
   // Candidate IDs are used only for this lookup; no network or media identifiers leave the page.
   return event;
 }
@@ -557,11 +556,13 @@ function stopStatsSampling(connection, finalSample) {
   state.timer = null;
   if (!finalSample || state.finalSampled) return;
   state.finalSampled = true;
+  let finalRequest;
   if (state.inFlight) {
-    void state.inFlight.then(() => sampleWebRtcStats(connection));
+    finalRequest = state.inFlight.then(() => sampleWebRtcStats(connection));
   } else {
-    void sampleWebRtcStats(connection);
+    finalRequest = sampleWebRtcStats(connection);
   }
+  void finalRequest.then(() => telemetry.flush());
 }
 
 function disconnectConversation() {

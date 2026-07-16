@@ -35,6 +35,7 @@ def e2e_server(tmp_path_factory: pytest.TempPathFactory) -> Iterator[str]:
         "THERAPY_DATA_DIR": str(data_dir),
         "THERAPY_RESUME_WINDOW_SECS": "900",
         "THERAPY_TEST_MODE": "1",
+        "THERAPY_CLIENT_TELEMETRY": "1",
     }
     proc = subprocess.Popen(
         [

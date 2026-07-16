@@ -563,7 +563,55 @@ def test_model_workspace_graph_pending_corpus_and_sovereignty(
     expect(page.locator("#model-nodes")).to_contain_text("Late meetings recur.")
 
 
-def test_registered_service_worker_handles_push_and_notification_click(
+def test_client_telemetry_queue_is_bounded_and_flushes(
+    page: Page, e2e_server: str
+) -> None:
+    page.goto(f"{e2e_server}/")
+    page.wait_for_function(
+        "navigator.serviceWorker.ready.then(r => !!r.active)", timeout=20_000
+    )
+
+    queue = page.evaluate(
+        """() => {
+          const realFetch = window.fetch;
+          window.fetch = (resource, options) => {
+            const url = typeof resource === "string" ? resource : resource.url;
+            if (url.endsWith("/api/telemetry/client")) return new Promise(() => {});
+            return realFetch(resource, options);
+          };
+          for (let index = 0; index < 60; index += 1) {
+            window.telemetry.enqueue({name: "shell_fetch", outcome: "success"});
+          }
+          return {
+            exists: typeof window.telemetry === "object",
+            size: window.telemetry.size,
+          };
+        }"""
+    )
+    assert queue == {"exists": True, "size": 50}
+
+    page.reload()
+    with page.expect_response(
+        lambda response: response.url.endswith("/api/telemetry/client")
+        and response.request.method == "POST"
+    ) as response_info:
+        status = page.evaluate(
+            """async () => {
+              window.telemetry.enqueue({
+                name: "webrtc_sample", outcome: "success", rtt_ms: 12.5,
+                packet_loss_ratio: 2, candidate_type: "prflx",
+                text: "must not leave the page", url: "/private", id: "secret",
+              });
+              return await window.telemetry.flush();
+            }"""
+        )
+    assert status == 200
+    assert response_info.value.status == 200
+    events = response_info.value.request.post_data_json["events"]
+    assert {"name": "webrtc_sample", "outcome": "success", "rtt_ms": 12.5} in events
+
+
+def test_registered_service_worker_telemetry_handles_push_and_notification_click(
     page: Page, e2e_server: str
 ) -> None:
     page.goto(f"{e2e_server}/")
@@ -578,6 +626,11 @@ def test_registered_service_worker_handles_push_and_notification_click(
     shown = worker.evaluate(
         """async () => {
           const calls = [];
+          const telemetry = [];
+          Object.defineProperty(self.clients, "matchAll", {
+            configurable: true,
+            value: async () => [{postMessage: (message) => telemetry.push(message)}],
+          });
           Object.defineProperty(self.registration, "showNotification", {
             configurable: true,
             value: async (title, options) => calls.push({title, options}),
@@ -592,22 +645,35 @@ def test_registered_service_worker_handles_push_and_notification_click(
           });
           self.dispatchEvent(event);
           await settled;
-          return calls;
+          return {calls, telemetry};
         }"""
     )
-    assert shown[0]["title"] == "TheraPy"
-    assert shown[0]["options"]["body"] == (
+    assert shown["calls"][0]["title"] == "TheraPy"
+    assert shown["calls"][0]["options"]["body"] == (
         "A reflection is available whenever you want it."
     )
     assert "private reflection text" not in str(shown)
+    assert shown["telemetry"] == [
+        {
+            "type": "telemetry",
+            "event": {"name": "push_lifecycle", "outcome": "received"},
+        },
+        {
+            "type": "telemetry",
+            "event": {"name": "push_lifecycle", "outcome": "shown"},
+        },
+    ]
 
     click = worker.evaluate(
         """async () => {
-          const result = {closed: false, navigated: null, focused: false};
+          const result = {
+            closed: false, navigated: null, focused: false, telemetry: [],
+          };
           const client = {
             url: self.location.origin + "/",
             navigate: async (url) => { result.navigated = url; },
             focus: async () => { result.focused = true; },
+            postMessage: (message) => { result.telemetry.push(message); },
           };
           Object.defineProperty(self.clients, "matchAll", {
             configurable: true, value: async () => [client],
@@ -628,3 +694,9 @@ def test_registered_service_worker_handles_push_and_notification_click(
     assert click["closed"] is True
     assert click["focused"] is True
     assert click["navigated"].endswith("/#model")
+    assert click["telemetry"] == [
+        {
+            "type": "telemetry",
+            "event": {"name": "push_lifecycle", "outcome": "clicked"},
+        }
+    ]

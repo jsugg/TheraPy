@@ -2,13 +2,18 @@ from __future__ import annotations
 
 import pytest
 
-from scripts.observability.evaluate_behavior import (
+# scripts/ is baked, not bind-mounted, into the container image; guard so a
+# stale image skips instead of breaking collection (same pattern as
+# test_observability_fixtures).
+pytest.importorskip("scripts.observability.evaluate_behavior")
+
+from scripts.observability.evaluate_behavior import (  # noqa: E402
     REVIEW_VERDICT,
     BehaviorCase,
     evaluate_behavior_case,
     evaluate_behavior_cases,
 )
-from scripts.observability.evaluate_speech import (
+from scripts.observability.evaluate_speech import (  # noqa: E402
     SpeechCase,
     UnreviewedFixtureError,
     compute_error_rates,
