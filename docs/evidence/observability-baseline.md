@@ -163,8 +163,11 @@ rollout, and this note is the recorded decision. STT fixture review status
 remains `seeded` until the owner reviews the reference transcripts — WER/CER
 claims stay disallowed until then (plan O3.4).
 
-- **Data restore duration:** destructive against the live owner volume;
-  measured in the isolated disposable environment during O3 alert drills.
+- **Data restore duration:** **measured 2026-07-16** in the isolated O3
+  drill instance (throwaway data dir, test mode): export 0.034 s / 2.8 KB,
+  restore 0.031 s, `/ready` healthy and session data intact after the
+  round-trip. Live-scale numbers (334 MB data dir) will differ; re-measured
+  at the O4 dogfood review. The live owner volume was never touched.
 - **Event-loop lag / TTFA stage decomposition:** requires O1/O2 owned
   instrumentation; the O2 off/on gate reuses `baseline.py` so both sides of
   the comparison share identical workloads.
