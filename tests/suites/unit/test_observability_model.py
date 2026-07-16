@@ -69,7 +69,7 @@ def test_status_transitions_are_monotonic() -> None:
 
 def test_route_manifest_is_well_formed() -> None:
     routes = model.HTTP_ROUTE_MANIFEST
-    assert len(routes) == 53  # the O0 set of 52 + O3.1's GET /ready
+    assert len(routes) == 54  # O0's 52 + O3.1 /ready + O4.1 client telemetry
     names = [route.name for route in routes]
     assert len(set(names)) == len(names), "duplicate route names"
     pairs = [(route.method, route.path) for route in routes]
@@ -79,7 +79,7 @@ def test_route_manifest_is_well_formed() -> None:
         assert route.path.startswith("/"), route
     # Liveness and the static shell stay out of broad traces (plan O2.1).
     excluded = {route.name for route in routes if not route.broad_traced}
-    assert excluded == {"health", "ready", "index"}
+    assert excluded == {"health", "ready", "index", "client_telemetry"}
     test_only = {route.name for route in routes if route.test_only}
     assert test_only == {"acceptance_agent_turn", "acceptance_proactivity_run"}
 

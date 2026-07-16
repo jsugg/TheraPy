@@ -144,6 +144,8 @@ INSTRUMENTS: tuple[InstrumentSpec, ...] = (
                    "s", {"workload_class": None}),
     InstrumentSpec("therapy_broad_span_drops_total", InstrumentKind.COUNTER, "1",
                    {"reason": ("unknown_scope", "forbidden_attribute", "queue_full")}),
+    InstrumentSpec("therapy_client_events_total", InstrumentKind.COUNTER, "1",
+                   {"name": None, "outcome": None}),
 )
 
 #: Fast lookup by name; duplicate names are a manifest bug caught by tests.

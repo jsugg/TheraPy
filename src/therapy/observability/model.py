@@ -322,6 +322,9 @@ HTTP_ROUTE_MANIFEST: tuple[RoutePolicy, ...] = (
         "acceptance_proactivity_run",
         test_only=True,
     ),
+    RoutePolicy(
+        "POST", "/api/telemetry/client", "client_telemetry", broad_traced=False
+    ),
     RoutePolicy("GET", "/api/crisis-resources", "crisis_resources_config"),
     RoutePolicy("GET", "/", "index", broad_traced=False),
 )

@@ -40,6 +40,7 @@ from therapy.server.schemas import (
     AcceptanceAgentTurn,
     AcceptanceOutreachRun,
     BoundaryRequest,
+    ClientTelemetryBatch,
     DeleteAllRequest,
     GraphEdgePatch,
     GraphNodePatch,
@@ -1017,6 +1018,105 @@ def acceptance_proactivity_run(body: AcceptanceOutreachRun) -> dict[str, object]
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     return {"job": job}
+
+
+
+
+# Process-wide token bucket for the client telemetry endpoint (O4.1):
+# never keyed by client IP, refills 1 token/s up to 60.
+_client_bucket = {"tokens": 60.0, "updated": 0.0}
+_CLIENT_BUCKET_CAPACITY = 60.0
+MAX_CLIENT_TELEMETRY_BYTES = 16 * 1024
+
+
+def _client_bucket_take() -> bool:
+    import time as _time
+
+    now = _time.monotonic()
+    elapsed = now - _client_bucket["updated"]
+    _client_bucket["updated"] = now
+    _client_bucket["tokens"] = min(
+        _CLIENT_BUCKET_CAPACITY, _client_bucket["tokens"] + elapsed
+    )
+    if _client_bucket["tokens"] < 1.0:
+        return False
+    _client_bucket["tokens"] -= 1.0
+    return True
+
+
+@app.post("/api/telemetry/client")
+async def client_telemetry(request: Request) -> dict[str, str]:
+    """Strict first-party browser telemetry (obs plan O4.1).
+
+    Same-origin only; bounded size + token bucket BEFORE parsing; events
+    aggregate to metrics and are never persisted; only schema/rate errors
+    are logged."""
+    if os.environ.get("THERAPY_CLIENT_TELEMETRY", "0") != "1":
+        raise HTTPException(status_code=404, detail="Not found")
+    length = request.headers.get("content-length")
+    if length is not None and int(length) > MAX_CLIENT_TELEMETRY_BYTES:
+        raise HTTPException(status_code=413, detail="telemetry batch too large")
+    origin = request.headers.get("origin")
+    if origin:
+        from urllib.parse import urlsplit
+
+        origin_host = urlsplit(origin).netloc
+        if origin_host and origin_host != request.headers.get("host", ""):
+            raise HTTPException(status_code=403, detail="same-origin only")
+    if not _client_bucket_take():
+        raise HTTPException(status_code=429, detail="telemetry rate limited")
+
+    raw = await request.body()
+    if len(raw) > MAX_CLIENT_TELEMETRY_BYTES:
+        raise HTTPException(status_code=413, detail="telemetry batch too large")
+    from pydantic import ValidationError
+
+    try:
+        body = ClientTelemetryBatch.model_validate_json(raw)
+    except ValidationError as exc:
+        raise HTTPException(status_code=422, detail=exc.errors()) from exc
+
+    from therapy.observability.telemetry import record_metric
+
+    for event in body.events:
+        candidate = event.candidate_type or "host"
+        if event.name == "webrtc_sample":
+            if event.rtt_ms is not None:
+                record_metric(
+                    "therapy_webrtc_rtt_seconds",
+                    event.rtt_ms / 1000,
+                    {"candidate_type": candidate},
+                )
+            if event.jitter_ms is not None:
+                record_metric(
+                    "therapy_webrtc_jitter_seconds",
+                    event.jitter_ms / 1000,
+                    {"candidate_type": candidate},
+                )
+            if event.packet_loss_ratio is not None:
+                record_metric(
+                    "therapy_webrtc_packet_loss_ratio",
+                    event.packet_loss_ratio,
+                    {"candidate_type": candidate},
+                )
+        elif event.name in ("peer_state", "ice_state"):
+            record_metric(
+                "therapy_webrtc_connection_total",
+                1,
+                {"candidate_type": candidate, "outcome": event.outcome},
+            )
+        elif event.name == "data_channel_state" and event.duration_ms is not None:
+            record_metric(
+                "therapy_webrtc_data_channel_open_seconds",
+                event.duration_ms / 1000,
+                {"outcome": event.outcome},
+            )
+        record_metric(
+            "therapy_client_events_total",
+            1,
+            {"name": event.name, "outcome": event.outcome},
+        )
+    return {"status": "accepted"}
 
 
 @app.get("/api/crisis-resources")
