@@ -901,11 +901,14 @@ async def run_bot(
         ]
     )
 
+    from therapy.integrations.pipecat.observability import build_task_telemetry
+
     task = PipelineTask(
         pipeline,
         params=PipelineParams(
             enable_metrics=True,
         ),
+        **build_task_telemetry(llm, session_id=session_id),
     )
 
     @transport.event_handler("on_app_message")

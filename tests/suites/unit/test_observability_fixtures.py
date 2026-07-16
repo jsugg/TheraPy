@@ -8,11 +8,14 @@
 
 import json
 
-from scripts.observability.canary_scan import (
-    FIXTURE_ROOT,
-    load_canaries,
-    scan_fixture_tree,
-)
+import pytest
+
+# scripts/ is not bind-mounted into the container image; the canary gate
+# runs on the host (and in any tree that carries scripts/observability/).
+canary_scan = pytest.importorskip("scripts.observability.canary_scan")
+FIXTURE_ROOT = canary_scan.FIXTURE_ROOT
+load_canaries = canary_scan.load_canaries
+scan_fixture_tree = canary_scan.scan_fixture_tree
 from therapy.observability.model import FieldClassification
 
 REQUIRED_SCENARIOS = {
