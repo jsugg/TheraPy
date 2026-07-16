@@ -148,6 +148,15 @@ services:
     ports:
       - "3478:3478/udp"
       - "3478:3478/tcp"
+    # Real STUN binding round-trip against the listener — not a port-open
+    # check. turnutils_stunclient is the strongest probe the pinned image
+    # ships (no wget/nc; full TURN allocation would need credentials in argv).
+    healthcheck:
+      test: ["CMD", "turnutils_stunclient", "-p", "3478", "127.0.0.1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
     mem_limit: 256m
 
 volumes:

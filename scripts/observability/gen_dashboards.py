@@ -215,6 +215,36 @@ DASHBOARDS: dict[str, dict] = {
                 unit="ms",
                 grid=g(12, 16),
             ),
+            # Relay: the collector scrapes coturn's internal 9641; the STUN
+            # healthcheck doubles as a synthetic binding probe, so these
+            # series carry data even with no active call. turn_* allocation
+            # counters appear lazily on the first real relay allocation.
+            stat(
+                "TURN relay up",
+                'up{job="turn"}',
+                grid=g(0, 24, 6),
+            ),
+            timeseries(
+                "STUN bindings (incl. synthetic healthcheck probe)",
+                'sum(rate({__name__=~"stun_binding_(request|response)_total", job="turn"}[5m])) by (__name__)',
+                unit="ops",
+                grid=g(6, 24, 9),
+            ),
+            timeseries(
+                "TURN allocations/traffic (populates on first relay use)",
+                'sum(rate({__name__=~"turn_.+", job="turn"}[5m])) by (__name__)',
+                unit="ops",
+                grid=g(15, 24, 9),
+            ),
+            # Supervision: restarts show as uptime sawtooth for both the app
+            # process and the relay (watchdog/hostwatch verification records
+            # are file-based and have no metrics path yet — named open item).
+            timeseries(
+                "Process uptime (restarts visible as resets)",
+                "time() - process_start_time_seconds",
+                unit="s",
+                grid=g(0, 32, 24),
+            ),
         ],
     ),
     "telemetry-health": dashboard(

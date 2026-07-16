@@ -34,6 +34,47 @@ def test_compose_declares_reliability_and_turn(repo_root) -> None:
     assert "--lt-cred-mech" in compose
 
 
+def test_turn_has_real_healthcheck_and_metrics_without_username_labels(
+    repo_root,
+) -> None:
+    """O3 audit: TURN needs a behavior healthcheck and a 9641 scrape path,
+    and must never emit per-username metric labels."""
+    compose = (repo_root / "compose.yaml").read_text()
+    assert "turnutils_stunclient" in compose  # STUN round-trip, not port-open
+    assert "--prometheus" in compose
+    assert "--prometheus-username-labels" not in compose
+
+    collector = (
+        repo_root / "deploy/observability/collector.yaml"
+    ).read_text()
+    assert "prometheus/turn" in collector
+    assert "turn:9641" in collector
+    assert "{key: username, action: delete}" in collector
+    # The scrape must feed the BROAD pipeline (denylist applied).
+    import re
+
+    metrics_broad = re.search(
+        r"metrics/broad:\n(?:\s+.+\n)+", collector
+    )
+    assert metrics_broad is not None
+    assert "prometheus/turn" in metrics_broad.group(0)
+    assert "attributes/broad_denylist" in metrics_broad.group(0)
+
+
+def test_reliability_dashboard_has_relay_and_supervision_panels(
+    repo_root,
+) -> None:
+    import json
+
+    dashboard = json.loads(
+        (repo_root / "deploy/observability/dashboards/reliability.json").read_text()
+    )
+    titles = [panel["title"] for panel in dashboard["panels"]]
+    assert "TURN relay up" in titles
+    assert any("STUN bindings" in title for title in titles)
+    assert any("Process uptime" in title for title in titles)
+
+
 def test_compose_caps_memory_per_service(repo_root) -> None:
     # Uncapped containers exhaust the Docker VM under load; a wedged VM
     # hangs the docker CLI and every port-forward (hypervisor stall,

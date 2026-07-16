@@ -26,6 +26,16 @@ receivers:
     protocols:
       http:
         endpoint: 0.0.0.0:4319
+  # TURN relay metrics (compose-internal 9641, never published to the host).
+  # coturn runs WITHOUT --prometheus-username-labels; the broad denylist
+  # below deletes `username` as defense in depth regardless.
+  prometheus/turn:
+    config:
+      scrape_configs:
+        - job_name: turn
+          scrape_interval: 30s
+          static_configs:
+            - targets: [turn:9641]
 
 processors:
   # Defense in depth: the app's routing scrub is primary; the collector
@@ -43,6 +53,7 @@ processors:
       - {key: exception.stacktrace, action: delete}
       - {key: session.id, action: delete}
       - {key: enduser.id, action: delete}
+      - {key: username, action: delete}
   batch/broad:
     send_batch_size: 256
     timeout: 5s
@@ -90,7 +101,7 @@ service:
       processors: [memory_limiter, attributes/broad_denylist, batch/broad]
       exporters: [otlphttp/lgtm]
     metrics/broad:
-      receivers: [otlp/broad]
+      receivers: [otlp/broad, prometheus/turn]
       processors: [memory_limiter, attributes/broad_denylist, batch/broad]
       exporters: [otlphttp/lgtm]
     traces/restricted:
