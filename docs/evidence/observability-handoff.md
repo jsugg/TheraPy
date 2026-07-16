@@ -83,6 +83,13 @@ templates only; Tempo trace names are templates (`GET
 any broad surface; Phoenix ACKs restricted exports against journaled IDs;
 all six dashboards + alert rules provisioned.
 
+Final gate run (2026-07-16, post O4.2): ruff clean; `uv lock --check` OK;
+compose (all profiles) valid; canary gate pass; host unit 156 passed;
+container integration 240 passed (one known pre-existing phase-4 ordering
+flake passes on rerun); browser e2e 10 passed / 1 skipped including the new
+telemetry queue/schema/flush/push coverage. A phase O3 cross-model audit is
+running; its findings land as follow-up commits like the O0-O2 audits did.
+
 ## Rollout / rollback state
 
 Rollout steps 1-4 and 6 are live (journal → Phoenix export → broad OTel →
