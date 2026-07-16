@@ -27,6 +27,7 @@ REPO_ROOT = next(
 sys.path.insert(0, str(REPO_ROOT))
 
 from scripts.observability.fixture_hash import fixture_hash  # noqa: E402
+from scripts.observability.report_io import write_restricted_report  # noqa: E402
 
 SPEECH_FIXTURE_ROOT = REPO_ROOT / "tests/fixtures/observability/speech"
 SPEECH_FIXTURE_PATH = SPEECH_FIXTURE_ROOT / "cases.json"
@@ -334,8 +335,10 @@ def _jiwer_version() -> str:
         raise RuntimeError("JiWER is not installed; run `uv sync` first.") from error
 
 
-def write_report(result: JsonObject, output: Path) -> None:
-    """Write a versioned speech evaluation report."""
+def write_report(
+    result: JsonObject, output: Path, *, allow_unrestricted: bool = False
+) -> str:
+    """Write a versioned speech evaluation report to a restricted path."""
     report: JsonObject = {
         "schema_version": 1,
         "report_type": "therapy-speech-evaluation",
@@ -349,10 +352,8 @@ def write_report(result: JsonObject, output: Path) -> None:
         },
         **result,
     }
-    output.parent.mkdir(parents=True, exist_ok=True)
-    output.write_text(
-        json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
+    return write_restricted_report(
+        report, output, repo_root=REPO_ROOT, allow_unrestricted=allow_unrestricted
     )
 
 
@@ -372,6 +373,14 @@ def _parser() -> argparse.ArgumentParser:
         help="allow a seeded exploratory report whose WER/CER claims are invalid",
     )
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT_PATH)
+    parser.add_argument(
+        "--unrestricted-output",
+        action="store_true",
+        help=(
+            "deliberately allow a report destination outside the restricted "
+            ".local directory (reports contain exact transcript content)"
+        ),
+    )
     return parser
 
 
@@ -385,10 +394,12 @@ def main(argv: list[str] | None = None) -> int:
         result = evaluate_speech_cases(
             cases, hypotheses, allow_seeded=args.allow_seeded
         )
-        write_report(result, args.output)
+        label = write_report(
+            result, args.output, allow_unrestricted=args.unrestricted_output
+        )
     except (OSError, json.JSONDecodeError, ValueError, RuntimeError) as error:
         parser.error(str(error))
-    print(f"wrote speech evaluation report: {args.output}")
+    print(f"wrote speech evaluation report: {label}")
     if result["result_label"] == "seeded-not-reviewed":
         print(INVALID_CLAIMS_CAVEAT)
     return 0

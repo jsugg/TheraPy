@@ -6,6 +6,9 @@
 `.local/obs-spike/logs/`; runbook `scripts/observability/backend_spike.md`  
 **Fixture corpus SHA-256 (final run):**
 `8198524ecf0027f87415ed95c0e39dff2828a09363c66db86adcda9e44c06479`
+*(point-in-time value; the aggregate corpus hash changed on 2026-07-16 when
+the behavior corpus was extended after the O3 audit — the golden interaction
+fixtures this spike measured are unchanged)*
 
 A first run against corpus `683b2279…` exposed two golden cases sharing
 `(trace_id, span_id)` transport IDs — a fixture-generator defect, since each

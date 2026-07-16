@@ -261,7 +261,14 @@ def main(argv: list[str] | None = None) -> int:
     try:
         datasets = upsert_datasets(args.endpoint, args.timeout)
     except Exception as error:
-        parser.error(f"Phoenix dataset upload failed: {error}")
+        # HTTP/client exceptions can embed concrete endpoints, query strings,
+        # or response text — surface only the bounded exception class (O3
+        # audit privacy finding).
+        parser.error(
+            "Phoenix dataset upload failed "
+            f"(error_type={type(error).__name__}); inspect locally with a "
+            "debugger for details"
+        )
     for dataset in datasets:
         print(
             json.dumps(
