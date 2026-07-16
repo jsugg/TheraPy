@@ -168,3 +168,43 @@ def test_rate_limit_filter_collapses_repeats() -> None:
     # unrelated events are unaffected
     other = record("capture_recovered")
     assert filt.filter(other) is True
+
+
+def test_descendant_third_party_loggers_cannot_smuggle_messages() -> None:
+    """Audit C-03: records from CHILD loggers (which bypass ancestor
+    filters) are sanitized at the root handler — message and args gone."""
+    import sys
+
+    from therapy.observability.logging import (
+        BroadJsonFormatter,
+        RootPolicyFilter,
+    )
+
+    stream = io.StringIO()
+    handler = logging.StreamHandler(stream)
+    handler.setFormatter(BroadJsonFormatter(environment="test"))
+    handler.addFilter(RootPolicyFilter())
+    root = logging.getLogger()
+    old_handlers, old_level = root.handlers, root.level
+    root.handlers = [handler]
+    root.setLevel(logging.DEBUG)
+    try:
+        child = logging.getLogger("httpx._client")  # descendant of policy'd httpx
+        child.warning("GET https://host/private/PRODUCT-ID?token=SECRET")
+        disabled_child = logging.getLogger("aioice.ice")  # descendant of disabled
+        disabled_child.error("candidate 192.168.1.10 51234 typ host")
+        unknown = logging.getLogger("somevendor.internal.module")
+        unknown.warning("payload with secrets sk-XYZ")
+        unknown.info("info level from unknown vendor is dropped")
+    finally:
+        root.handlers, root.level = old_handlers, old_level
+
+    text = stream.getvalue()
+    assert "PRODUCT-ID" not in text
+    assert "SECRET" not in text
+    assert "192.168" not in text
+    assert "sk-XYZ" not in text
+    lines = [json.loads(line) for line in text.splitlines()]
+    names = {line["event.name"] for line in lines}
+    assert names == {"third_party.httpx", "third_party.somevendor"}
+    assert sys is not None

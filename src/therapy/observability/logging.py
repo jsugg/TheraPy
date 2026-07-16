@@ -236,6 +236,50 @@ def emit_event(
     )
 
 
+class RootPolicyFilter(logging.Filter):
+    """Root-handler enforcement (audit C-03).
+
+    Python does not run ancestor-logger filters for records emitted by
+    descendants (`httpx._client`, `opentelemetry.exporter.*`, …), so the
+    named-logger policy alone cannot stop a child logger's free-form message
+    from becoming a broad `event.name`. This filter runs on the ROOT handler:
+
+    - owned `therapy.*`/`scripts` records pass (their messages are fixed,
+      audited event names);
+    - third-party records are matched by longest logger-name prefix against
+      the policy: disabled prefixes drop entirely; others pass only at or
+      above their fixed level AND with the message REPLACED by a bounded
+      classified name — the original text/args are discarded;
+    - unknown third-party loggers get the same sanitization at WARNING+.
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        name = record.name
+        if name == "root" or name.startswith(("therapy", "scripts", "__main__")):
+            return True
+        matched: str | int | None = None
+        matched_len = -1
+        for prefix, policy in THIRD_PARTY_LOGGER_POLICY.items():
+            if (name == prefix or name.startswith(prefix + ".")) and len(
+                prefix
+            ) > matched_len:
+                matched, matched_len = policy, len(prefix)
+        if matched == "disabled":
+            return False
+        minimum = int(matched) if matched is not None else logging.WARNING
+        if record.levelno < minimum:
+            return False
+        # classified, content-free replacement: package + exception class only
+        top = name.split(".", 1)[0]
+        record.event_name = f"third_party.{top}"
+        record.msg = record.event_name
+        record.args = ()
+        if record.exc_info and record.exc_info[1] is not None:
+            record.error_type = type(record.exc_info[1]).__name__
+            record.exc_info = None
+        return True
+
+
 def configure_stdout_json_logging(
     *,
     level: str = "INFO",
@@ -252,6 +296,7 @@ def configure_stdout_json_logging(
             resource=resource,
         )
     )
+    handler.addFilter(RootPolicyFilter())
     handler.addFilter(RateLimitFilter())
     root = logging.getLogger()
     root.handlers = [handler]

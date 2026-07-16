@@ -41,6 +41,30 @@ def state() -> TelemetryState:
     return _state
 
 
+def active_span_ids() -> tuple[str, str] | None:
+    """The active OTel span's (trace_id, span_id) hex pair, if recording."""
+    if not _state.enabled:
+        return None
+    try:
+        from opentelemetry import trace
+
+        span_context = trace.get_current_span().get_span_context()
+        if not span_context.is_valid:
+            return None
+        return (
+            f"{span_context.trace_id:032x}",
+            f"{span_context.span_id:016x}",
+        )
+    except Exception:
+        return None
+
+
+def _service_instance_id() -> str:
+    from therapy.observability.logging import SERVICE_INSTANCE_ID
+
+    return SERVICE_INSTANCE_ID
+
+
 def initialize(config: ObservabilityConfig, *, service_version: str) -> bool:
     """Install the one owned global TracerProvider. Returns enabled state."""
     if not config.otel_enabled:
@@ -71,10 +95,16 @@ def initialize(config: ObservabilityConfig, *, service_version: str) -> bool:
 
     import platform
 
-    resource = Resource.create(
+    # Fixed resource ONLY (audit C-02): the direct constructor skips the
+    # OTEL_RESOURCE_ATTRIBUTES env detector, so arbitrary env-injected
+    # key/values can never ride the broad resource. Belt and braces: the
+    # variable is also cleared for any later SDK path that calls create().
+    os.environ.pop("OTEL_RESOURCE_ATTRIBUTES", None)
+    resource = Resource(
         {
             "service.name": "therapy",
             "service.version": service_version,
+            "service.instance.id": _service_instance_id(),
             "deployment.environment": config.environment,
             "process.runtime.version": platform.python_version(),
         }
@@ -174,7 +204,18 @@ def record_metric(name: str, value: float, attributes: dict[str, str] | None = N
             continue
         allowed = spec.attributes[key]
         text = str(raw)
-        clean[key] = text if allowed is None or text in allowed else "unknown"
+        if allowed is not None:
+            clean[key] = text if text in allowed else "unknown"
+        else:
+            # bounded-enum dimension: shape-guard hostile/free input so a
+            # typo or env-injected value can never mint a label (audit H-02)
+            import re as _re
+
+            clean[key] = (
+                text
+                if _re.fullmatch(r"[a-z0-9_.-]{1,32}", text)
+                else "unknown"
+            )
     add = getattr(instrument, "add", None)
     if callable(add):
         add(value, clean)
@@ -464,6 +505,11 @@ class PlaneRoutingSpanProcessor:
                 if result.dropped_keys:
                     with _state._lock:
                         _state.dropped_forbidden_keys += len(result.dropped_keys)
+                    record_metric(
+                        "therapy_broad_span_drops_total",
+                        len(result.dropped_keys),
+                        {"reason": "forbidden_attribute"},
+                    )
                     emit_event(
                         "telemetry.broad_attribute_dropped",
                         severity=logging.WARNING,
@@ -473,11 +519,17 @@ class PlaneRoutingSpanProcessor:
                         count=len(result.dropped_keys),
                         rate_limited=True,
                     )
-                    span = _ScrubbedSpanView(span, result.attributes)
-                self._broad.on_end(span)
+                # EVERY broad span goes out as a strict envelope (audit
+                # C-01): denylisted attributes gone, span events (exception
+                # message/stack carriers) dropped, status description
+                # stripped to its code.
+                self._broad.on_end(_ScrubbedSpanView(span, result.attributes))
             return
         with _state._lock:
             _state.dropped_unknown_scopes += 1
+        record_metric(
+            "therapy_broad_span_drops_total", 1, {"reason": "unknown_scope"}
+        )
         emit_event(
             "telemetry.unknown_scope_dropped",
             severity=logging.WARNING,
@@ -535,7 +587,8 @@ class PhoenixInteractionExporter:
 
         self._id_generator = _NextIdGenerator()
         self._provider = TracerProvider(
-            resource=Resource.create({"service.name": "therapy-interactions"}),
+            # direct constructor: no env resource detector (audit C-02)
+            resource=Resource({"service.name": "therapy-interactions"}),
             id_generator=self._id_generator,
         )
         self._tracer = self._provider.get_tracer("therapy.interactions")
@@ -641,17 +694,39 @@ def make_interaction_exporter(config: ObservabilityConfig):
 
 
 class _ScrubbedSpanView:
-    """Read-only span proxy presenting scrubbed attributes to the exporter."""
+    """Strict broad-span envelope (audit C-01).
 
-    __slots__ = ("_span", "_attributes")
+    Presents scrubbed attributes, NO span events (FastAPI records exception
+    message/stacktrace as events), and a status stripped of its description
+    (FastAPI sets it to `ExcType: message`). Everything else proxies.
+    """
+
+    __slots__ = ("_span", "_attributes", "_status")
 
     def __init__(self, span, attributes: dict[str, object]) -> None:
         self._span = span
         self._attributes = attributes
+        status = getattr(span, "status", None)
+        self._status = status
+        if status is not None and getattr(status, "description", None):
+            try:
+                from opentelemetry.trace.status import Status
+
+                self._status = Status(status_code=status.status_code)
+            except Exception:
+                pass
 
     @property
     def attributes(self) -> dict[str, object]:
         return self._attributes
+
+    @property
+    def events(self) -> tuple:
+        return ()
+
+    @property
+    def status(self):
+        return self._status
 
     def __getattr__(self, name: str):
         return getattr(self._span, name)

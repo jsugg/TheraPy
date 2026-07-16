@@ -45,7 +45,7 @@ groups:
             relativeTimeRange: {from: 600, to: 0}
             datasourceUid: prometheus
             model:
-              expr: time() - therapy_llm_capture_oldest_unexported_unixtime
+              expr: time() - therapy_llm_capture_oldest_unexported_unixtime_seconds
               refId: A
           - refId: C
             datasourceUid: __expr__
@@ -119,7 +119,7 @@ groups:
             relativeTimeRange: {from: 600, to: 0}
             datasourceUid: prometheus
             model:
-              expr: time() - therapy_proactivity_scheduler_last_tick_unixtime
+              expr: time() - therapy_proactivity_scheduler_last_tick_unixtime_seconds
               refId: A
           - refId: C
             datasourceUid: __expr__

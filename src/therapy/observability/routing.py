@@ -53,6 +53,7 @@ BROAD_DENYLIST_KEYS: frozenset[str] = frozenset(
     {
         "url.query",
         "url.full",
+        "url.path",  # concrete request paths carry product IDs (audit C-01)
         "http.target",
         "http.url",
         "client.address",

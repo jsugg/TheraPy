@@ -19,6 +19,147 @@ const botAudio = $("bot-audio");
 const workspace = $("model-workspace");
 const workspaceButton = $("model-workspace-button");
 
+const telemetry = (() => {
+  const ENDPOINT = "/api/telemetry/client";
+  const MAX_EVENTS = 50;
+  const BATCH_SIZE = 20;
+  const MAX_AGE_MS = 24 * 60 * 60 * 1000;
+  const EVENT_NAMES = new Set([
+    "media_permission", "signaling_state", "ice_state", "data_channel_state",
+    "peer_state", "transcript_echo_timeout", "playback_failure", "disconnect",
+    "webrtc_sample", "sw_lifecycle", "shell_fetch", "cache_fallback",
+    "cache_recovery", "push_lifecycle",
+  ]);
+  const OUTCOMES = new Set([
+    "success", "error", "timeout", "fallback", "recovered", "denied",
+    "granted", "received", "shown", "clicked", "connected", "disconnected",
+    "failed", "installed", "activated", "refreshed", "deactivated",
+  ]);
+  const NUMBER_FIELDS = {
+    duration_ms: [0, 600000, false],
+    rtt_ms: [0, 60000, false],
+    jitter_ms: [0, 10000, false],
+    packet_loss_ratio: [0, 1, false],
+    bitrate_kbps: [0, 1000000, false],
+    bytes_delta: [0, 10000000000, true],
+    concealed_samples: [0, 1000000000, true],
+    dropped_events: [0, 10000, true],
+  };
+  const CANDIDATE_TYPES = new Set(["relay", "host", "srflx"]);
+  let queue = [];
+  let droppedEvents = 0;
+  let enabled = null;
+  let flushing = null;
+
+  // Only bounded schema fields cross this privacy boundary; all other input is ignored.
+  function sanitize(raw) {
+    if (!raw || typeof raw !== "object" || !EVENT_NAMES.has(raw.name)) return null;
+    const event = {
+      name: raw.name,
+      outcome: OUTCOMES.has(raw.outcome) ? raw.outcome : "success",
+    };
+    for (const [field, [minimum, maximum, integer]] of Object.entries(NUMBER_FIELDS)) {
+      const value = raw[field];
+      if (typeof value !== "number" || !Number.isFinite(value)) continue;
+      if (value < minimum || value > maximum || (integer && !Number.isInteger(value))) continue;
+      event[field] = value;
+    }
+    if (CANDIDATE_TYPES.has(raw.candidate_type)) {
+      event.candidate_type = raw.candidate_type;
+    }
+    return event;
+  }
+
+  function attachDroppedEvents(event) {
+    if (!droppedEvents) return;
+    const available = 10000 - (event.dropped_events || 0);
+    const attached = Math.min(available, droppedEvents);
+    if (attached > 0) {
+      event.dropped_events = (event.dropped_events || 0) + attached;
+      droppedEvents -= attached;
+    }
+  }
+
+  function enqueue(raw) {
+    if (enabled === false) return false;
+    const event = sanitize(raw);
+    if (!event) return false;
+    if (queue.length === MAX_EVENTS) {
+      queue.shift();
+      droppedEvents += 1;
+    }
+    attachDroppedEvents(event);
+    queue.push({ event, queuedAt: Date.now() });
+    if (queue.length >= BATCH_SIZE) void flush();
+    return true;
+  }
+
+  function expireOldEvents() {
+    const oldest = Date.now() - MAX_AGE_MS;
+    const previousLength = queue.length;
+    queue = queue.filter((entry) => entry.queuedAt >= oldest);
+    droppedEvents += previousLength - queue.length;
+  }
+
+  async function flush() {
+    if (enabled === false) return null;
+    if (flushing) return flushing;
+    expireOldEvents();
+    if (!queue.length) return null;
+    const entries = queue.slice(0, BATCH_SIZE);
+    const request = (async () => {
+      try {
+        const response = await fetch(ENDPOINT, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            schema_version: 1,
+            events: entries.map((entry) => entry.event),
+          }),
+          keepalive: true,
+        });
+        if (response.status === 404) {
+          enabled = false;
+          queue = [];
+          droppedEvents = 0;
+          return response.status;
+        }
+        if (!response.ok) return response.status;
+        enabled = true;
+        const sent = new Set(entries);
+        queue = queue.filter((entry) => !sent.has(entry));
+        return response.status;
+      } catch {
+        return null;
+      }
+    })();
+    flushing = request;
+    try {
+      return await request;
+    } finally {
+      flushing = null;
+      if (enabled !== false && queue.length >= BATCH_SIZE) void flush();
+    }
+  }
+
+  return Object.freeze({
+    enqueue,
+    flush,
+    get size() { return queue.length; },
+  });
+})();
+
+window.telemetry = telemetry;
+botAudio.addEventListener("error", () => {
+  telemetry.enqueue({ name: "playback_failure", outcome: "error" });
+});
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "hidden") void telemetry.flush();
+});
+navigator.serviceWorker?.addEventListener("message", (event) => {
+  if (event.data?.type === "telemetry") telemetry.enqueue(event.data.event);
+});
+
 const NODE_TYPES = [
   "identity_fact", "value", "goal", "pattern", "preference", "thread",
   "person", "strength", "strategy", "thought_record", "boundary",
@@ -38,6 +179,13 @@ let viewingSessionId = null; // session open in the history detail view
 let historyLoaded = false; // initial transcript rendered for the current connection
 let pushToTalk = false; // push-to-talk: mic gated until the Hold button is held
 const pendingTypedEchoes = [];
+const intentionalConnections = new WeakSet();
+const disconnectedConnections = new WeakSet();
+const statsStates = new WeakMap();
+
+setInterval(() => {
+  if (pc?.connectionState === "connected") void telemetry.flush();
+}, 30000);
 
 // Reply language (SPEC §7): "" = auto, or a pinned es/en/pt. Persists across
 // visits and is re-sent on every connect — the server holds the live state.
@@ -91,7 +239,8 @@ function addMessage(role, text, language) {
 function reconcileTypedEcho(text, language) {
   const index = pendingTypedEchoes.findIndex((pending) => pending.text === text);
   if (index < 0) return false;
-  const [{ element }] = pendingTypedEchoes.splice(index, 1);
+  const [{ element, timer }] = pendingTypedEchoes.splice(index, 1);
+  clearTimeout(timer);
   element.removeAttribute("data-awaiting-echo");
   if (language && !element.querySelector(".lang")) {
     const tag = document.createElement("span");
@@ -255,6 +404,166 @@ async function iceServers() {
   }
 }
 
+function signalingOutcome(state) {
+  if (state === "stable") return "connected";
+  if (state === "closed") return "disconnected";
+  if ([
+    "have-local-offer", "have-remote-offer",
+    "have-local-pranswer", "have-remote-pranswer",
+  ].includes(state)) return "success";
+  return "error";
+}
+
+function connectionOutcome(state) {
+  if (["connected", "completed"].includes(state)) return "connected";
+  if (state === "failed") return "failed";
+  if (["disconnected", "closed"].includes(state)) return "disconnected";
+  if (["new", "checking", "connecting"].includes(state)) return "success";
+  return "error";
+}
+
+function getStatsState(connection) {
+  let state = statsStates.get(connection);
+  if (!state) {
+    state = {
+      timer: null,
+      inFlight: null,
+      finalSampled: false,
+      previousBytes: null,
+      previousAt: null,
+    };
+    statsStates.set(connection, state);
+  }
+  return state;
+}
+
+function selectedCandidateType(report) {
+  let selectedPair = null;
+  for (const stat of report.values()) {
+    if (stat.type === "transport" && stat.selectedCandidatePairId) {
+      selectedPair = report.get(stat.selectedCandidatePairId) || selectedPair;
+    }
+    if (
+      !selectedPair && stat.type === "candidate-pair" &&
+      (stat.selected || (stat.nominated && stat.state === "succeeded"))
+    ) {
+      selectedPair = stat;
+    }
+  }
+  if (!selectedPair?.localCandidateId) return null;
+  const candidate = report.get(selectedPair.localCandidateId);
+  return ["relay", "host", "srflx"].includes(candidate?.candidateType)
+    ? candidate.candidateType : null;
+}
+
+function buildWebRtcSample(report, state) {
+  const event = { name: "webrtc_sample", outcome: "success" };
+  let bytesReceived = 0;
+  let hasBytes = false;
+  let concealedSamples = 0;
+  let hasConcealedSamples = false;
+  let packetsLost = 0;
+  let packetsReceived = 0;
+  let hasPackets = false;
+  let rtt = null;
+  let jitter = null;
+
+  for (const stat of report.values()) {
+    if (
+      stat.type === "candidate-pair" && Number.isFinite(stat.currentRoundTripTime) &&
+      (stat.selected || (stat.nominated && stat.state === "succeeded"))
+    ) {
+      rtt = stat.currentRoundTripTime;
+    }
+    if (stat.type === "remote-inbound-rtp" && Number.isFinite(stat.currentRoundTripTime)) {
+      rtt ??= stat.currentRoundTripTime;
+    }
+    if (stat.type !== "inbound-rtp") continue;
+    if (stat.kind && stat.kind !== "audio") continue;
+    if (stat.mediaType && stat.mediaType !== "audio") continue;
+    if (Number.isFinite(stat.jitter)) jitter ??= stat.jitter;
+    if (Number.isFinite(stat.bytesReceived)) {
+      bytesReceived += stat.bytesReceived;
+      hasBytes = true;
+    }
+    if (Number.isFinite(stat.concealedSamples)) {
+      concealedSamples += stat.concealedSamples;
+      hasConcealedSamples = true;
+    }
+    if (Number.isFinite(stat.packetsLost) && Number.isFinite(stat.packetsReceived)) {
+      packetsLost += Math.max(0, stat.packetsLost);
+      packetsReceived += Math.max(0, stat.packetsReceived);
+      hasPackets = true;
+    }
+  }
+
+  if (rtt !== null) event.rtt_ms = rtt * 1000;
+  if (jitter !== null) event.jitter_ms = jitter * 1000;
+  if (hasPackets && packetsLost + packetsReceived > 0) {
+    event.packet_loss_ratio = Math.min(1, Math.max(0,
+      packetsLost / (packetsLost + packetsReceived)));
+  }
+  if (hasConcealedSamples) {
+    event.concealed_samples = Math.min(1000000000, Math.round(concealedSamples));
+  }
+  const sampledAt = performance.now();
+  if (hasBytes && state.previousBytes !== null && state.previousAt !== null) {
+    const bytesDelta = Math.min(
+      10000000000,
+      Math.max(0, Math.round(bytesReceived - state.previousBytes)),
+    );
+    const elapsedMs = sampledAt - state.previousAt;
+    event.bytes_delta = bytesDelta;
+    if (elapsedMs > 0) event.bitrate_kbps = bytesDelta * 8 / elapsedMs;
+  }
+  if (hasBytes) {
+    state.previousBytes = bytesReceived;
+    state.previousAt = sampledAt;
+  }
+  const candidateType = selectedCandidateType(report);
+  if (candidateType) event.candidate_type = candidateType;
+  // Candidate IDs are used only for this lookup; no network or media identifiers leave the page.
+  return event;
+}
+
+function sampleWebRtcStats(connection) {
+  const state = getStatsState(connection);
+  if (state.inFlight) return state.inFlight;
+  const request = (async () => {
+    try {
+      telemetry.enqueue(buildWebRtcSample(await connection.getStats(), state));
+    } catch {
+      telemetry.enqueue({ name: "webrtc_sample", outcome: "error" });
+    }
+  })();
+  state.inFlight = request;
+  void request.finally(() => {
+    if (state.inFlight === request) state.inFlight = null;
+  });
+  return request;
+}
+
+function startStatsSampling(connection) {
+  const state = getStatsState(connection);
+  if (state.timer !== null) return;
+  state.timer = setInterval(() => {
+    if (connection.connectionState === "connected") void sampleWebRtcStats(connection);
+  }, 12000);
+}
+
+function stopStatsSampling(connection, finalSample) {
+  const state = getStatsState(connection);
+  if (state.timer !== null) clearInterval(state.timer);
+  state.timer = null;
+  if (!finalSample || state.finalSampled) return;
+  state.finalSampled = true;
+  if (state.inFlight) {
+    void state.inFlight.then(() => sampleWebRtcStats(connection));
+  } else {
+    void sampleWebRtcStats(connection);
+  }
+}
+
 function disconnectConversation() {
   const connection = pc;
   const peerId = peerConnectionId;
@@ -264,7 +573,15 @@ function disconnectConversation() {
   channel = null;
   if (micTrack) micTrack.stop();
   micTrack = null;
-  if (connection) connection.close();
+  if (connection) {
+    intentionalConnections.add(connection);
+    stopStatsSampling(connection, true);
+    if (!disconnectedConnections.has(connection)) {
+      disconnectedConnections.add(connection);
+      telemetry.enqueue({ name: "disconnect", outcome: "success" });
+    }
+    connection.close();
+  }
   botAudio.srcObject = null;
   return peerId;
 }
@@ -282,6 +599,7 @@ window.addEventListener("pagehide", () => {
       method: "POST", keepalive: true,
     });
   }
+  void telemetry.flush();
 });
 
 async function connect(opts = {}) {
@@ -289,9 +607,16 @@ async function connect(opts = {}) {
   historyLoaded = false;
   chat.replaceChildren(); // history reloads below (HTTP) or via the replay
   disconnectConversation();
-  const media = await navigator.mediaDevices.getUserMedia({
-    audio: { echoCancellation: true, noiseSuppression: true },
-  });
+  let media;
+  try {
+    media = await navigator.mediaDevices.getUserMedia({
+      audio: { echoCancellation: true, noiseSuppression: true },
+    });
+    telemetry.enqueue({ name: "media_permission", outcome: "granted" });
+  } catch (error) {
+    telemetry.enqueue({ name: "media_permission", outcome: "denied" });
+    throw error;
+  }
   micTrack = media.getAudioTracks()[0];
   // Honor the persisted mic mode for this fresh track — push mode starts muted
   // until the user holds Talk (companion.js reflects the mode on #mic-mode).
@@ -303,7 +628,14 @@ async function connect(opts = {}) {
   pc.addTransceiver("audio", { direction: "recvonly" });
 
   channel = pc.createDataChannel("chat", { ordered: true });
+  let offerPostedAt = null;
   channel.onopen = () => {
+    telemetry.enqueue({
+      name: "data_channel_state",
+      outcome: "connected",
+      duration_ms: offerPostedAt === null
+        ? undefined : Math.min(600000, performance.now() - offerPostedAt),
+    });
     sendReplyLanguage(); // replay the persisted pin (SPEC §7)
     // Fallback server-truth chat state, in case the HTTP load in connect()
     // didn't render (the primary path). renderHistoryOnce dedupes the two.
@@ -328,13 +660,53 @@ async function connect(opts = {}) {
       Companion.setServerPresence(msg.state);
     }
   };
+  channel.onclose = () => {
+    telemetry.enqueue({ name: "data_channel_state", outcome: "disconnected" });
+  };
 
-  pc.ontrack = (event) => { botAudio.srcObject = event.streams[0]; };
+  pc.ontrack = (event) => {
+    botAudio.srcObject = event.streams[0];
+    const playback = botAudio.play();
+    if (playback) {
+      playback.catch(() => telemetry.enqueue({
+        name: "playback_failure", outcome: "error",
+      }));
+    }
+  };
   const connection = pc;
+  pc.onsignalingstatechange = () => {
+    telemetry.enqueue({
+      name: "signaling_state",
+      outcome: signalingOutcome(connection.signalingState),
+    });
+  };
+  pc.oniceconnectionstatechange = () => {
+    telemetry.enqueue({
+      name: "ice_state",
+      outcome: connectionOutcome(connection.iceConnectionState),
+    });
+  };
   pc.onconnectionstatechange = () => {
+    const state = connection.connectionState;
+    telemetry.enqueue({ name: "peer_state", outcome: connectionOutcome(state) });
+    if (state === "connected") {
+      startStatsSampling(connection);
+      void telemetry.flush();
+    } else if (state === "disconnected") {
+      stopStatsSampling(connection, false);
+    } else if (["failed", "closed"].includes(state)) {
+      stopStatsSampling(connection, true);
+    }
+    if (
+      ["failed", "disconnected", "closed"].includes(state) &&
+      !intentionalConnections.has(connection) && !disconnectedConnections.has(connection)
+    ) {
+      disconnectedConnections.add(connection);
+      telemetry.enqueue({ name: "disconnect", outcome: "error" });
+    }
     if (connection !== pc) return;
-    if (connection.connectionState === "connected") setStatus("listening", "listening");
-    if (["failed", "disconnected", "closed"].includes(connection.connectionState)) {
+    if (state === "connected") setStatus("listening", "listening");
+    if (["failed", "disconnected", "closed"].includes(state)) {
       setStatus("disconnected");
       $("connect").hidden = false;
       $("controls").hidden = true;
@@ -361,6 +733,7 @@ async function connect(opts = {}) {
   let offerUrl = "/api/offer";
   if (opts.sessionId) offerUrl += `?session=${encodeURIComponent(opts.sessionId)}`;
   else if (opts.newSession) offerUrl += "?new_session=1";
+  offerPostedAt = performance.now();
   const response = await fetch(offerUrl, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -388,8 +761,15 @@ function sendText() {
   channel.send(JSON.stringify({ type: "user_text", text }));
   const element = addMessage("user", text, null);
   element.dataset.awaitingEcho = "true";
-  pendingTypedEchoes.push({ text, element });
-  if (pendingTypedEchoes.length > 20) pendingTypedEchoes.shift();
+  const pending = { text, element, timer: null };
+  pending.timer = setTimeout(() => {
+    element.removeAttribute("data-awaiting-echo");
+    telemetry.enqueue({ name: "transcript_echo_timeout", outcome: "timeout" });
+  }, 30000);
+  pendingTypedEchoes.push(pending);
+  if (pendingTypedEchoes.length > 20) {
+    clearTimeout(pendingTypedEchoes.shift().timer);
+  }
   // The server echo later supplies the authoritative language without duplicating it.
   input.value = "";
   applySpeaker(false); // typed turn → mirror to silent replies unless overridden

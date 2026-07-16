@@ -56,7 +56,7 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "time() - therapy_llm_capture_oldest_unexported_unixtime",
+          "expr": "time() - therapy_llm_capture_oldest_unexported_unixtime_seconds",
           "refId": "A"
         }
       ],
@@ -86,7 +86,7 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "time() - therapy_llm_capture_last_export_success_unixtime",
+          "expr": "time() - therapy_llm_capture_last_export_success_unixtime_seconds",
           "refId": "A"
         }
       ],

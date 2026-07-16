@@ -238,6 +238,16 @@ class CaptureService:
     ) -> AttemptHandle:
         """Durable pre-dispatch commit; must succeed before provider I/O."""
         context = current_trace_context()
+        # Cross-plane correlation (audit H-01): when the owned provider is
+        # active, the journal row carries the ACTIVE broad span's IDs so
+        # Tempo, journal, and Phoenix join on the same trace.
+        from therapy.observability.telemetry import active_span_ids
+
+        active = active_span_ids()
+        if active is not None:
+            from therapy.observability.context import TraceContext
+
+            context = TraceContext(trace_id=active[0], span_id=active[1])
         record = InteractionRecord(
             interaction_id=new_interaction_id(),
             trace_id=context.trace_id,
@@ -295,6 +305,13 @@ class CaptureService:
                 outcome="error",
                 error_type=type(exc).__name__,
                 rate_limited=True,
+            )
+            from therapy.observability.telemetry import record_metric
+
+            record_metric(
+                "therapy_llm_capture_records_total",
+                1,
+                {"operation": operation.value, "status": "failed"},
             )
             # §5.3: evaluation stops immediately; runtime returns a distinct
             # capture-unavailable result — continuing is the boundary's

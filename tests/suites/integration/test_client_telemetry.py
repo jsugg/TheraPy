@@ -137,6 +137,5 @@ def test_fuzz_random_payloads_never_pass_schema(client, enabled) -> None:
         assert response.status_code in (200, 422), response.text
         if response.status_code == 200:
             # only possible when the random draw formed a fully valid event
-            assert event.get("name") in {"shell_fetch"} and set(event) <= {
-                "name", "outcome", "rtt_ms",
-            }
+            assert event.get("name") == "shell_fetch"
+            assert set(event) <= {"name", "outcome", "rtt_ms"}

@@ -116,7 +116,7 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "time() - max(therapy_sqlite_checkpoint_last_success_unixtime)",
+          "expr": "time() - max(therapy_sqlite_checkpoint_last_success_unixtime_seconds)",
           "refId": "A"
         }
       ],

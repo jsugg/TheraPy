@@ -36,8 +36,13 @@ processors:
       - {key: http.url, action: delete}
       - {key: url.query, action: delete}
       - {key: url.full, action: delete}
+      - {key: url.path, action: delete}
       - {key: client.address, action: delete}
       - {key: user_agent.original, action: delete}
+      - {key: exception.message, action: delete}
+      - {key: exception.stacktrace, action: delete}
+      - {key: session.id, action: delete}
+      - {key: enduser.id, action: delete}
   batch/broad:
     send_batch_size: 256
     timeout: 5s

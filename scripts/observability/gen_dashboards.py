@@ -119,7 +119,7 @@ DASHBOARDS: dict[str, dict] = {
             ),
             stat(
                 "Last journal checkpoint age (s)",
-                'time() - max(therapy_sqlite_checkpoint_last_success_unixtime)',
+                'time() - max(therapy_sqlite_checkpoint_last_success_unixtime_seconds)',
                 unit="s",
                 grid=g(6, 8, 6),
             ),
@@ -165,7 +165,7 @@ DASHBOARDS: dict[str, dict] = {
         [
             stat(
                 "Scheduler last tick age (s)",
-                "time() - therapy_proactivity_scheduler_last_tick_unixtime",
+                "time() - therapy_proactivity_scheduler_last_tick_unixtime_seconds",
                 unit="s",
                 grid=g(0, 0, 6),
             ),
@@ -229,13 +229,13 @@ DASHBOARDS: dict[str, dict] = {
             ),
             stat(
                 "Oldest unexported interaction age (s)",
-                "time() - therapy_llm_capture_oldest_unexported_unixtime",
+                "time() - therapy_llm_capture_oldest_unexported_unixtime_seconds",
                 unit="s",
                 grid=g(12, 0, 6),
             ),
             stat(
                 "Last successful export age (s)",
-                "time() - therapy_llm_capture_last_export_success_unixtime",
+                "time() - therapy_llm_capture_last_export_success_unixtime_seconds",
                 unit="s",
                 grid=g(18, 0, 6),
             ),

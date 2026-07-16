@@ -26,7 +26,7 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "time() - therapy_proactivity_scheduler_last_tick_unixtime",
+          "expr": "time() - therapy_proactivity_scheduler_last_tick_unixtime_seconds",
           "refId": "A"
         }
       ],

@@ -312,7 +312,10 @@ class MetricsFrameAdapter(BaseObserver):
 def _env_provider() -> str:
     import os
 
-    return os.environ.get("THERAPY_LLM", "anthropic")
+    # bounded: raw env input never becomes a label (audit H-02)
+    return normalize_enum(
+        os.environ.get("THERAPY_LLM", "anthropic"), Provider, Provider.UNKNOWN
+    ).value
 
 
 def build_task_telemetry(

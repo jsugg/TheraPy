@@ -324,13 +324,16 @@ async def offer(
     except InvalidOffer as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
+    from therapy.observability.telemetry import broad_span
+
     store = _store()
     new_session = request.query_params.get("new_session") == "1"
-    resolved, resumed = _resolve_session(
-        store,
-        new_session=new_session,
-        explicit=request.query_params.get("session"),
-    )
+    with broad_span("offer.resolve_session", component="voice", operation="resolve"):
+        resolved, resumed = _resolve_session(
+            store,
+            new_session=new_session,
+            explicit=request.query_params.get("session"),
+        )
     # Carry the resumed transcript in the answer so the client renders it
     # synchronously on connect — an async fetch after connect raced a reconnect
     # (rendering the wrong session) and live turns (duplicating/mis-ordering).
@@ -339,10 +342,11 @@ async def offer(
     )
 
     try:
-        answer = await gateway.negotiate(
-            webrtc_offer,
-            SessionTarget(session_id=resolved, new_session=resolved is None),
-        )
+        with broad_span("offer.negotiate", component="voice", operation="negotiate"):
+            answer = await gateway.negotiate(
+                webrtc_offer,
+                SessionTarget(session_id=resolved, new_session=resolved is None),
+            )
     except ConnectionConflict as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     except InvalidOffer as exc:

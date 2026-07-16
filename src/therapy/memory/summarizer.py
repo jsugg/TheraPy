@@ -262,8 +262,10 @@ async def _complete_openai_style(
     headers = None
     if provider == "openrouter":
         headers = {"Authorization": f"Bearer {os.environ['OPENROUTER_API_KEY']}"}
+    from therapy.observability.telemetry import instrumented_async_client
+
     try:
-        async with httpx.AsyncClient(timeout=120.0) as client:
+        async with instrumented_async_client(provider, timeout=120.0) as client:
             response = await client.post(
                 f"{base_url.rstrip('/')}/chat/completions",
                 json={
