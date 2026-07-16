@@ -13,9 +13,9 @@
     "provider": "anthropic",
     "requested_model_policy": "claude-opus-4-8",
     "retry_count": 2,
-    "span_id": "fda5d78d2494d5fb",
+    "span_id": "5935d1024e997d54",
     "status_class": "2xx",
-    "trace_id": "55427e0c43570d5b422b6449b92cf31c",
+    "trace_id": "8904e0f961ecc91ff56c096b9157ea7b",
     "ttft_ms": 350
   },
   "case": "anthropic_retry_then_success",
@@ -25,7 +25,7 @@
     "completed_at": "2026-07-15T12:00:02.500000+00:00",
     "config_version": "c1",
     "error": null,
-    "interaction_id": "itx-anthropic-retry",
+    "interaction_id": "itx-anthropic-retry-then-success",
     "language": "es",
     "modality": "voice",
     "operation": "reply",
@@ -177,8 +177,8 @@
         "output_tokens": 96
       }
     },
-    "session_id": "sess-anthropic-success",
-    "span_id": "fda5d78d2494d5fb",
+    "session_id": "sess-anthropic-retry-then-success",
+    "span_id": "5935d1024e997d54",
     "started_at": "2026-07-15T12:00:00.000000+00:00",
     "status": "succeeded",
     "stream": [
@@ -195,7 +195,7 @@
         "tool_delta": null
       }
     ],
-    "trace_id": "55427e0c43570d5b422b6449b92cf31c",
+    "trace_id": "8904e0f961ecc91ff56c096b9157ea7b",
     "turn_id": 3
   },
   "scenario": "retry_fallback"

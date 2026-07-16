@@ -356,9 +356,19 @@ def case_anthropic_tools() -> dict[str, object]:
     }
 
 
+def _rekey(record: dict[str, object], case: str) -> None:
+    """Give a derived case its own identity: every fixture is a distinct
+    provider attempt, so trace/span IDs must never collide across cases."""
+    digest = hashlib.sha256(case.encode("utf-8")).hexdigest()
+    record["interaction_id"] = f"itx-{case.replace('_', '-')}"
+    record["trace_id"] = digest[:32]
+    record["span_id"] = digest[32:48]
+    record["session_id"] = f"sess-{case.replace('_', '-')}"
+
+
 def case_anthropic_retry_then_success() -> dict[str, object]:
     record = case_anthropic_success()["record"]
-    record["interaction_id"] = "itx-anthropic-retry"  # type: ignore[index]
+    _rekey(record, "anthropic_retry_then_success")  # type: ignore[arg-type]
     native = record["provider_native"]  # type: ignore[index]
     native["sdk_retry"] = {"attempt": 2, "parsed_delay_seconds": 1.5}
     return {
@@ -528,7 +538,7 @@ def case_openrouter_success() -> dict[str, object]:
 def case_openrouter_truncation() -> dict[str, object]:
     fixture = case_openrouter_success()
     record = fixture["record"]
-    record["interaction_id"] = "itx-openrouter-truncation"  # type: ignore[index]
+    _rekey(record, "openrouter_truncation")  # type: ignore[arg-type]
     record["response"]["finish_reason"] = "length"  # type: ignore[index]
     record["request"]["truncation"] = {"applied": True, "dropped_messages": 2}  # type: ignore[index]
     native = record["provider_native"]  # type: ignore[index]

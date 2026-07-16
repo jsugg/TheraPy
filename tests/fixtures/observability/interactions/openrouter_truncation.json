@@ -13,9 +13,9 @@
     "provider": "openrouter",
     "requested_model_policy": "openrouter/free",
     "retry_count": 0,
-    "span_id": "621cf8d2df245637",
+    "span_id": "7985c5458d0638a6",
     "status_class": "2xx",
-    "trace_id": "85256a9c8d6a8a974d855e79073f17e4",
+    "trace_id": "f8b864093e0202bdc418b4aecfd4ab15",
     "ttft_ms": 350
   },
   "case": "openrouter_truncation",
@@ -142,12 +142,12 @@
         "total_tokens": 468
       }
     },
-    "session_id": "sess-openrouter-success",
-    "span_id": "621cf8d2df245637",
+    "session_id": "sess-openrouter-truncation",
+    "span_id": "7985c5458d0638a6",
     "started_at": "2026-07-15T12:00:00.000000+00:00",
     "status": "succeeded",
     "stream": [],
-    "trace_id": "85256a9c8d6a8a974d855e79073f17e4",
+    "trace_id": "f8b864093e0202bdc418b4aecfd4ab15",
     "turn_id": 3
   },
   "scenario": "truncation"
