@@ -311,13 +311,27 @@ All 10 content canaries were present. All six forbidden canaries had count
 - A real measurement requires an owner-scoped test key. It must not use a
   personal production credential or trigger a signup from this spike.
 
-### C. Measured results
+### C. Measured results (2026-07-16, owner-provided scoped key)
 
-**Not run: no credential; measurement still required: owner-scoped test key.**
+The owner supplied `LANGFUSE_{PUBLIC,SECRET}_KEY`/`LANGFUSE_BASE_URL`, and
+the identical corpus (`8198524e…`) ran via
+`scripts/observability/backend_spike_langfuse.py` (raw:
+`.local/obs-spike/results/langfuse.json`):
 
-No API key was available; no signup was attempted. Export/query latency, RSS,
-disk, amplification, round-trip loss, duplicate handling, outage behavior, and
-canary checks are all **not measured**.
+| Measurement | Result |
+|---|---:|
+| OTLP ingest (`/api/public/otel/v1/traces`, Basic auth) | **SUCCESS**, 15/15 spans; first export **1368.8 ms** |
+| Queryable traces | **15 / 15** (async ingestion; polled) |
+| Canonical envelope round-trip via public API | **exact**, 0 losses/transformations |
+| Query latency (per-trace, remote + Hobby rate limits) | **p50 1146.8 ms; p95 25177.7 ms** (429 backoffs included) |
+| Duplicate resend | accepted, **no new trace IDs** |
+| Content canaries via API | all 10 present |
+| Forbidden canaries via API | all 6 absent (API-level scan only — remote storage cannot be inspected) |
+| Local footprint | none (managed) |
+
+Measurement limits: retention/deletion completion, access controls, and
+storage-level scans remain documented-only (no remote storage access);
+Hobby-tier public-API rate limits materially shape query latency.
 
 ---
 
@@ -376,13 +390,25 @@ findings above):
 - Remote export stays off (`THERAPY_INTERACTION_REMOTE_EXPORT=0`); Phoenix is
   local, so this gate remains untouched.
 
-**Langfuse Cloud** remains documented-only: measurement still requires an
-owner-scoped test key (no credential existed in this environment and no
-signup was performed). If the owner later wants the hosted comparison, the
-identical fixture corpus (`8198524e…`) and `backend_spike.py` run unchanged
-against a Langfuse OTLP endpoint; per plan O0.3, LangSmith Cloud is the
-fallback to test before rejecting hosted mode entirely. This does not block
-O0: the capture contract is satisfied by journal + local Phoenix.
+**Langfuse Cloud** was subsequently measured (2026-07-16) with an
+owner-provided scoped key: the identical corpus round-trips exactly and all
+canary checks pass (section above). It does not displace Phoenix under the
+fixed ranking: capture correctness ties, but remote query latency (p50
+1.15 s / p95 25 s under Hobby rate limits) versus Phoenix's local 23/50 ms,
+plus the plan's local tie-break (reproducibility/control/resource cost) and
+the Hobby unit/retention limits keep the local candidate selected. LangSmith
+was not tested — the plan requires it only before REJECTING hosted mode,
+and hosted mode was measured and viable, just not selected.
+
+**Executable gate reconciliation (audit F-03):** `backend_spike.py` now (a)
+returns a nonzero exit code whenever `overall_pass` is false, and (b)
+encodes the documented structural-promotion criterion — consuming
+`openinference.span.kind` into a backend's own span-kind column is recorded
+as `structural_promotions`, not content loss. Re-run results: **Phoenix
+`overall_pass: true`** (15 structural promotions, 0 content losses);
+**MLflow `overall_pass: false`** (its 5 irreversible representation
+mutations are genuine capture-contract failures). The machine gate and this
+decision record now agree.
 
 **Config consequence:** `THERAPY_INTERACTION_BACKEND` gains the enum value
 `phoenix` (alongside `journal`) when the O1.2 adapter lands; the default

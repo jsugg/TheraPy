@@ -38,10 +38,11 @@ def e2e_server(tmp_path_factory: pytest.TempPathFactory) -> Iterator[str]:
     }
     proc = subprocess.Popen(
         [
-            sys.executable, "-m", "uvicorn", "therapy.server.app:app",
-            "--host", "127.0.0.1", "--port", str(port),
+            # the owned launcher: logging/OTel bootstrap BEFORE the app
+            # imports (obs plan O1.1); uvicorn host/port come from env
+            sys.executable, "-m", "therapy.server",
         ],
-        env=env,
+        env={**env, "THERAPY_HOST": "127.0.0.1", "THERAPY_PORT": str(port)},
     )
     base_url = f"http://127.0.0.1:{port}"
     try:

@@ -183,7 +183,7 @@ def test_task_telemetry_kwargs_are_safe(monkeypatch: pytest.MonkeyPatch) -> None
     assert kwargs["enable_turn_tracking"] is False
     assert kwargs["conversation_id"].startswith("tele-")
     assert "sess-product-42" not in kwargs["conversation_id"]
-    assert len(kwargs["observers"]) == 1
+    assert len(kwargs["observers"]) == 2  # capture + MetricsFrame adapter
     assert isinstance(kwargs["observers"][0], InteractionCaptureObserver)
 
 

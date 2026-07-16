@@ -43,7 +43,11 @@ from therapy.observability.model import (
     InteractionStatus,
 )
 
-JOURNAL_SCHEMA_VERSION = 1
+JOURNAL_SCHEMA_VERSION = 2
+
+#: v2 (2026-07-16): `canonical_record_json` persists the COMPLETE §5.2
+#: pre-dispatch envelope so exact reconstruction never depends on scattered
+#: columns; the row checksum covers it plus the terminal.
 
 _DDL = """
 CREATE TABLE IF NOT EXISTS interactions(
@@ -60,6 +64,7 @@ CREATE TABLE IF NOT EXISTS interactions(
   started_at TEXT NOT NULL,
   completed_at TEXT NULL,
   canonical_request_json TEXT NOT NULL,
+  canonical_record_json TEXT NOT NULL DEFAULT '',
   provider_request_json TEXT NOT NULL,
   terminal_json TEXT NULL,
   checksum TEXT NOT NULL,
@@ -176,9 +181,29 @@ class JournalStore:
                     "INSERT INTO journal_metadata(key, value) VALUES(?, ?)",
                     ("schema_version", str(JOURNAL_SCHEMA_VERSION)),
                 )
-            elif int(row["value"]) > JOURNAL_SCHEMA_VERSION:
+                return
+            stored = int(row["value"])
+            if stored > JOURNAL_SCHEMA_VERSION:
                 raise JournalError("journal schema is newer than this build")
-            # future migrations branch on the stored version here
+            if stored < 2:
+                # v1 -> v2: add the complete-envelope column. v1 rows keep
+                # an empty envelope and are reported as legacy by
+                # `reconstruct()`; they were all synthetic dev records.
+                columns = {
+                    r[1]
+                    for r in self._conn.execute(
+                        "PRAGMA table_info(interactions)"
+                    ).fetchall()
+                }
+                if "canonical_record_json" not in columns:
+                    self._conn.execute(
+                        "ALTER TABLE interactions ADD COLUMN "
+                        "canonical_record_json TEXT NOT NULL DEFAULT ''"
+                    )
+            self._conn.execute(
+                "UPDATE journal_metadata SET value=? WHERE key='schema_version'",
+                (str(JOURNAL_SCHEMA_VERSION),),
+            )
 
     def _tx(self):
         return _Transaction(self._conn)
@@ -191,6 +216,7 @@ class JournalStore:
             raise JournalConflict("start_attempt requires status=started")
         payload = record.to_json_dict()
         canonical_request = canonical_json(payload["request"])  # type: ignore[arg-type]
+        canonical_record = canonical_json(payload)
         provider_request = canonical_json(payload["provider_native"]["request"])  # type: ignore[index]
         digest = checksum(payload)
         now = _utcnow()
@@ -202,10 +228,11 @@ class JournalStore:
                       interaction_id, schema_version, payload_encoding,
                       key_version, nonce, trace_id, span_id, operation,
                       provider, status, started_at, completed_at,
-                      canonical_request_json, provider_request_json,
+                      canonical_request_json, canonical_record_json,
+                      provider_request_json,
                       terminal_json, checksum, next_sequence,
                       created_at, updated_at
-                    ) VALUES (?,?,?,NULL,NULL,?,?,?,?,?,?,NULL,?,?,NULL,?,0,?,?)
+                    ) VALUES (?,?,?,NULL,NULL,?,?,?,?,?,?,NULL,?,?,?,NULL,?,0,?,?)
                     """,
                     (
                         record.interaction_id,
@@ -218,6 +245,7 @@ class JournalStore:
                         record.status.value,
                         record.started_at,
                         canonical_request,
+                        canonical_record,
                         provider_request,
                         digest,
                         now,
@@ -243,51 +271,74 @@ class JournalStore:
         observed_at: str,
         payload: dict[str, JsonValue],
     ) -> None:
+        with self._tx():
+            self._append_one(interaction_id, sequence, kind, observed_at, payload)
+
+    def append_stream_events(
+        self,
+        items: list[tuple[str, int, InteractionEventKind, str, dict[str, JsonValue]]],
+    ) -> None:
+        """True group commit (§5.3): one transaction for the whole batch.
+
+        A conflict anywhere rolls the batch back and surfaces to every
+        member — a partially persisted group is never reported as success.
+        """
+        with self._tx():
+            for interaction_id, sequence, kind, observed_at, payload in items:
+                self._append_one(interaction_id, sequence, kind, observed_at, payload)
+
+    def _append_one(
+        self,
+        interaction_id: str,
+        sequence: int,
+        kind: InteractionEventKind,
+        observed_at: str,
+        payload: dict[str, JsonValue],
+    ) -> None:
         payload_text = canonical_json(payload)
         digest = checksum(payload)
-        with self._tx():
-            row = self._conn.execute(
-                "SELECT status, next_sequence FROM interactions WHERE interaction_id=?",
-                (interaction_id,),
-            ).fetchone()
-            if row is None:
-                raise JournalConflict(f"unknown interaction {interaction_id}")
-            status = InteractionStatus(row["status"])
-            if status in TERMINAL_INTERACTION_STATUSES:
-                raise JournalConflict(
-                    f"stream event after terminal state for {interaction_id}"
-                )
-            try:
-                self._conn.execute(
-                    """
-                    INSERT INTO interaction_events(
-                      interaction_id, sequence, kind, observed_at,
-                      payload_json, checksum
-                    ) VALUES (?,?,?,?,?,?)
-                    """,
-                    (interaction_id, sequence, kind.value, observed_at, payload_text, digest),
-                )
-            except sqlite3.IntegrityError:
-                existing = self._conn.execute(
-                    "SELECT checksum FROM interaction_events "
-                    "WHERE interaction_id=? AND sequence=?",
-                    (interaction_id, sequence),
-                ).fetchone()
-                if existing is not None and existing["checksum"] == digest:
-                    return  # idempotent duplicate
-                raise JournalConflict(
-                    f"conflicting duplicate sequence {sequence} for {interaction_id}"
-                ) from None
-            new_status = (
-                InteractionStatus.STREAMING
-                if status is InteractionStatus.STARTED
-                else status
+        row = self._conn.execute(
+            "SELECT status, next_sequence FROM interactions WHERE interaction_id=?",
+            (interaction_id,),
+        ).fetchone()
+        if row is None:
+            raise JournalConflict(f"unknown interaction {interaction_id}")
+        status = InteractionStatus(row["status"])
+        if status in TERMINAL_INTERACTION_STATUSES:
+            raise JournalConflict(
+                f"stream event after terminal state for {interaction_id}"
             )
+        try:
             self._conn.execute(
-                "UPDATE interactions SET next_sequence=MAX(next_sequence, ?), "
-                "status=?, updated_at=? WHERE interaction_id=?",
-                (sequence + 1, new_status.value, _utcnow(), interaction_id),
+                """
+                INSERT INTO interaction_events(
+                  interaction_id, sequence, kind, observed_at,
+                  payload_json, checksum
+                ) VALUES (?,?,?,?,?,?)
+                """,
+                (interaction_id, sequence, kind.value, observed_at, payload_text, digest),
             )
+        except sqlite3.IntegrityError:
+            existing = self._conn.execute(
+                "SELECT checksum FROM interaction_events "
+                "WHERE interaction_id=? AND sequence=?",
+                (interaction_id, sequence),
+            ).fetchone()
+            if existing is not None and existing["checksum"] == digest:
+                return  # idempotent duplicate
+            raise JournalConflict(
+                f"conflicting duplicate sequence {sequence} for {interaction_id}"
+            ) from None
+        new_status = (
+            InteractionStatus.STREAMING
+            if status is InteractionStatus.STARTED
+            else status
+        )
+        self._conn.execute(
+            "UPDATE interactions SET next_sequence=MAX(next_sequence, ?), "
+            "status=?, updated_at=? WHERE interaction_id=?",
+            (sequence + 1, new_status.value, _utcnow(), interaction_id),
+        )
 
     def _finish(
         self,
@@ -548,16 +599,83 @@ class JournalStore:
         }
 
     def verify_checksums(self, interaction_id: str) -> bool:
+        """Corruption check over the WHOLE row: the pre-dispatch canonical
+        envelope, the chained terminal digest, and every event payload."""
         import json as _json
 
         data = self.load(interaction_id)
         if data is None:
             return False
+        row = data["interaction"]
+        envelope_text = row.get("canonical_record_json") or ""
+        if envelope_text:
+            try:
+                start_digest = checksum(_json.loads(envelope_text))
+            except ValueError:
+                return False
+            if row["terminal_json"] is None:
+                if row["checksum"] != start_digest:
+                    return False
+            else:
+                try:
+                    terminal = _json.loads(row["terminal_json"])
+                except ValueError:
+                    return False
+                chained = checksum({"base": start_digest, "terminal": terminal})
+                if row["checksum"] != chained:
+                    return False
         for event in data["events"]:
             payload = _json.loads(event["payload_json"])
             if checksum(payload) != event["checksum"]:
                 return False
         return True
+
+    def reconstruct(self, interaction_id: str) -> dict[str, JsonValue] | None:
+        """Exact §5.2 reconstruction: the pre-dispatch canonical envelope
+        with the persisted stream and terminal folded back in.
+
+        Returns None for unknown IDs; raises `JournalError` for legacy v1
+        rows without a stored envelope (visible, never invented)."""
+        import json as _json
+
+        data = self.load(interaction_id)
+        if data is None:
+            return None
+        row = data["interaction"]
+        envelope_text = row.get("canonical_record_json") or ""
+        if not envelope_text:
+            raise JournalError(
+                f"{interaction_id} is a legacy v1 row without a stored envelope"
+            )
+        envelope: dict[str, JsonValue] = _json.loads(envelope_text)
+        envelope["status"] = row["status"]
+        envelope["completed_at"] = row["completed_at"]
+        stream: list[JsonValue] = []
+        native_events: list[JsonValue] = []
+        for event in data["events"]:
+            payload = _json.loads(event["payload_json"])
+            entry = {
+                "sequence": event["sequence"],
+                "observed_at": event["observed_at"],
+                "kind": event["kind"],
+                **(payload if isinstance(payload, dict) else {"payload": payload}),
+            }
+            if event["kind"] in ("stream_delta", "tool_delta"):
+                stream.append(entry)
+            else:
+                native_events.append(entry)
+        envelope["stream"] = stream
+        native = envelope.get("provider_native")
+        if isinstance(native, dict):
+            native["ordered_events"] = list(native.get("ordered_events") or []) + native_events
+        if row["terminal_json"] is not None:
+            terminal = _json.loads(row["terminal_json"])
+            envelope["terminal"] = terminal
+            if isinstance(terminal, dict) and isinstance(terminal.get("response"), dict):
+                envelope["response"] = terminal["response"]
+            if isinstance(terminal, dict) and isinstance(terminal.get("error"), dict):
+                envelope["error"] = terminal["error"]
+        return envelope
 
     def iter_interaction_ids(self) -> Iterator[str]:
         for row in self._conn.execute(
@@ -692,17 +810,57 @@ class AsyncJournalWriter:
             await self._apply(batch)
 
     async def _apply(self, batch: list[_WriteOp]) -> None:
-        for op in batch:
+        index = 0
+        while index < len(batch):
+            op = batch[index]
+            # consecutive stream appends commit as ONE transaction (§5.3)
+            if op.method == "append_stream_event":
+                run = [op]
+                while (
+                    index + len(run) < len(batch)
+                    and batch[index + len(run)].method == "append_stream_event"
+                ):
+                    run.append(batch[index + len(run)])
+                items = [tuple(member.args) for member in run]
+                try:
+                    started = time.monotonic()
+                    await asyncio.to_thread(
+                        self._store.append_stream_events, items
+                    )
+                    self._observe_append((time.monotonic() - started) * 1000)
+                except Exception as exc:
+                    for member in run:
+                        if not member.future.done():
+                            member.future.set_exception(exc)
+                else:
+                    for member in run:
+                        if not member.future.done():
+                            member.future.set_result(None)
+                index += len(run)
+                continue
             try:
+                started = time.monotonic()
                 await asyncio.to_thread(
                     getattr(self._store, op.method), *op.args, **op.kwargs
                 )
+                self._observe_append((time.monotonic() - started) * 1000)
             except Exception as exc:  # propagate to the caller, keep writing
                 if not op.future.done():
                     op.future.set_exception(exc)
             else:
                 if not op.future.done():
                     op.future.set_result(None)
+            index += 1
+
+    @staticmethod
+    def _observe_append(duration_ms: float) -> None:
+        from therapy.observability.telemetry import record_metric
+
+        record_metric(
+            "therapy_llm_capture_append_seconds",
+            duration_ms / 1000,
+            {"outcome": "success"},
+        )
 
     async def _submit(self, method: str, *args, durable: bool, **kwargs) -> None:
         if self._closed:
@@ -755,9 +913,15 @@ class AsyncJournalWriter:
             return
         self._closed = True
         if self._task is not None:
-            await self._queue.put(None)
+            try:
+                self._queue.put_nowait(None)
+            except asyncio.QueueFull:
+                self._task.cancel()
             try:
                 await asyncio.wait_for(self._task, timeout)
-            except TimeoutError:
+            except (TimeoutError, asyncio.CancelledError):
                 self._task.cancel()
-        await asyncio.to_thread(self._store.close)
+        try:
+            await asyncio.wait_for(asyncio.to_thread(self._store.close), timeout)
+        except TimeoutError:
+            pass  # the connection dies with the process; data is committed

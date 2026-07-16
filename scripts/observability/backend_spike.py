@@ -1018,9 +1018,23 @@ def measure(args: argparse.Namespace) -> int:
             "passed": not round_trip["missing_cases"],
             "missing_cases": round_trip["missing_cases"],
         },
+        # Documented acceptance criterion (ADR, docs/evidence/
+        # observability-backend-spike.md): a backend consuming
+        # `openinference.span.kind` into its own top-level span-kind column
+        # is a STRUCTURAL promotion — the value is preserved and recoverable
+        # — not content loss. Everything else remains a hard failure.
         "attributes_round_trip": {
-            "passed": round_trip["attribute_loss_count"] == 0,
+            "passed": all(
+                loss.get("kind") == "lost"
+                and loss.get("path") == "openinference.span.kind"
+                for loss in round_trip["attribute_losses"]
+            ),
             "loss_count": round_trip["attribute_loss_count"],
+            "structural_promotions": sum(
+                1
+                for loss in round_trip["attribute_losses"]
+                if loss.get("path") == "openinference.span.kind"
+            ),
         },
         "attribute_representation_exact": {
             "passed": round_trip["attribute_transformation_count"] == 0,
@@ -1134,7 +1148,8 @@ def measure(args: argparse.Namespace) -> int:
             }
         )
     )
-    return 0
+    # A failing acceptance run must FAIL the shell gate (audit F-03).
+    return 0 if result["overall_pass"] else 1
 
 
 def serve_phoenix(args: argparse.Namespace) -> int:

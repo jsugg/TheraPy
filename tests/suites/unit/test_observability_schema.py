@@ -140,3 +140,20 @@ def test_provider_native_extra_flattens_into_envelope() -> None:
     assert native["generation_id"] == "gen-1"
     assert native["fallback_attempts"] == 2
     assert "extra" not in native
+
+
+def test_non_finite_floats_rejected(  ) -> None:
+    """Audit F-16: NaN/Infinity never reach canonical JSON."""
+    record = _record(
+        provider_native=ProviderNative(request={"score": float("nan")})
+    )
+    with pytest.raises(TypeError, match="non-finite"):
+        record.to_json_dict()
+
+
+def test_non_hex_ids_rejected() -> None:
+    """Audit F-16: W3C IDs must be lowercase hex, not merely length-shaped."""
+    with pytest.raises(ValueError, match="hex"):
+        _record(trace_id="z" * 32)
+    with pytest.raises(ValueError, match="hex"):
+        _record(span_id="G" * 16)

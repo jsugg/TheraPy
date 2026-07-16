@@ -122,18 +122,17 @@ def _server(data_dir: Path, log_path: Path) -> Iterator[ServerProcess]:
     }
     process = subprocess.Popen(
         [
+            # owned launcher (obs plan O1.1): bootstrap before app import
             sys.executable,
             "-m",
-            "uvicorn",
-            "therapy.server.app:app",
-            "--host",
-            "127.0.0.1",
-            "--port",
-            str(port),
-            "--log-level",
-            "warning",
+            "therapy.server",
         ],
-        env=environment,
+        env={
+            **environment,
+            "THERAPY_HOST": "127.0.0.1",
+            "THERAPY_PORT": str(port),
+            "THERAPY_LOG_LEVEL": "WARNING",
+        },
         stdout=log_file,
         stderr=subprocess.STDOUT,
     )

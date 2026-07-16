@@ -139,8 +139,20 @@ class InteractionCaptureObserver(BaseObserver):
             elif isinstance(frame, CancelFrame | EndFrame):
                 await self._finish_incomplete("pipeline_stopped")
         except Exception as exc:
-            # Capture failure never breaks the voice path (§5.3 runtime
-            # policy) — it degrades visibly instead.
+            # Runtime mode: capture failure never breaks the voice path
+            # (§5.3) — it degrades visibly. Evaluation mode fails CLOSED:
+            # the capture error propagates and stops the pipeline run.
+            from therapy.observability.capture import (
+                CaptureUnavailable,
+                capture_service,
+            )
+            from therapy.observability.model import CaptureMode
+
+            service = capture_service()
+            if isinstance(exc, CaptureUnavailable) or (
+                service is not None and service.mode is CaptureMode.EVALUATION
+            ):
+                raise
             emit_event(
                 "capture_degraded",
                 severity=logging.ERROR,

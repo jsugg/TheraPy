@@ -23,11 +23,16 @@ def main() -> int:
 
     config = ObservabilityConfig.from_env()
 
-    pipecat_version = "not-installed"
-    try:
-        import importlib.metadata as metadata
+    import importlib.metadata as metadata
 
+    pipecat_version = "not-installed"
+    genai_schema = "none"
+    try:
         pipecat_version = metadata.version("pipecat-ai")
+    except Exception:
+        pass
+    try:
+        genai_schema = metadata.version("opentelemetry-semantic-conventions")
     except Exception:
         pass
 
@@ -39,7 +44,10 @@ def main() -> int:
             "pipecat.version": pipecat_version,
             "capture.mode": config.capture_mode.value,
             "capture.backend": config.interaction_backend,
-            "schema.genai": "none",  # pinned when O2 adds the semconv dep
+            "schema.genai": genai_schema,
+            "capture.enabled": str(
+                config.capture_mode.value != "disabled"
+            ).lower(),
             "config.fingerprint": config.fingerprint(),
         },
     )

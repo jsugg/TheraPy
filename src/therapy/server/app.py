@@ -80,18 +80,37 @@ async def lifespan(app: FastAPI):
 
     scheduler = ProactivityScheduler(_proactivity())
     scheduler_task = asyncio.create_task(scheduler.run(), name="therapy-proactivity")
+    from therapy.observability.logging import emit_event
+
+    emit_event(
+        "app.ready", component="server", operation="lifecycle", outcome="success"
+    )
     try:
         yield
     finally:
         # Shutdown order (plan O1.1): scheduler -> finalizers/gateway ->
         # journal/exporter flush (bounded) -> OTel. Never waits indefinitely.
+        emit_event(
+            "app.stopping", component="server", operation="lifecycle",
+            outcome="success",
+        )
         scheduler.stop()
-        await scheduler_task
+        try:
+            await asyncio.wait_for(scheduler_task, 10.0)
+        except (TimeoutError, asyncio.CancelledError):
+            scheduler_task.cancel()
         gateway, _voice_gateway = _voice_gateway, None
         if gateway is not None:
-            await gateway.close()
+            try:
+                await asyncio.wait_for(gateway.close(), 15.0)
+            except Exception:
+                pass
         await capture_runtime.close()
         telemetry.shutdown()
+        emit_event(
+            "app.stopped", component="server", operation="lifecycle",
+            outcome="success",
+        )
 
 
 app = FastAPI(title="TheraPy", version=__version__, lifespan=lifespan)
@@ -925,11 +944,25 @@ def delete_owner_data(body: DeleteAllRequest) -> dict[str, bool]:
     return {"deleted": True}
 
 
+def _require_acceptance_capture() -> None:
+    """Acceptance routes forbid disabled capture (obs plan §4, O3.1)."""
+    from therapy.observability.capture import capture_service
+    from therapy.observability.model import CaptureMode
+
+    service = capture_service()
+    if service is not None and service.mode is CaptureMode.DISABLED:
+        raise HTTPException(
+            status_code=409,
+            detail="acceptance routes require capture (mode is disabled)",
+        )
+
+
 @app.post("/api/testing/agent/turn")
 async def acceptance_agent_turn(body: AcceptanceAgentTurn) -> dict[str, object]:
     """Run a deterministic production-shaped agent turn in explicit test mode."""
     if os.getenv("THERAPY_TEST_MODE") != "1":
         raise HTTPException(status_code=404, detail="Not found")
+    _require_acceptance_capture()
     try:
         result = await _acceptance_agent().turn(
             body.text,
@@ -947,6 +980,7 @@ def acceptance_proactivity_run(body: AcceptanceOutreachRun) -> dict[str, object]
     """Exercise persistent enqueue/delivery with an explicit acceptance clock."""
     if os.getenv("THERAPY_TEST_MODE") != "1":
         raise HTTPException(status_code=404, detail="Not found")
+    _require_acceptance_capture()
     service = _proactivity()
     try:
         job_id = service.enqueue(

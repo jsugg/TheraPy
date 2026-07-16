@@ -365,10 +365,7 @@ class MultilingualWhisperSTTService(WhisperSTTService):
                 # a hallucination signature (repeated Korean stock phrases
                 # in field testing), not a user switching languages.
                 # Re-decode anchored to the conversation to recover it.
-                logger.debug(
-                    f"Unsupported detection {detected!r}; re-decoding as "
-                    f"{self.current_language}"
-                )
+                logger.debug("stt_unsupported_detection_redecode")
                 text, _, _ = await asyncio.to_thread(
                     _transcribe_utterance,
                     self._model,
@@ -586,7 +583,10 @@ class InputAudioProbe(FrameProcessor):
             self._sumsq += float(np.sum(samples.astype(np.float64) ** 2))
             if self._samples >= self._rate:
                 rms = (self._sumsq / self._samples) ** 0.5
-                logger.debug(f"Input audio: rms={rms:.0f} over {self._samples} samples @{self._rate}Hz")
+                logger.debug(
+                    "input_audio_rms",
+                    extra={"rms": round(rms), "samples": self._samples},
+                )
                 self._samples = 0
                 self._sumsq = 0.0
         await self.push_frame(frame, direction)

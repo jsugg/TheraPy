@@ -140,3 +140,17 @@ def test_restricted_endpoint_never_inferred_from_broad(clean_env) -> None:
     clean_env.setenv("THERAPY_OTLP_BROAD_ENDPOINT", "http://collector:4318")
     config = ObservabilityConfig.from_env()
     assert config.otlp_restricted_endpoint is None
+
+
+def test_journal_rejects_the_actual_product_db(clean_env, tmp_path) -> None:
+    """Audit F-06: therapy.db (the real product DB) is refused by name and
+    by resolved path."""
+    clean_env.setenv("THERAPY_DATA_DIR", str(tmp_path))
+    clean_env.setenv("THERAPY_INTERACTION_JOURNAL", str(tmp_path / "therapy.db"))
+    with pytest.raises(ConfigError):
+        ObservabilityConfig.from_env()
+    clean_env.setenv(
+        "THERAPY_INTERACTION_JOURNAL", str(tmp_path / "sub" / ".." / "therapy.db")
+    )
+    with pytest.raises(ConfigError):
+        ObservabilityConfig.from_env()

@@ -45,6 +45,8 @@ def checksum(payload: dict[str, JsonValue]) -> str:
 
 def _require_json_value(value: object, where: str) -> JsonValue:
     """Boundary validation: reject anything not exactly JSON-shaped."""
+    if isinstance(value, float) and (value != value or value in (float("inf"), float("-inf"))):
+        raise TypeError(f"{where}: non-finite float is not valid JSON")
     if value is None or isinstance(value, str | int | float | bool):
         return value
     if isinstance(value, list | tuple):
@@ -195,8 +197,11 @@ class InteractionRecord:
     turn_id: int | None = None
 
     def __post_init__(self) -> None:
-        if len(self.trace_id) != 32 or len(self.span_id) != 16:
-            raise ValueError("trace_id/span_id must be W3C-shaped hex")
+        hex_digits = set("0123456789abcdef")
+        if len(self.trace_id) != 32 or not set(self.trace_id) <= hex_digits:
+            raise ValueError("trace_id must be 32 lowercase W3C hex digits")
+        if len(self.span_id) != 16 or not set(self.span_id) <= hex_digits:
+            raise ValueError("span_id must be 16 lowercase W3C hex digits")
         if not self.interaction_id:
             raise ValueError("interaction_id required")
         sequences = [event.sequence for event in self.stream]

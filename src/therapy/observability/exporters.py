@@ -144,8 +144,24 @@ class ExportWorker:
                     acknowledged=True,
                     backend_record_id=backend_record_id,
                 )
+                self._observe_export_success()
                 self._note_recovered()
         return attempted
+
+    @staticmethod
+    def _observe_export_success() -> None:
+        import time as _time
+
+        from therapy.observability.telemetry import record_metric
+
+        record_metric(
+            "therapy_llm_capture_last_export_success_unixtime", _time.time()
+        )
+        record_metric(
+            "therapy_llm_capture_records_total",
+            1,
+            {"operation": "reply", "status": "exported"},
+        )
 
     def _attempts_so_far(self, interaction_id: str, backend: str) -> int:
         row = self._store._conn.execute(

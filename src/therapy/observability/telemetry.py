@@ -351,19 +351,35 @@ def link_root(name: str, *, component: str, operation: str, parent_trace_id: str
 
 
 def shutdown(timeout_millis: int = 5000) -> None:
-    """Bounded flush; product shutdown never waits indefinitely (O1.1)."""
-    for owner in (_state.provider, _state.meter_provider):
-        if owner is None:
-            continue
-        try:
-            # both providers flush with their own bounded timeouts
-            getattr(owner, "shutdown", lambda: None)()
-        except Exception:
-            pass
+    """Bounded flush; product shutdown never waits indefinitely (O1.1).
+
+    Provider shutdowns run in a worker thread joined with the given budget —
+    a wedged exporter can leak a daemon thread but can never block exit."""
+    import concurrent.futures
+
+    owners = [o for o in (_state.provider, _state.meter_provider) if o is not None]
     _state.enabled = False
     _state.provider = None
     _state.meter_provider = None
     _state.instruments = {}
+    if not owners:
+        return
+
+    def _shutdown_all() -> None:
+        for owner in owners:
+            try:
+                getattr(owner, "shutdown", lambda: None)()
+            except Exception:
+                pass
+
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    future = executor.submit(_shutdown_all)
+    try:
+        future.result(timeout=timeout_millis / 1000)
+    except concurrent.futures.TimeoutError:
+        pass
+    finally:
+        executor.shutdown(wait=False)
 
 
 class PlaneRoutingSpanProcessor:
@@ -541,11 +557,30 @@ class PhoenixInteractionExporter:
         return row["span_id"]
 
 
+_LOCAL_HOSTS = frozenset(
+    {"localhost", "127.0.0.1", "::1", "phoenix", "collector", "lgtm"}
+)
+
+
 def make_interaction_exporter(config: ObservabilityConfig):
     """The single selected backend adapter, or None for journal-only."""
     if config.interaction_backend != "phoenix":
         return None
     if not config.otlp_restricted_endpoint:
+        return None
+    # Owner remote-export gate (§4): any destination beyond loopback/compose-
+    # internal names requires THERAPY_INTERACTION_REMOTE_EXPORT=1 explicitly.
+    from urllib.parse import urlsplit
+
+    host = urlsplit(config.otlp_restricted_endpoint).hostname or ""
+    if host not in _LOCAL_HOSTS and not config.remote_export_enabled:
+        emit_event(
+            "telemetry.remote_export_gated",
+            severity=logging.WARNING,
+            component="telemetry",
+            operation="backend_adapter",
+            outcome="rejected",
+        )
         return None
     try:
         return PhoenixInteractionExporter(

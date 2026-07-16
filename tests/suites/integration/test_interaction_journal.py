@@ -90,7 +90,7 @@ def test_pragmas_and_schema(store: JournalStore) -> None:
     version = conn.execute(
         "SELECT value FROM journal_metadata WHERE key='schema_version'"
     ).fetchone()[0]
-    assert version == "1"
+    assert version == "2"
 
 
 def test_lifecycle_success_and_idempotent_duplicates(store: JournalStore) -> None:
@@ -373,3 +373,83 @@ def test_kill_during_stream_preserves_prefix(tmp_path: Path) -> None:
     assert loaded["interaction"]["status"] == "incomplete"
     assert len(loaded["events"]) == 4
     second.close()
+
+
+def test_exact_reconstruction_and_tamper_detection(store: JournalStore) -> None:
+    """Audit F-01/F-05: the full §5.2 envelope round-trips; corrupting the
+    canonical row is detected."""
+    record = _record("itx-recon")
+    store.start_attempt(record)
+    store.append_stream_event(
+        "itx-recon", 0, InteractionEventKind.STREAM_DELTA, "t0", {"delta": "he"}
+    )
+    store.finish_success("itx-recon", {"completion": "he"})
+
+    envelope = store.reconstruct("itx-recon")
+    assert envelope is not None
+    assert envelope["session_id"] is None
+    assert envelope["requested_model"] == "claude-opus-4-8"
+    assert envelope["prompt_template_version"] == "v1"
+    assert envelope["language"] == "en"
+    assert envelope["modality"] == "voice"
+    assert envelope["build_version"] == "0.1.0"
+    assert envelope["status"] == "succeeded"
+    assert envelope["request"]["system_instructions"] == "sys"
+    assert [e["delta"] for e in envelope["stream"]] == ["he"]
+    assert envelope["terminal"]["kind"] == "success"
+    assert store.verify_checksums("itx-recon")
+
+    # tampering with the canonical envelope is now visible
+    store._conn.execute(
+        "UPDATE interactions SET canonical_record_json="
+        "replace(canonical_record_json, 'sys', 'TAMPERED') "
+        "WHERE interaction_id='itx-recon'"
+    )
+    assert store.verify_checksums("itx-recon") is False
+
+
+def test_v1_to_v2_migration_flags_legacy_rows(tmp_path: Path) -> None:
+    """Audit: older schemas migrate forward; legacy rows are visible, never
+    silently reconstructed."""
+    path = tmp_path / "legacy.sqlite3"
+    first = JournalStore(path)
+    first.start_attempt(_record("itx-legacy"))
+    first.finish_success("itx-legacy", {"completion": "x"})
+    # simulate a v1 database: drop the v2 column content and version stamp
+    first._conn.execute(
+        "UPDATE interactions SET canonical_record_json='' "
+        "WHERE interaction_id='itx-legacy'"
+    )
+    first._conn.execute(
+        "UPDATE journal_metadata SET value='1' WHERE key='schema_version'"
+    )
+    first._conn.close()
+
+    second = JournalStore(path)
+    version = second._conn.execute(
+        "SELECT value FROM journal_metadata WHERE key='schema_version'"
+    ).fetchone()[0]
+    assert version == "2"
+    with pytest.raises(JournalError, match="legacy v1 row"):
+        second.reconstruct("itx-legacy")
+    second.close()
+
+
+def test_group_commit_is_one_transaction(tmp_path: Path) -> None:
+    """Audit F-14: a batch with a conflicting member rolls back entirely."""
+    store = JournalStore(tmp_path / "batch.sqlite3")
+    store.start_attempt(_record("itx-batch"))
+    store.append_stream_event(
+        "itx-batch", 0, InteractionEventKind.STREAM_DELTA, "t", {"delta": "a"}
+    )
+    items = [
+        ("itx-batch", 1, InteractionEventKind.STREAM_DELTA, "t", {"delta": "b"}),
+        # sequence 0 with DIFFERENT content: a visible conflict
+        ("itx-batch", 0, InteractionEventKind.STREAM_DELTA, "t", {"delta": "X"}),
+    ]
+    with pytest.raises(JournalConflict):
+        store.append_stream_events(items)
+    # the whole batch rolled back: sequence 1 was not persisted
+    events = store.load("itx-batch")["events"]
+    assert [e["sequence"] for e in events] == [0]
+    store.close()

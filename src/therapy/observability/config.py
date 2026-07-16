@@ -119,11 +119,21 @@ class ObservabilityConfig:
         journal_raw = os.environ.get("THERAPY_INTERACTION_JOURNAL", "").strip()
         journal_path = Path(journal_raw) if journal_raw else journal_default
 
-        # The journal must never share a file with the product database
-        # (or any other sqlite file already in use for product data).
-        product_db_names = {"memory.sqlite3", "user_model.sqlite3", "research.sqlite3"}
+        # The journal must never share a file with the product database.
+        # `therapy.db` is THE product DB (MemoryStore/UserModel/research all
+        # open it); compare resolved paths so relative spellings can't slip
+        # past, and keep the name-level guard for other product sqlite files.
+        product_db_names = {"therapy.db", "memory.sqlite3", "user_model.sqlite3",
+                            "research.sqlite3"}
         if journal_path.name in product_db_names:
             raise ConfigError("THERAPY_INTERACTION_JOURNAL must not be a product DB")
+        try:
+            if journal_path.resolve() == (data_dir / "therapy.db").resolve():
+                raise ConfigError(
+                    "THERAPY_INTERACTION_JOURNAL must not be the product DB"
+                )
+        except OSError:
+            pass
 
         raw_mode = os.environ.get("THERAPY_CAPTURE_MODE", "runtime").strip().lower()
         try:

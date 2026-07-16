@@ -391,7 +391,13 @@ def capture_service() -> CaptureService | None:
     return _service
 
 
-async def _health_monitor(store, interval_s: float = 15.0) -> None:
+async def _health_monitor(
+    store,
+    interval_s: float = 15.0,
+    *,
+    retention_days: int = 30,
+    ack_backend: str | None = None,
+) -> None:
     """Owned event-loop lag + capture-health gauges (plan O1.2 item 3, O2.3).
 
     Loop lag is measured as sleep drift — the authoritative signal (plan
@@ -402,12 +408,14 @@ async def _health_monitor(store, interval_s: float = 15.0) -> None:
 
     from therapy.observability.telemetry import record_metric
 
+    tick = 0
     while True:
         started = time.monotonic()
         try:
             await _asyncio.sleep(interval_s)
         except _asyncio.CancelledError:
             return
+        tick += 1
         lag = max(0.0, (time.monotonic() - started) - interval_s)
         record_metric("therapy_event_loop_lag_seconds", lag)
         if store is None:
@@ -416,6 +424,8 @@ async def _health_monitor(store, interval_s: float = 15.0) -> None:
             health = await _asyncio.to_thread(store.health)
         except Exception:
             continue
+        record_metric("therapy_sqlite_wal_bytes", health.wal_bytes,
+                      {"component": "journal"})
         if health.oldest_unexported_at:
             try:
                 oldest = datetime.fromisoformat(health.oldest_unexported_at)
@@ -425,6 +435,38 @@ async def _health_monitor(store, interval_s: float = 15.0) -> None:
                 )
             except ValueError:
                 pass
+        # periodic maintenance off the hot path (§5.3): passive checkpoint
+        # roughly every 10 minutes, retention + integrity check hourly.
+        try:
+            if tick % max(1, int(600 / interval_s)) == 0:
+                await _asyncio.to_thread(store.checkpoint)
+                record_metric(
+                    "therapy_sqlite_checkpoint_last_success_unixtime",
+                    time.time(),
+                    {"component": "journal"},
+                )
+            if tick % max(1, int(3600 / interval_s)) == 0:
+                await _asyncio.to_thread(
+                    store.apply_retention,
+                    retention_days,
+                    require_ack_backend=ack_backend,
+                )
+                if await _asyncio.to_thread(store.integrity_check):
+                    record_metric(
+                        "therapy_sqlite_integrity_last_success_unixtime",
+                        time.time(),
+                        {"component": "journal"},
+                    )
+        except Exception as exc:
+            emit_event(
+                "journal.maintenance_failed",
+                severity=logging.ERROR,
+                component="journal",
+                operation="maintenance",
+                outcome="error",
+                error_type=type(exc).__name__,
+                rate_limited=True,
+            )
 
 
 @dataclass
@@ -531,7 +573,16 @@ async def start_capture(config, *, build_version: str = "0.1.0") -> CaptureRunti
         import asyncio as _asyncio
 
         monitor = _asyncio.create_task(
-            _health_monitor(store), name="observability-health"
+            _health_monitor(
+                store,
+                retention_days=config.retention_days,
+                ack_backend=(
+                    config.interaction_backend
+                    if config.interaction_backend != "journal"
+                    else None
+                ),
+            ),
+            name="observability-health",
         )
 
     return CaptureRuntime(
