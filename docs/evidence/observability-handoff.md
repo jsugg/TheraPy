@@ -9,6 +9,35 @@ findings remediated) and phase 2
 (`.local/obs-needs-impl-plan-phase-02-audit.md`, all three Critical leaks
 closed and verified live; High findings fixed or dispositioned below).
 
+## ⚠️ Phase O3 and O4 audit verdicts (2026-07-16): both FAIL — corrected record
+
+The later cross-model audits returned **FAIL** for both O3
+(`.local/obs-needs-impl-plan-phase-03-audit.md`) and O4
+(`.local/obs-needs-impl-plan-phase-04-audit.md`). Two claims in this
+handoff were wrong and are corrected here:
+
+1. **The client-telemetry rollout claim was false.** `THERAPY_CLIENT_TELEMETRY`
+   was never set on the live instance; the endpoint returned 404 and browser
+   dogfood telemetry was NOT being collected. Fixed 2026-07-16: the flag is
+   set, the endpoint was hardened first (strict types, mandatory same-origin,
+   controlled Content-Length errors, fixed-schema rejection events, complete
+   metric aggregation), and the O4.3 two-week clock counts from this fix,
+   not from the original handoff date.
+2. **The O3 coverage ledger overstated completion** (36/39 claims per the
+   audit): incident-style triggers are not plan-sanctioned deferrals. O3 is
+   reopened; see the amended
+   `docs/evidence/observability-o3-coverage.md` for the remediated-vs-open
+   split. Same-day remediations: behavior-evaluator false-pass elimination
+   (audit Critical), terminal-outcome `owner.audit` events, restricted 0600
+   evaluation reports, sanitized Phoenix CLI errors, TURN
+   healthcheck/scrape/panels, SW zero-client telemetry fallback +
+   registration instrumentation + HTTP-error shell classification.
+
+Remaining reopened scope (O3 instrumentation program, retrieval/tool replay
+harness, §9 alert catalog + firing drills, cross-browser E2E matrix,
+cross-plane browser correlation) is tracked in the coverage ledger and must
+close before any completion claim is repeated.
+
 ## What shipped, by phase
 
 - **O0** — architecture/dependency guards; 54-route policy manifest;
@@ -92,17 +121,20 @@ running; its findings land as follow-up commits like the O0-O2 audits did.
 
 ## Rollout / rollback state
 
-Rollout steps 1-4 and 6 are live (journal → Phoenix export → broad OTel →
-LGTM profile → client endpoint gated by `THERAPY_CLIENT_TELEMETRY`).
+Rollout steps 1-4 are live since 2026-07-16 (journal → Phoenix export →
+broad OTel → LGTM profile). Step 6 (client endpoint) became live only with
+the post-audit fix later the same day: `THERAPY_CLIENT_TELEMETRY=1` is now
+set and verified against the running instance.
 Rollback: `THERAPY_OTEL_ENABLED=0`, `THERAPY_INTERACTION_BACKEND=journal`,
 restart — never delete journal/WAL/backend volumes before capturing
 diagnostics (runbooks). Telemetry rollback touches no product schema.
 
 ## Owner gates still open (named, per plan)
 
-1. **O4.3 two-week dogfood review** — started 2026-07-16; owner reviews
-   capture completeness, evaluator usefulness, false alerts, series counts,
-   storage, CPU/RSS, TTFA, then tunes buckets/thresholds/retention.
+1. **O4.3 two-week dogfood review** — the clock starts 2026-07-16 from the
+   moment the client-telemetry flag was actually enabled (audit F-02); owner
+   reviews capture completeness, evaluator usefulness, false alerts, series
+   counts, storage, CPU/RSS, TTFA, then tunes buckets/thresholds/retention.
 2. **STT fixture review** — WER/CER claims stay disallowed until the owner
    approves the seeded reference transcripts.
 3. **Alert notification channel** — Grafana rules evaluate; the single

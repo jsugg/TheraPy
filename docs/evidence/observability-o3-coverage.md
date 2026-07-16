@@ -3,6 +3,43 @@
 Per plan §7, every O3 surface is **implemented**, **covered** (by an earlier
 phase's artifact), or **deferred** with a named trigger. Date: 2026-07-16.
 
+## ⚠️ Independent-audit status (2026-07-16): O3 gate FAIL — reopened
+
+The cross-model audit (`.local/obs-needs-impl-plan-phase-03-audit.md`) rated
+36 of 39 ledger claims **overstated**: the plan makes O3 surfaces mandatory in
+their assigned phase, and "first incident / first VPS move" triggers are not
+plan-sanctioned deferrals. This ledger's dispositions below are therefore
+**not** evidence of gate compliance; treat every "Deferred/Partially
+implemented/Covered" row as OPEN work unless it appears in the remediated
+list.
+
+**Remediated same day (audit Critical/High/Medium findings):**
+
+- Behavior evaluator no longer auto-passes non-provable safety dimensions;
+  adversarial false-pass probes are now regression tests; corpus extended to
+  the full frozen dimension set; reports carry fixture/response hashes and an
+  evaluator version (audit Critical 1, High 5).
+- `owner.audit` events now emit one terminal bounded outcome AFTER the
+  operation (success/rejected/error) instead of pre-emptive success (Medium 8).
+- Evaluation reports are 0600 and restricted to `.local` without an explicit
+  override; the Phoenix dataset CLI no longer prints raw exception payloads
+  (Medium 9).
+- TURN: real STUN-binding healthcheck, collector Prometheus scrape of
+  internal 9641 into the broad pipeline (with `username` denylisted), and
+  relay/supervision panels on the reliability dashboard (High 7).
+
+**Still open (reopened O3 scope, in plan order):** full per-stage server
+instrumentation (offer stages, turn_audio, deletion stages, readiness
+components), STT/VAD named instruments, prompt/context broad counters,
+persistence/graph/distillation/insight/inspection metrics, OCR/FastEmbed
+instruments, scheduler/web-push lifecycle metrics, DataSovereignty staged
+roots, retrieval/tool boundary manifest + executable replay (High 3), the §9
+alert catalog/SLI panels + firing drills (High 6), fault-injection coverage
+for OCR/embedding/partial-delete/restore/TURN/scheduler-death, and
+success/failure/routing/cardinality tests per new surface (Medium 10).
+Watchdog/hostwatch verification records remain file-based (no metrics path);
+noted on the reliability dashboard.
+
 ## O3.1 server routes
 
 | Surface | Disposition |
