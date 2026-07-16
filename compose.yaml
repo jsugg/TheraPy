@@ -118,7 +118,7 @@ services:
       - "127.0.0.1:3000:3000" # Grafana UI only; OTLP/scrape stay internal
     volumes:
       - lgtm-data:/data
-      - ./deploy/observability/grafana/provisioning/dashboards:/otel-lgtm/grafana/conf/provisioning/dashboards/therapy:ro
+      - ./deploy/observability/grafana/provisioning/dashboards/therapy.yaml:/otel-lgtm/grafana/conf/provisioning/dashboards/therapy.yaml:ro
       - ./deploy/observability/grafana/provisioning/alerting:/otel-lgtm/grafana/conf/provisioning/alerting:ro
       - ./deploy/observability/dashboards:/var/lib/grafana/dashboards/therapy:ro
     mem_limit: 1500m
