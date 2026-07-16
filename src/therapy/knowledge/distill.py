@@ -22,6 +22,7 @@ from therapy.knowledge.schema import (
 )
 from therapy.knowledge.user_model import GraphQuote, UserModel
 from therapy.memory.summarizer import complete, render_transcript
+from therapy.observability.model import InteractionOperation
 
 EXTRACTOR_VERSION = "phase4-distill-v2"
 MAX_CANDIDATES = 100
@@ -303,7 +304,9 @@ async def extract_candidates(transcript: str, observations: list[str]) -> list[R
         body += "\n\nSession observations:\n" + "\n".join(
             f"- {item}" for item in observations
         )
-    raw = await complete(system, body, max_tokens=1_500)
+    raw = await complete(
+        system, body, max_tokens=1_500, operation=InteractionOperation.DISTILL
+    )
     return parse_candidates(raw)
 
 
@@ -321,7 +324,11 @@ async def judge_candidate(
         },
         ensure_ascii=False,
     )
-    answer = (await complete(JUDGMENT_PROMPT, body, max_tokens=8)).strip().casefold()
+    answer = (
+        await complete(
+            JUDGMENT_PROMPT, body, max_tokens=8, operation=InteractionOperation.JUDGE
+        )
+    ).strip().casefold()
     return answer == "yes"
 
 

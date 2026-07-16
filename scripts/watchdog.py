@@ -18,9 +18,9 @@ import urllib.request
 from collections.abc import Callable
 from types import FrameType
 
-DEFAULT_CMD = (
-    "uv run --no-dev uvicorn therapy.server.app:app --host 0.0.0.0 --port 8000"
-)
+# `-m therapy.server` bootstraps JSON logging + the owned OTel provider
+# BEFORE the FastAPI app imports (observability plan O1.1).
+DEFAULT_CMD = "uv run --no-dev python -m therapy.server"
 DEFAULT_URL = "http://127.0.0.1:8000/health"
 DEFAULT_INTERVAL = 15.0
 DEFAULT_TIMEOUT = 10.0

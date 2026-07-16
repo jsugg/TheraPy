@@ -24,6 +24,7 @@ from therapy.knowledge.user_model import (
     _tokens,
 )
 from therapy.memory.summarizer import complete, render_transcript
+from therapy.observability.model import InteractionOperation
 
 type Recapper = Callable[[str], Awaitable[str]]
 type InsightState = Literal[
@@ -584,7 +585,12 @@ async def session_recap(
     return (
         await recapper(transcript)
         if recapper is not None
-        else await complete(RECAP_PROMPT, transcript, max_tokens=160)
+        else await complete(
+            RECAP_PROMPT,
+            transcript,
+            max_tokens=160,
+            operation=InteractionOperation.RECAP,
+        )
     )
 
 

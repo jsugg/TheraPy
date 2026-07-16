@@ -1,0 +1,142 @@
+"""Canonical record schema contract (plan §5.2, O1 test list).
+
+Covers boundary validation, canonical serialization determinism, checksum
+stability, stream ordering, and a deterministic fuzz loop over malformed
+payloads — arbitrary objects must never slip into the `json-v1` shape.
+"""
+
+import json
+import random
+
+import pytest
+
+from therapy.observability.interactions import (
+    InteractionRecord,
+    InteractionRequest,
+    InteractionResponse,
+    Message,
+    ProviderNative,
+    StreamEvent,
+    canonical_json,
+    checksum,
+)
+from therapy.observability.model import (
+    InteractionOperation,
+    InteractionStatus,
+    Provider,
+)
+
+
+def _record(**overrides) -> InteractionRecord:
+    base = dict(
+        interaction_id="itx-test-0001",
+        trace_id="a" * 32,
+        span_id="b" * 16,
+        operation=InteractionOperation.SUMMARY,
+        provider=Provider.OLLAMA,
+        requested_model="m",
+        actual_model="m",
+        prompt_template_version="v1",
+        request=InteractionRequest(
+            system_instructions="sys",
+            messages=(Message(role="user", content="hello"),),
+        ),
+        response=InteractionResponse(completion="world"),
+        stream=(StreamEvent(sequence=0, observed_at="t0", delta="wor"),
+                StreamEvent(sequence=1, observed_at="t1", delta="ld")),
+        error=None,
+        provider_native=ProviderNative(request={"model": "m"}),
+        language="en",
+        modality="text",
+        build_version="0.1.0",
+        policy_version="p1",
+        config_version="c1",
+        started_at="2026-07-15T00:00:00+00:00",
+        completed_at="2026-07-15T00:00:01+00:00",
+        status=InteractionStatus.SUCCEEDED,
+    )
+    base.update(overrides)
+    return InteractionRecord(**base)
+
+
+def test_to_json_dict_round_trips_and_is_canonical() -> None:
+    record = _record()
+    payload = record.to_json_dict()
+    assert payload["operation"] == "summary"
+    assert payload["provider"] == "ollama"
+    assert payload["status"] == "succeeded"
+    assert payload["request"]["messages"][0] == {"role": "user", "content": "hello"}
+    # canonical serialization is deterministic and key-sorted
+    assert canonical_json(payload) == canonical_json(json.loads(record.canonical()))
+    assert record.checksum() == checksum(payload)
+
+
+def test_checksum_changes_with_content() -> None:
+    first = _record().checksum()
+    second = _record(response=InteractionResponse(completion="tampered")).checksum()
+    assert first != second
+
+
+def test_malformed_ids_rejected() -> None:
+    with pytest.raises(ValueError, match="W3C"):
+        _record(trace_id="short")
+    with pytest.raises(ValueError, match="W3C"):
+        _record(span_id="tiny")
+    with pytest.raises(ValueError, match="interaction_id"):
+        _record(interaction_id="")
+
+
+def test_stream_ordering_enforced() -> None:
+    events = (
+        StreamEvent(sequence=1, observed_at="t", delta="a"),
+        StreamEvent(sequence=0, observed_at="t", delta="b"),
+    )
+    with pytest.raises(ValueError, match="strictly increasing"):
+        _record(stream=events)
+    duplicated = (
+        StreamEvent(sequence=0, observed_at="t", delta="a"),
+        StreamEvent(sequence=0, observed_at="t", delta="b"),
+    )
+    with pytest.raises(ValueError, match="strictly increasing"):
+        _record(stream=duplicated)
+
+
+def test_non_json_values_rejected_at_the_boundary() -> None:
+    record = _record(
+        provider_native=ProviderNative(request={"weird": object()})  # type: ignore[dict-item]
+    )
+    with pytest.raises(TypeError, match="not JSON-serializable"):
+        record.to_json_dict()
+
+
+def test_fuzz_loop_never_accepts_undeclared_shapes() -> None:
+    """Deterministic fuzz: random junk inside native envelopes must either
+    serialize as pure JSON or raise TypeError — never pass through as-is."""
+    rng = random.Random(20260715)
+    junk_factory = [
+        lambda: object(),
+        lambda: {1: "non-string-key"},
+        lambda: {"nested": {"deep": object()}},
+        lambda: [object()],
+        lambda: {"x": bytes(3)},
+    ]
+    for _ in range(200):
+        junk = rng.choice(junk_factory)()
+        record = _record(
+            provider_native=ProviderNative(request={"payload": junk})  # type: ignore[dict-item]
+        )
+        with pytest.raises(TypeError):
+            record.to_json_dict()
+
+
+def test_provider_native_extra_flattens_into_envelope() -> None:
+    record = _record(
+        provider_native=ProviderNative(
+            request={"model": "m"},
+            extra={"generation_id": "gen-1", "fallback_attempts": 2},
+        )
+    )
+    native = record.to_json_dict()["provider_native"]
+    assert native["generation_id"] == "gen-1"
+    assert native["fallback_attempts"] == 2
+    assert "extra" not in native

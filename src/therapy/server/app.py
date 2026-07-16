@@ -68,17 +68,30 @@ _voice_gateway: VoiceGateway | None = None
 async def lifespan(app: FastAPI):
     global _voice_gateway
     from therapy.dialogue.outreach import ProactivityScheduler
+    from therapy.observability import telemetry
+    from therapy.observability.capture import start_capture
+    from therapy.observability.config import ObservabilityConfig
+
+    # Interaction capture (plan O1.1/O1.2): journal opens and recovers before
+    # any LLM boundary can run; failure degrades visibly, never blocks start.
+    capture_runtime = await start_capture(
+        ObservabilityConfig.from_env(), build_version=__version__
+    )
 
     scheduler = ProactivityScheduler(_proactivity())
     scheduler_task = asyncio.create_task(scheduler.run(), name="therapy-proactivity")
     try:
         yield
     finally:
+        # Shutdown order (plan O1.1): scheduler -> finalizers/gateway ->
+        # journal/exporter flush (bounded) -> OTel. Never waits indefinitely.
         scheduler.stop()
         await scheduler_task
         gateway, _voice_gateway = _voice_gateway, None
         if gateway is not None:
             await gateway.close()
+        await capture_runtime.close()
+        telemetry.shutdown()
 
 
 app = FastAPI(title="TheraPy", version=__version__, lifespan=lifespan)

@@ -8,6 +8,7 @@ re-statements reinforce (occurrence counts), never duplicate.
 """
 
 from therapy.memory.summarizer import complete, render_transcript
+from therapy.observability.model import InteractionOperation
 
 FACTS_PROMPT = """From the session transcript, list the distinctive, stable
 personal facts about the user worth remembering across conversations: names
@@ -35,5 +36,10 @@ async def distill_facts(turns: list[dict[str, object]]) -> list[str]:
     """Extract user-model v1 facts from a session's turns."""
     if not turns:
         return []
-    raw = await complete(FACTS_PROMPT, render_transcript(turns), max_tokens=300)
+    raw = await complete(
+        FACTS_PROMPT,
+        render_transcript(turns),
+        max_tokens=300,
+        operation=InteractionOperation.DISTILL,
+    )
     return parse_facts(raw)

@@ -13,6 +13,20 @@ from typing import Protocol
 
 import httpx
 
+from therapy.observability.capture import capture_service
+from therapy.observability.interactions import (
+    InteractionError,
+    InteractionRequest,
+    InteractionResponse,
+    Message,
+)
+from therapy.observability.model import (
+    InteractionEventKind,
+    InteractionOperation,
+    Provider,
+    normalize_enum,
+)
+
 SUMMARY_PROMPT = """Distill the session transcript into a compact English summary.
 Write plain prose for a future conversation to rely on, using at most about
 eight sentences. Capture the topics discussed, the user's emotional state,
@@ -60,6 +74,7 @@ async def entitle(turns: Sequence[Mapping[str, object]]) -> str | None:
         ),
         render_transcript(turns),
         max_tokens=40,
+        operation=InteractionOperation.TITLE,
     )
     return clean_title(raw)
 
@@ -95,56 +110,215 @@ async def complete(
     model: str | None = None,
     base_url: str | None = None,
     max_tokens: int = 500,
+    operation: InteractionOperation = InteractionOperation.SUMMARY,
+    session_id: str | None = None,
+    turn_id: int | None = None,
 ) -> str:
     """One non-streaming completion against the configured provider.
 
     Shared by summarization and fact distillation — both are offline,
     single-shot calls that must not depend on the realtime pipeline.
+
+    Every attempt is captured through the interaction journal BEFORE
+    dispatch (plan O1.3); `operation` defaults to SUMMARY only for direct
+    compatibility callers — production callers pass it explicitly.
     """
     provider = (provider or os.environ.get("THERAPY_LLM", "anthropic")).lower()
     if provider == "anthropic":
-        from anthropic import AsyncAnthropic
-
-        message = await AsyncAnthropic().messages.create(
-            model=model or "claude-opus-4-8",
-            max_tokens=max_tokens,
-            system=system,
-            messages=[{"role": "user", "content": user}],
-        )
-        parts = [getattr(block, "text", "") or "" for block in message.content]
-        return "".join(parts).strip()
-
-    if provider == "ollama":
+        resolved_model = model or "claude-opus-4-8"
+    elif provider == "ollama":
         base_url = (
             base_url
             or os.environ.get("OLLAMA_BASE_URL")
             or "http://localhost:11434/v1"
         )
-        headers = None
-        default_model = "pedrolucas/smollm3:3b-q4_k_m"
+        resolved_model = (
+            model or os.environ.get("THERAPY_LLM_MODEL") or "pedrolucas/smollm3:3b-q4_k_m"
+        )
     elif provider == "openrouter":
         base_url = base_url or "https://openrouter.ai/api/v1"
-        headers = {"Authorization": f"Bearer {os.environ['OPENROUTER_API_KEY']}"}
-        default_model = "openrouter/free"
+        resolved_model = (
+            model or os.environ.get("THERAPY_LLM_MODEL") or "openrouter/free"
+        )
     else:
         raise ValueError(f"Unknown THERAPY_LLM provider: {provider!r}")
 
-    async with httpx.AsyncClient(timeout=120.0) as client:
-        response = await client.post(
-            f"{base_url.rstrip('/')}/chat/completions",
-            json={
-                "model": model or os.environ.get("THERAPY_LLM_MODEL") or default_model,
-                "messages": [
-                    {"role": "system", "content": system},
-                    {"role": "user", "content": user},
-                ],
-                "stream": False,
-            },
-            headers=headers,
+    handle = None
+    service = capture_service()
+    if service is not None:
+        request = InteractionRequest(
+            system_instructions=system,
+            messages=(Message(role="user", content=user),),
+            parameters={"max_tokens": max_tokens},
         )
-    response.raise_for_status()
-    content = response.json()["choices"][0]["message"]["content"]
-    return str(content).strip()
+        provider_request: dict[str, object] = {
+            "model": resolved_model,
+            "max_tokens": max_tokens,
+            "system": system,
+            "messages": [{"role": "user", "content": user}],
+            "stream": False,
+        }
+        handle = await service.start_attempt(
+            operation=operation,
+            provider=normalize_enum(provider, Provider, Provider.UNKNOWN),
+            requested_model=resolved_model,
+            request=request,
+            provider_request=provider_request,  # type: ignore[arg-type]
+            session_id=session_id,
+            turn_id=turn_id,
+        )
+
+    if provider == "anthropic":
+        return await _complete_anthropic(
+            system, user, resolved_model, max_tokens, handle
+        )
+    assert base_url is not None  # both non-anthropic branches set it above
+    return await _complete_openai_style(
+        system, user, resolved_model, base_url, provider, handle
+    )
+
+
+async def _complete_anthropic(
+    system: str, user: str, model: str, max_tokens: int, handle
+) -> str:
+    from anthropic import APIError, AsyncAnthropic
+
+    try:
+        message = await AsyncAnthropic().messages.create(
+            model=model,
+            max_tokens=max_tokens,
+            system=system,
+            messages=[{"role": "user", "content": user}],
+        )
+    except APIError as exc:
+        if handle is not None:
+            await handle.fail(
+                InteractionError(
+                    http_status=getattr(exc, "status_code", None),
+                    provider_type=getattr(exc, "type", None) or type(exc).__name__,
+                    provider_code=None,
+                    provider_error_body=getattr(exc, "body", None)
+                    and str(exc.body),
+                    retry_attempt=0,
+                    provider_request_id=getattr(exc, "request_id", None),
+                )
+            )
+        raise
+    except Exception as exc:
+        if handle is not None:
+            await handle.fail(
+                InteractionError(
+                    http_status=None,
+                    provider_type=type(exc).__name__,
+                    provider_code=None,
+                    provider_error_body=None,
+                    retry_attempt=0,
+                    provider_request_id=None,
+                ),
+                finish_class="transport_error",
+            )
+        raise
+    parts = [getattr(block, "text", "") or "" for block in message.content]
+    completion = "".join(parts).strip()
+    if handle is not None:
+        usage = message.usage.model_dump() if message.usage else None
+        native = message.model_dump(mode="json")
+        await handle.record_event(
+            InteractionEventKind.PROVIDER_EVENT, {"response": native}
+        )
+        await handle.succeed(
+            InteractionResponse(
+                messages=(Message(role="assistant", content=completion),),
+                completion=completion,
+                finish_reason=message.stop_reason,
+                usage=usage,
+            ),
+            native_terminal={
+                "id": message.id,
+                "stop_reason": message.stop_reason,
+                "usage": usage,
+            },
+        )
+    return completion
+
+
+async def _complete_openai_style(
+    system: str,
+    user: str,
+    model: str,
+    base_url: str,
+    provider: str,
+    handle,
+) -> str:
+    headers = None
+    if provider == "openrouter":
+        headers = {"Authorization": f"Bearer {os.environ['OPENROUTER_API_KEY']}"}
+    try:
+        async with httpx.AsyncClient(timeout=120.0) as client:
+            response = await client.post(
+                f"{base_url.rstrip('/')}/chat/completions",
+                json={
+                    "model": model,
+                    "messages": [
+                        {"role": "system", "content": system},
+                        {"role": "user", "content": user},
+                    ],
+                    "stream": False,
+                },
+                headers=headers,
+            )
+        response.raise_for_status()
+    except httpx.HTTPStatusError as exc:
+        if handle is not None:
+            await handle.fail(
+                InteractionError(
+                    http_status=exc.response.status_code,
+                    provider_type="http_error",
+                    provider_code=str(exc.response.status_code),
+                    provider_error_body=exc.response.text[:100_000],
+                    retry_attempt=0,
+                    provider_request_id=None,
+                ),
+                finish_class=(
+                    "rate_limit" if exc.response.status_code == 429 else "provider_error"
+                ),
+            )
+        raise
+    except httpx.HTTPError as exc:
+        if handle is not None:
+            await handle.fail(
+                InteractionError(
+                    http_status=None,
+                    provider_type=type(exc).__name__,
+                    provider_code=None,
+                    provider_error_body=None,
+                    retry_attempt=0,
+                    provider_request_id=None,
+                ),
+                finish_class="transport_error",
+            )
+        raise
+    body = response.json()
+    content = str(body["choices"][0]["message"]["content"]).strip()
+    if handle is not None:
+        await handle.record_event(
+            InteractionEventKind.PROVIDER_EVENT, {"response": body}
+        )
+        await handle.succeed(
+            InteractionResponse(
+                messages=(Message(role="assistant", content=content),),
+                completion=content,
+                finish_reason=body["choices"][0].get("finish_reason"),
+                usage=body.get("usage"),
+            ),
+            native_terminal={
+                "id": body.get("id"),
+                "model": body.get("model"),
+                "finish_reason": body["choices"][0].get("finish_reason"),
+                "usage": body.get("usage"),
+            },
+        )
+    return content
 
 
 class LLMSummarizer:
@@ -170,6 +344,7 @@ class LLMSummarizer:
             provider=self._provider,
             model=self._model,
             base_url=self._base_url,
+            operation=InteractionOperation.SUMMARY,
         )
 
 
