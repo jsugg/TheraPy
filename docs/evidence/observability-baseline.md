@@ -153,6 +153,16 @@ ACK-recorded against journaled IDs.
 
 ## 3. Remaining measurements (named deferrals)
 
+**Owner-visible phase-ordering deviation (2026-07-16, per audit F-07):**
+the O0.4 contract listed restore duration, event-loop lag, and TTFA stage
+decomposition. Event-loop lag is now measured continuously by the owned
+monitor whenever broad telemetry is on (O2). Restore duration and per-stage
+TTFA require the isolated O3 environment and O3 stage instrumentation
+respectively; they proceed under those phases rather than blocking O1/O2
+rollout, and this note is the recorded decision. STT fixture review status
+remains `seeded` until the owner reviews the reference transcripts — WER/CER
+claims stay disallowed until then (plan O3.4).
+
 - **Data restore duration:** destructive against the live owner volume;
   measured in the isolated disposable environment during O3 alert drills.
 - **Event-loop lag / TTFA stage decomposition:** requires O1/O2 owned

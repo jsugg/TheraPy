@@ -183,13 +183,20 @@ async def _complete_anthropic(
 ) -> str:
     from anthropic import APIError, AsyncAnthropic
 
+    request_id: str | None = None
+    retries_taken = 0
     try:
-        message = await AsyncAnthropic().messages.create(
+        # raw response: the allowlisted `request-id` header and SDK retry
+        # count are explicitly parsed fields (§5.2) — never raw headers.
+        raw = await AsyncAnthropic().messages.with_raw_response.create(
             model=model,
             max_tokens=max_tokens,
             system=system,
             messages=[{"role": "user", "content": user}],
         )
+        request_id = raw.headers.get("request-id")
+        retries_taken = int(getattr(raw, "retries_taken", 0) or 0)
+        message = raw.parse()
     except APIError as exc:
         if handle is not None:
             await handle.fail(
@@ -237,6 +244,8 @@ async def _complete_anthropic(
                 "id": message.id,
                 "stop_reason": message.stop_reason,
                 "usage": usage,
+                "request_id": request_id,
+                "sdk_retries_taken": retries_taken,
             },
         )
     return completion

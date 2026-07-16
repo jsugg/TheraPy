@@ -98,3 +98,25 @@ verify-longitudinal-loop: ## Verify longitudinal self-knowledge loop (host, isol
 
 .PHONY: check
 check: lint test-fast ## Fast pre-push gate: lint + framework-free tests (host)
+
+# --- observability gate tooling (obs plan §11) -------------------------------
+
+.PHONY: obs-canary-scan
+obs-canary-scan: ## Routing/secret canary gate over the fixture corpus
+	$(VENV)/python scripts/observability/canary_scan.py fixtures
+
+.PHONY: obs-fixture-hash
+obs-fixture-hash: ## Reproducible identity of the observability fixture corpus
+	$(VENV)/python scripts/observability/fixture_hash.py
+
+.PHONY: obs-baseline
+obs-baseline: ## Telemetry-off/on workload baseline against a running instance
+	$(VENV)/python scripts/observability/baseline.py --label off
+
+.PHONY: obs-dashboards
+obs-dashboards: ## Regenerate the six Grafana dashboards deterministically
+	$(VENV)/python scripts/observability/gen_dashboards.py
+
+.PHONY: obs-fixtures
+obs-fixtures: ## Regenerate golden interaction fixtures + canaries
+	$(VENV)/python scripts/observability/gen_interaction_fixtures.py
