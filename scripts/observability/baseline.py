@@ -61,11 +61,12 @@ def _dist(samples: list[float]) -> dict[str, float]:
 
 
 class StatsSampler(threading.Thread):
-    """Samples `docker stats` for the therapy container until stopped."""
+    """Samples `docker stats` for one container (name substring) until stopped."""
 
-    def __init__(self, interval: float = 2.0) -> None:
+    def __init__(self, interval: float = 2.0, container: str = "therapy-therapy") -> None:
         super().__init__(daemon=True)
         self.interval = interval
+        self.container = container
         self.samples: list[dict[str, float]] = []
         self._halt = threading.Event()
 
@@ -83,9 +84,7 @@ class StatsSampler(threading.Thread):
                 ).stdout
                 for line in out.splitlines():
                     parts = line.split()
-                    if len(parts) < 3 or "therapy" not in parts[0]:
-                        continue
-                    if "turn" in parts[0]:
+                    if len(parts) < 3 or self.container not in parts[0]:
                         continue
                     cpu = float(parts[1].rstrip("%"))
                     raw_mem = parts[2]
@@ -265,6 +264,8 @@ def main() -> int:
     parser.add_argument("--agent-turns", type=int, default=5)
     parser.add_argument("--skip-llm", action="store_true",
                         help="skip agent-turn/scheduler workloads entirely")
+    parser.add_argument("--container", default="therapy-therapy",
+                        help="docker stats name substring to sample")
     args = parser.parse_args()
 
     report: dict[str, object] = {
@@ -273,7 +274,7 @@ def main() -> int:
         "server": args.server,
     }
 
-    idle = StatsSampler()
+    idle = StatsSampler(container=args.container)
     idle.start()
     time.sleep(args.idle_seconds)
     idle_samples = idle.stop()
@@ -282,7 +283,7 @@ def main() -> int:
         "rss_bytes": _dist([s["rss_bytes"] for s in idle_samples]),
     }
 
-    load = StatsSampler()
+    load = StatsSampler(container=args.container)
     load.start()
     with httpx.Client(timeout=60.0) as client:
         workloads = Workloads(client, args.server)

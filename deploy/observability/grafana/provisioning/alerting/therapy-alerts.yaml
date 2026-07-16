@@ -1,0 +1,159 @@
+# Initial alert rules (obs plan §9): consecutive-event/absolute symptoms
+# only; thresholds tuned after the O4 dogfood baseline. Content, product
+# IDs, session counts, insight decisions, and engagement proxies are never
+# alert inputs. Every group has a runbook in deploy/observability/runbooks.
+apiVersion: 1
+groups:
+  - orgId: 1
+    name: therapy-capture
+    folder: TheraPy
+    interval: 1m
+    rules:
+      - uid: capture-journal-degraded
+        title: Interaction journal pre-dispatch failures
+        condition: C
+        for: 2m
+        annotations:
+          runbook: deploy/observability/runbooks/capture.md
+          summary: LLM attempts are failing to journal before dispatch.
+        labels: {severity: critical, group: capture}
+        data:
+          - refId: A
+            relativeTimeRange: {from: 600, to: 0}
+            datasourceUid: prometheus
+            model:
+              expr: sum(rate(therapy_llm_capture_records_total{status="failed"}[5m]))
+              refId: A
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              expression: A
+              conditions:
+                - evaluator: {type: gt, params: [0]}
+              refId: C
+      - uid: capture-export-backlog
+        title: Restricted export backlog age
+        condition: C
+        for: 15m
+        annotations:
+          runbook: deploy/observability/runbooks/capture.md
+          summary: Oldest unexported interaction is older than 1h.
+        labels: {severity: warning, group: capture}
+        data:
+          - refId: A
+            relativeTimeRange: {from: 600, to: 0}
+            datasourceUid: prometheus
+            model:
+              expr: time() - therapy_llm_capture_oldest_unexported_unixtime
+              refId: A
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              expression: A
+              conditions:
+                - evaluator: {type: gt, params: [3600]}
+              refId: C
+      - uid: routing-violation
+        title: Broad routing violation (content/forbidden key or unknown scope)
+        condition: C
+        for: 0m
+        annotations:
+          runbook: deploy/observability/runbooks/capture.md
+          summary: A span attribute or scope was dropped by the broad-plane guard — routing bug.
+        labels: {severity: critical, group: capture}
+        data:
+          - refId: A
+            relativeTimeRange: {from: 600, to: 0}
+            datasourceUid: prometheus
+            model:
+              expr: sum(rate(therapy_broad_span_drops_total{reason=~"forbidden_attribute|unknown_scope"}[5m]))
+              refId: A
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              expression: A
+              conditions:
+                - evaluator: {type: gt, params: [0]}
+              refId: C
+  - orgId: 1
+    name: therapy-availability
+    folder: TheraPy
+    interval: 1m
+    rules:
+      - uid: voice-negotiation-failures
+        title: Three consecutive voice negotiation failures
+        condition: C
+        for: 3m
+        annotations:
+          runbook: deploy/observability/runbooks/availability.md
+          summary: Voice connections are failing repeatedly.
+        labels: {severity: critical, group: availability}
+        data:
+          - refId: A
+            relativeTimeRange: {from: 600, to: 0}
+            datasourceUid: prometheus
+            model:
+              expr: sum(increase(therapy_voice_connections_total{outcome="error"}[5m]))
+              refId: A
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              expression: A
+              conditions:
+                - evaluator: {type: gt, params: [2]}
+              refId: C
+      - uid: scheduler-heartbeat-stale
+        title: Proactivity scheduler heartbeat older than 2x interval
+        condition: C
+        for: 5m
+        annotations:
+          runbook: deploy/observability/runbooks/availability.md
+          summary: The scheduler has stopped ticking.
+        labels: {severity: warning, group: availability}
+        data:
+          - refId: A
+            relativeTimeRange: {from: 600, to: 0}
+            datasourceUid: prometheus
+            model:
+              expr: time() - therapy_proactivity_scheduler_last_tick_unixtime
+              refId: A
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              expression: A
+              conditions:
+                - evaluator: {type: gt, params: [120]}
+              refId: C
+  - orgId: 1
+    name: therapy-resources
+    folder: TheraPy
+    interval: 1m
+    rules:
+      - uid: event-loop-lag
+        title: Event-loop lag p95 over 500ms
+        condition: C
+        for: 10m
+        annotations:
+          runbook: deploy/observability/runbooks/resources.md
+          summary: The asyncio loop is materially delayed; voice quality degrades first.
+        labels: {severity: warning, group: resources}
+        data:
+          - refId: A
+            relativeTimeRange: {from: 600, to: 0}
+            datasourceUid: prometheus
+            model:
+              expr: histogram_quantile(0.95, sum(rate(therapy_event_loop_lag_seconds_bucket[5m])) by (le))
+              refId: A
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              expression: A
+              conditions:
+                - evaluator: {type: gt, params: [0.5]}
+              refId: C

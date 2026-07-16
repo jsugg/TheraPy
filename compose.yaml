@@ -83,6 +83,46 @@ services:
       - phoenix-data:/mnt/data
     mem_limit: 1g
 
+  # --- opt-in broad-plane dev/test stack (obs plan O2.4; NOT production) ---
+  # `docker compose --profile observability up -d` starts a pinned isolated
+  # collector (two pipelines + file_storage WAL) and the disposable
+  # grafana/otel-lgtm all-in-one. UI is loopback-only; OTLP stays internal.
+  # First run only — both images are non-root, so seed volume ownership:
+  #   docker run --rm -v therapy_collector-wal:/w alpine chown -R 10001:10001 /w
+  #   docker run --rm -v therapy_phoenix-data:/d alpine chown -R 65532:65532 /d
+  collector:
+    image: otel/opentelemetry-collector-contrib:0.156.0
+    profiles: ["observability"]
+    restart: unless-stopped
+    logging:
+      driver: local
+      options:
+        max-size: "10m"
+        max-file: "3"
+    command: ["--config=/etc/otelcol/collector.yaml"]
+    volumes:
+      - ./deploy/observability/collector.yaml:/etc/otelcol/collector.yaml:ro
+      - collector-wal:/var/lib/otelcol
+    mem_limit: 256m
+
+  lgtm:
+    image: grafana/otel-lgtm:0.29.0
+    profiles: ["observability"]
+    restart: unless-stopped
+    logging:
+      driver: local
+      options:
+        max-size: "10m"
+        max-file: "3"
+    ports:
+      - "127.0.0.1:3000:3000" # Grafana UI only; OTLP/scrape stay internal
+    volumes:
+      - lgtm-data:/data
+      - ./deploy/observability/grafana/provisioning/dashboards:/otel-lgtm/grafana/conf/provisioning/dashboards/therapy:ro
+      - ./deploy/observability/grafana/provisioning/alerting:/otel-lgtm/grafana/conf/provisioning/alerting:ro
+      - ./deploy/observability/dashboards:/var/lib/grafana/dashboards/therapy:ro
+    mem_limit: 1500m
+
   turn:
     image: coturn/coturn:4.6
     restart: unless-stopped
@@ -112,3 +152,5 @@ volumes:
   therapy-data:
   model-cache:
   phoenix-data:
+  collector-wal:
+  lgtm-data:

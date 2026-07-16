@@ -30,6 +30,14 @@ from pipecat.frames.frames import (
     LLMFullResponseEndFrame,
     LLMFullResponseStartFrame,
     LLMTextFrame,
+    MetricsFrame,
+)
+from pipecat.metrics.metrics import (
+    LLMUsageMetricsData,
+    ProcessingMetricsData,
+    TTFAMetricsData,
+    TTFBMetricsData,
+    TTSUsageMetricsData,
 )
 from pipecat.observers.base_observer import BaseObserver, FramePushed
 
@@ -203,6 +211,98 @@ class InteractionCaptureObserver(BaseObserver):
         await handle.incomplete(reason)
 
 
+class MetricsFrameAdapter(BaseObserver):
+    """Translate Pipecat `MetricsFrame` payloads to owned instruments (O2.3).
+
+    Consumes the signal `PipelineParams(enable_metrics=True)` already emits —
+    no parallel Pipecat metric system. Values that owned code already
+    represents (the TTFAMonitor broad event) are recorded here exactly once
+    as histograms; processor class names map to a bounded component set and
+    are never used as raw labels.
+    """
+
+    _COMPONENT_HINTS = (
+        ("llm", "llm"),
+        ("tts", "tts"),
+        ("stt", "stt"),
+        ("whisper", "stt"),
+        ("kokoro", "tts"),
+    )
+
+    def _component(self, processor: str) -> str:
+        lowered = processor.lower()
+        for hint, component in self._COMPONENT_HINTS:
+            if hint in lowered:
+                return component
+        return "unknown"
+
+    async def on_push_frame(self, data: FramePushed) -> None:
+        frame = data.frame
+        if not isinstance(frame, MetricsFrame):
+            return
+        from therapy.observability.telemetry import record_metric
+
+        for item in frame.data:
+            processor = getattr(item, "processor", "") or ""
+            component = self._component(processor)
+            try:
+                if isinstance(item, TTFBMetricsData):
+                    if component == "llm":
+                        record_metric(
+                            "therapy_llm_time_to_first_token_seconds",
+                            item.value,
+                            {
+                                "provider": _env_provider(),
+                                "operation": "reply",
+                                "outcome": "success",
+                            },
+                        )
+                    elif component == "tts":
+                        record_metric(
+                            "therapy_tts_time_to_first_audio_seconds",
+                            item.value,
+                            {"language_group": "unknown", "outcome": "success"},
+                        )
+                elif isinstance(item, TTFAMetricsData):
+                    record_metric(
+                        "therapy_turn_ttfa_seconds",
+                        item.ttfa,
+                        {"provider": _env_provider(), "mode": "warm"},
+                    )
+                elif isinstance(item, LLMUsageMetricsData):
+                    usage = item.value
+                    record_metric(
+                        "therapy_llm_input_tokens_total",
+                        getattr(usage, "prompt_tokens", 0) or 0,
+                        {"provider": _env_provider(), "operation": "reply"},
+                    )
+                    record_metric(
+                        "therapy_llm_output_tokens_total",
+                        getattr(usage, "completion_tokens", 0) or 0,
+                        {"provider": _env_provider(), "operation": "reply"},
+                    )
+                elif isinstance(item, TTSUsageMetricsData):
+                    record_metric(
+                        "therapy_tts_characters_total",
+                        item.value,
+                        {"language_group": "unknown"},
+                    )
+                elif isinstance(item, ProcessingMetricsData) and component != "unknown":
+                    record_metric(
+                        "therapy_turn_stage_duration_seconds",
+                        item.value,
+                        {"stage": component, "outcome": "success"},
+                    )
+            except Exception:
+                continue  # metric translation must never disturb the pipeline
+
+
+def _env_provider() -> str:
+    import os
+
+    return os.environ.get("THERAPY_LLM", "anthropic")
+
+
 def build_task_telemetry(
     llm_service: object,
     *,
@@ -236,5 +336,5 @@ def build_task_telemetry(
         "enable_tracing": tracing,
         "enable_turn_tracking": tracing,
         "conversation_id": f"tele-{uuid.uuid4().hex}",
-        "observers": [observer],
+        "observers": [observer, MetricsFrameAdapter()],
     }

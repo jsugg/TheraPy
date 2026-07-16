@@ -317,7 +317,7 @@ class CaptureService:
         retry_count: int = 0,
         status_class: str = "2xx",
     ) -> None:
-        """Content-free broad twin (O1.3 item 4)."""
+        """Content-free broad twin (O1.3 item 4) + O2 instruments."""
         emit_event(
             "llm.attempt",
             severity=logging.INFO,
@@ -327,9 +327,56 @@ class CaptureService:
             duration_ms=duration_ms,
             retry_count=retry_count,
         )
-        # Detailed bounded dimensions travel on the broad span/metrics path
-        # in O2; the log twin stays within the fixed §5.4 fields above.
-        _ = (finish_class, ttft_ms, output_chars, usage, status_class)
+        from therapy.observability.telemetry import record_metric
+
+        dims = {
+            "provider": record.provider.value,
+            "operation": record.operation.value,
+            "outcome": outcome.value,
+        }
+        record_metric("therapy_llm_requests_total", 1, dims)
+        record_metric(
+            "therapy_llm_capture_records_total",
+            1,
+            {
+                "operation": record.operation.value,
+                "status": "journaled" if self.writer is not None else "failed",
+            },
+        )
+        if ttft_ms is not None:
+            record_metric(
+                "therapy_llm_time_to_first_token_seconds", ttft_ms / 1000, dims
+            )
+        for key, instrument in (
+            ("input_tokens", "therapy_llm_input_tokens_total"),
+            ("prompt_tokens", "therapy_llm_input_tokens_total"),
+            ("output_tokens", "therapy_llm_output_tokens_total"),
+            ("completion_tokens", "therapy_llm_output_tokens_total"),
+        ):
+            value = (usage or {}).get(key)
+            if isinstance(value, int | float) and value > 0:
+                record_metric(
+                    instrument,
+                    value,
+                    {"provider": dims["provider"], "operation": dims["operation"]},
+                )
+        if status_class == "4xx" and finish_class == "rate_limit":
+            record_metric(
+                "therapy_llm_rate_limits_total",
+                1,
+                {"provider": dims["provider"], "operation": dims["operation"]},
+            )
+        result = "ok" if output_chars else "empty"
+        if outcome is Outcome.SUCCESS:
+            record_metric(
+                "therapy_llm_output_total",
+                1,
+                {
+                    "provider": dims["provider"],
+                    "operation": dims["operation"],
+                    "result": result,
+                },
+            )
 
 
 _service: CaptureService | None = None
@@ -344,6 +391,42 @@ def capture_service() -> CaptureService | None:
     return _service
 
 
+async def _health_monitor(store, interval_s: float = 15.0) -> None:
+    """Owned event-loop lag + capture-health gauges (plan O1.2 item 3, O2.3).
+
+    Loop lag is measured as sleep drift — the authoritative signal (plan
+    O2.1 item 5); journal gauges publish last-success timestamps, never
+    precomputed ages (§8)."""
+    import asyncio as _asyncio
+    from datetime import datetime
+
+    from therapy.observability.telemetry import record_metric
+
+    while True:
+        started = time.monotonic()
+        try:
+            await _asyncio.sleep(interval_s)
+        except _asyncio.CancelledError:
+            return
+        lag = max(0.0, (time.monotonic() - started) - interval_s)
+        record_metric("therapy_event_loop_lag_seconds", lag)
+        if store is None:
+            continue
+        try:
+            health = await _asyncio.to_thread(store.health)
+        except Exception:
+            continue
+        if health.oldest_unexported_at:
+            try:
+                oldest = datetime.fromisoformat(health.oldest_unexported_at)
+                record_metric(
+                    "therapy_llm_capture_oldest_unexported_unixtime",
+                    oldest.timestamp(),
+                )
+            except ValueError:
+                pass
+
+
 @dataclass
 class CaptureRuntime:
     """Everything the app lifespan owns: journal, writer, service, worker."""
@@ -352,10 +435,18 @@ class CaptureRuntime:
     writer: AsyncJournalWriter | None
     service: CaptureService
     worker: object | None = None  # ExportWorker when a backend is selected
+    monitor: object | None = None  # health/loop-lag task
 
     async def close(self, timeout: float = 5.0) -> None:
         """Bounded flush + close; never blocks product shutdown (O1.1)."""
+        import asyncio as _asyncio
+        import contextlib
+
         set_capture_service(None)
+        if self.monitor is not None:
+            self.monitor.cancel()  # type: ignore[attr-defined]
+            with contextlib.suppress(Exception):
+                await _asyncio.wait_for(self.monitor, 2.0)  # type: ignore[arg-type]
         if self.worker is not None:
             await self.worker.close(timeout)  # type: ignore[attr-defined]
         if self.writer is not None:
@@ -433,7 +524,19 @@ async def start_capture(config, *, build_version: str = "0.1.0") -> CaptureRunti
             worker = ExportWorker(store, exporter)
             await worker.start()
 
-    return CaptureRuntime(store=store, writer=writer, service=service, worker=worker)
+    monitor = None
+    from therapy.observability.telemetry import state as telemetry_state
+
+    if telemetry_state().enabled:
+        import asyncio as _asyncio
+
+        monitor = _asyncio.create_task(
+            _health_monitor(store), name="observability-health"
+        )
+
+    return CaptureRuntime(
+        store=store, writer=writer, service=service, worker=worker, monitor=monitor
+    )
 
 
 def stream_event_from_delta(delta: str) -> tuple[InteractionEventKind, dict[str, JsonValue]]:

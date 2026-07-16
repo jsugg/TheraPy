@@ -18,6 +18,14 @@ dependencies = [
   "lingua-language-detector>=2.1.1",
   "loguru>=0.7,<1.0",
   "numpy>=1.26,<3.0",
+  # Broad-plane telemetry (obs plan O2.1): stable SDK + OTLP HTTP only.
+  # Instrumentation pins track the 0.x semconv train; routing/compat tests
+  # gate every upgrade (semconv maturity re-audited per dependency bump).
+  "opentelemetry-sdk>=1.43,<2.0",
+  "opentelemetry-exporter-otlp-proto-http>=1.43,<2.0",
+  "opentelemetry-instrumentation-fastapi>=0.64b0,<1.0",
+  "opentelemetry-instrumentation-httpx>=0.64b0,<1.0",
+  "opentelemetry-instrumentation-system-metrics>=0.64b0,<1.0",
   "pillow>=11,<13",
   "pipecat-ai[silero,webrtc,whisper]~=1.5.0; sys_platform != 'darwin' or platform_machine != 'x86_64'",
   "pymupdf>=1.26,<2.0",
