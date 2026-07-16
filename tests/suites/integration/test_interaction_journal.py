@@ -271,6 +271,33 @@ def test_export_replay_cursor(store: JournalStore) -> None:
     assert health.unexported_records == 2  # itx-exp-1 (pending) + itx-exp-2
 
 
+def test_disk_full_fails_visibly_and_preserves_existing_data(
+    tmp_path: Path,
+) -> None:
+    """Simulated full disk (bounded page count): writes fail loudly, prior
+    records stay intact and readable."""
+    store = JournalStore(tmp_path / "journal.sqlite3")
+    store.start_attempt(_record("itx-before-full"))
+    store.finish_success("itx-before-full", {"completion": "kept"})
+
+    store._conn.execute("PRAGMA max_page_count=8")  # no room to grow
+
+    def _fill() -> None:
+        for index in range(64):
+            store.start_attempt(_record(f"itx-full-{index}"))
+            store.finish_success(f"itx-full-{index}", {"completion": "x" * 2048})
+
+    with pytest.raises(sqlite3.OperationalError, match="full"):
+        _fill()
+
+    store._conn.execute("PRAGMA max_page_count=1073741823")
+    assert store.integrity_check() is True
+    loaded = store.load("itx-before-full")
+    assert loaded is not None
+    assert loaded["interaction"]["status"] == "succeeded"
+    store.close()
+
+
 def test_checkpoint_and_integrity(store: JournalStore) -> None:
     for index in range(5):
         record = _record(f"itx-cp-{index}")

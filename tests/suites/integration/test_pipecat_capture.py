@@ -30,7 +30,10 @@ from therapy.integrations.pipecat.observability import (  # noqa: E402
     InteractionCaptureObserver,
     build_task_telemetry,
 )
-from therapy.observability.capture import set_capture_service, start_capture  # noqa: E402
+from therapy.observability.capture import (  # noqa: E402
+    set_capture_service,
+    start_capture,
+)
 from therapy.observability.config import ObservabilityConfig  # noqa: E402
 from therapy.observability.logging import BroadJsonFormatter  # noqa: E402
 

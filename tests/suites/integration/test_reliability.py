@@ -20,8 +20,9 @@ def test_ice_config_env_override(client, monkeypatch) -> None:
 
 def test_compose_declares_reliability_and_turn(repo_root) -> None:
     compose = (repo_root / "compose.yaml").read_text()
-    # Restart policies + healthcheck keep the stack self-recovering.
-    assert compose.count("restart: unless-stopped") == 2
+    # Restart policies + healthcheck keep the stack self-recovering
+    # (therapy, turn, and the opt-in phoenix observability profile).
+    assert compose.count("restart: unless-stopped") == 3
     assert "healthcheck" in compose
     assert "/health" in compose
     assert "stop_grace_period" in compose
@@ -35,8 +36,9 @@ def test_compose_caps_memory_per_service(repo_root) -> None:
     # Uncapped containers exhaust the Docker VM under load; a wedged VM
     # hangs the docker CLI and every port-forward (hypervisor stall,
     # observed 2026-07-10). Caps convert that into a container OOM-kill
-    # that the restart policy recovers from. One cap per service.
-    assert (repo_root / "compose.yaml").read_text().count("mem_limit:") == 2
+    # that the restart policy recovers from. One cap per service
+    # (therapy, turn, phoenix).
+    assert (repo_root / "compose.yaml").read_text().count("mem_limit:") == 3
 
 
 def test_dockerfile_runs_watchdog(repo_root) -> None:

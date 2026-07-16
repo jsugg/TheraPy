@@ -620,8 +620,13 @@ class _Transaction:
     def __exit__(self, exc_type, exc, tb) -> None:
         if exc_type is None:
             self._conn.execute("COMMIT")
-        else:
-            self._conn.execute("ROLLBACK")
+        elif self._conn.in_transaction:
+            # a failed write (e.g. disk full) may already have auto-rolled
+            # back; never mask the original error with a rollback error
+            try:
+                self._conn.execute("ROLLBACK")
+            except sqlite3.OperationalError:
+                pass
 
 
 @dataclass(frozen=True, slots=True)
