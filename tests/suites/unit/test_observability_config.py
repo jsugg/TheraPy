@@ -67,7 +67,18 @@ def test_unknown_backend_rejected(clean_env) -> None:
     clean_env.setenv("THERAPY_INTERACTION_BACKEND", "kafka")
     with pytest.raises(ConfigError):
         ObservabilityConfig.from_env()
-    assert SUPPORTED_BACKENDS == ("journal",)  # extended only by the O0 ADR
+    # journal + exactly the one O0-ADR winner; never a third SDK path (§4)
+    assert SUPPORTED_BACKENDS == ("journal", "phoenix")
+
+
+def test_backend_requires_explicit_restricted_endpoint(clean_env) -> None:
+    clean_env.setenv("THERAPY_INTERACTION_BACKEND", "phoenix")
+    with pytest.raises(ConfigError):
+        ObservabilityConfig.from_env()  # never inferred from the broad endpoint
+    clean_env.setenv("THERAPY_OTLP_RESTRICTED_ENDPOINT", "http://localhost:6006")
+    config = ObservabilityConfig.from_env()
+    assert config.interaction_backend == "phoenix"
+    assert config.otlp_restricted_endpoint == "http://localhost:6006"
 
 
 @pytest.mark.parametrize(

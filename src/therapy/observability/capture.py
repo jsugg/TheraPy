@@ -351,10 +351,13 @@ class CaptureRuntime:
     store: object | None
     writer: AsyncJournalWriter | None
     service: CaptureService
+    worker: object | None = None  # ExportWorker when a backend is selected
 
     async def close(self, timeout: float = 5.0) -> None:
         """Bounded flush + close; never blocks product shutdown (O1.1)."""
         set_capture_service(None)
+        if self.worker is not None:
+            await self.worker.close(timeout)  # type: ignore[attr-defined]
         if self.writer is not None:
             try:
                 await self.writer.flush()
@@ -417,7 +420,20 @@ async def start_capture(config, *, build_version: str = "0.1.0") -> CaptureRunti
         build_version=build_version,
     )
     set_capture_service(service)
-    return CaptureRuntime(store=store, writer=writer, service=service)
+
+    # Selected-backend export (O1.2): asynchronous, ACK-gated, retryable.
+    # A backend outage rolls back to journal-only, never capture-off.
+    worker = None
+    if store is not None and config.interaction_backend != "journal":
+        from therapy.observability.exporters import ExportWorker
+        from therapy.observability.telemetry import make_interaction_exporter
+
+        exporter = make_interaction_exporter(config)
+        if exporter is not None:
+            worker = ExportWorker(store, exporter)
+            await worker.start()
+
+    return CaptureRuntime(store=store, writer=writer, service=service, worker=worker)
 
 
 def stream_event_from_delta(delta: str) -> tuple[InteractionEventKind, dict[str, JsonValue]]:

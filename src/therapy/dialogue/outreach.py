@@ -20,6 +20,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from therapy.dialogue.proactive import CHANNELS, CHECK_IN, GREETING, PUSH
 from therapy.knowledge.schema import migrate_database
 from therapy.knowledge.user_model import UserModel
+from therapy.observability.logging import emit_event
 
 type Channel = Literal["push", "greeting", "check_in", "digest"]
 type JobState = Literal[
@@ -29,6 +30,7 @@ type PushSender = Callable[[dict[str, object], str], None]
 
 _DEFAULT_DATA_DIR = Path.home() / ".local" / "share" / "therapy"
 _MAX_ATTEMPTS = 3
+
 logger = logging.getLogger(__name__)
 _GENERIC_PUSH = json.dumps(
     {"type": "reflection_available", "title": "TheraPy", "url": "/#model"},
@@ -624,11 +626,13 @@ class ProactivityService:
                 )
             return self._finish(job_id, "delivered", result, current)
         except Exception as exc:
-            logger.warning(
-                "proactivity delivery failed channel=%s job=%s error=%s",
-                job["channel"],
-                job_id,
-                type(exc).__name__,
+            emit_event(
+                "proactivity.delivery_failed",
+                severity=logging.WARNING,
+                component="proactivity",
+                operation=str(job["channel"]),
+                outcome="error",
+                error_type=type(exc).__name__,
             )
             return self._retry_or_fail(job_id, str(exc), current)
 
@@ -807,8 +811,17 @@ class ProactivityScheduler:
         while not self._stop.is_set():
             try:
                 await asyncio.to_thread(self.service.tick)
-            except Exception:
-                logger.exception("proactivity scheduler tick failed")
+            except Exception as exc:
+                emit_event(
+                    "scheduler.tick_failed",
+                    severity=logging.ERROR,
+                    component="scheduler",
+                    operation="tick",
+                    outcome="error",
+                    error_type=type(exc).__name__,
+                    exc=exc,
+                    owned_failure=True,
+                )
             try:
                 await asyncio.wait_for(self._stop.wait(), timeout=self.interval_seconds)
             except TimeoutError:

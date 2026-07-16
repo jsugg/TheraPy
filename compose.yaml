@@ -2,6 +2,13 @@ services:
   therapy:
     build: .
     restart: unless-stopped
+    # Bounded broad-log retention (obs plan O1.5): the `local` driver replaces
+    # Docker's unbounded json-file default. Stdout stays authoritative.
+    logging:
+      driver: local
+      options:
+        max-size: "20m"
+        max-file: "5"
     ports:
       - "8000:8000"
     env_file:
@@ -50,9 +57,40 @@ services:
   # IPs, and container→tailnet UDP is not guaranteed). The client allocates a
   # relay via turn:<page-host>:3478; the pipeline reaches the relay directly
   # on this compose network — no dependence on host↔container NAT quirks.
+  # Restricted interaction backend selected by the O0.3 ADR
+  # (docs/evidence/observability-backend-spike.md). Opt-in profile; loopback
+  # UI/OTLP only; synthetic 30-day retention; derived store — the owned
+  # journal remains the source of truth. The image's gRPC collector port
+  # (4317) is deliberately NOT published (v18 binds [::] regardless of host
+  # setting). Analytics/external resources are disabled.
+  phoenix:
+    image: arizephoenix/phoenix:version-18.0.0-nonroot
+    profiles: ["llm-observability"]
+    restart: unless-stopped
+    logging:
+      driver: local
+      options:
+        max-size: "10m"
+        max-file: "3"
+    ports:
+      - "127.0.0.1:6006:6006"
+    environment:
+      PHOENIX_TELEMETRY_ENABLED: "false"
+      PHOENIX_ALLOW_EXTERNAL_RESOURCES: "false"
+      PHOENIX_DEFAULT_RETENTION_POLICY_DAYS: "30"
+      PHOENIX_WORKING_DIR: /mnt/data
+    volumes:
+      - phoenix-data:/mnt/data
+    mem_limit: 1g
+
   turn:
     image: coturn/coturn:4.6
     restart: unless-stopped
+    logging:
+      driver: local
+      options:
+        max-size: "10m"
+        max-file: "3"
     command:
       - --listening-port=3478
       - --lt-cred-mech
@@ -73,3 +111,4 @@ services:
 volumes:
   therapy-data:
   model-cache:
+  phoenix-data:

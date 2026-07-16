@@ -189,6 +189,127 @@ class PlaneRoutingSpanProcessor:
         return ok
 
 
+class PhoenixInteractionExporter:
+    """O0-ADR-selected backend adapter (Phoenix 18.0.0 over OTLP HTTP).
+
+    Maps one journaled interaction to one OpenInference LLM span carrying the
+    lossless canonical envelope, preserving the journaled trace/span IDs. ACK
+    is the OTLP exporter's SUCCESS result — Phoenix returns HTTP success even
+    for ignored duplicates (spike evidence), which is exactly the idempotent
+    replay semantic the journal needs.
+    """
+
+    backend_name = "phoenix"
+
+    def __init__(self, endpoint: str, timeout: float = 3.0) -> None:
+        from opentelemetry.exporter.otlp.proto.http.trace_exporter import (
+            OTLPSpanExporter,
+        )
+        from opentelemetry.sdk.resources import Resource
+        from opentelemetry.sdk.trace import TracerProvider
+        from opentelemetry.sdk.trace.id_generator import IdGenerator
+
+        class _NextIdGenerator(IdGenerator):
+            """Serial exports set the next (trace, span) pair explicitly."""
+
+            def __init__(self) -> None:
+                self.next_trace_id = 0
+                self.next_span_id = 0
+
+            def generate_trace_id(self) -> int:
+                return self.next_trace_id
+
+            def generate_span_id(self) -> int:
+                return self.next_span_id
+
+        self._id_generator = _NextIdGenerator()
+        self._provider = TracerProvider(
+            resource=Resource.create({"service.name": "therapy-interactions"}),
+            id_generator=self._id_generator,
+        )
+        self._tracer = self._provider.get_tracer("therapy.interactions")
+        self._exporter = OTLPSpanExporter(
+            endpoint=f"{endpoint}/v1/traces", timeout=timeout
+        )
+
+    async def export(self, interaction: dict) -> str | None:
+        import asyncio
+
+        return await asyncio.to_thread(self._export_sync, interaction)
+
+    def _export_sync(self, payload: dict) -> str:
+        import json as _json
+        from datetime import datetime
+
+        from opentelemetry.sdk.trace.export import SpanExportResult
+        from opentelemetry.trace import SpanKind
+
+        from therapy.observability.exporters import ExportError
+
+        row = payload["interaction"]
+        events = payload["events"]
+
+        def _ns(iso: str | None) -> int:
+            if not iso:
+                return 0
+            return int(datetime.fromisoformat(iso).timestamp() * 1_000_000_000)
+
+        self._id_generator.next_trace_id = int(row["trace_id"], 16)
+        self._id_generator.next_span_id = int(row["span_id"], 16)
+
+        envelope = {
+            "interaction": {k: row[k] for k in row.keys()},
+            "events": events,
+        }
+        attributes = {
+            "openinference.span.kind": "LLM",
+            "llm.provider": row["provider"],
+            "therapy.operation": row["operation"],
+            "therapy.status": row["status"],
+            "session.id": row["interaction_id"],
+            "input.value": row["canonical_request_json"],
+            "input.mime_type": "application/json",
+            "output.value": row["terminal_json"] or "",
+            "output.mime_type": "application/json",
+            "therapy.canonical_record": _json.dumps(
+                envelope, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+            ),
+        }
+        span = self._tracer.start_span(
+            name=f"llm.{row['operation']}",
+            kind=SpanKind.CLIENT,
+            attributes=attributes,
+            start_time=_ns(row["started_at"]) or None,
+        )
+        span.end(_ns(row["completed_at"] or row["updated_at"]) or None)
+        result = self._exporter.export([span])  # type: ignore[list-item]
+        if result is not SpanExportResult.SUCCESS:
+            raise ExportError("phoenix OTLP export failed")
+        return row["span_id"]
+
+
+def make_interaction_exporter(config: ObservabilityConfig):
+    """The single selected backend adapter, or None for journal-only."""
+    if config.interaction_backend != "phoenix":
+        return None
+    if not config.otlp_restricted_endpoint:
+        return None
+    try:
+        return PhoenixInteractionExporter(
+            config.otlp_restricted_endpoint,
+            timeout=config.otel_export_timeout_secs,
+        )
+    except ImportError:
+        emit_event(
+            "telemetry.sdk_unavailable",
+            severity=logging.WARNING,
+            component="telemetry",
+            operation="backend_adapter",
+            outcome="rejected",
+        )
+        return None
+
+
 class _ScrubbedSpanView:
     """Read-only span proxy presenting scrubbed attributes to the exporter."""
 

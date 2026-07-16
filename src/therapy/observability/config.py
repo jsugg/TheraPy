@@ -19,10 +19,10 @@ from urllib.parse import urlsplit
 from therapy.observability.model import CaptureMode
 
 #: Backends the runtime may export interactions to. `journal` is the
-#: always-on local source of truth. The single remote/backend value chosen
-#: by the O0.3 ADR is appended when its adapter lands (plan: never ship
-#: three runtime SDK paths).
-SUPPORTED_BACKENDS: tuple[str, ...] = ("journal",)
+#: always-on local source of truth; `phoenix` is the single backend selected
+#: by the O0.3 ADR (docs/evidence/observability-backend-spike.md). No third
+#: runtime SDK path ships (plan §4).
+SUPPORTED_BACKENDS: tuple[str, ...] = ("journal", "phoenix")
 
 SUPPORTED_ENVIRONMENTS: tuple[str, ...] = ("development", "test", "dogfood", "vps-test")
 
@@ -140,6 +140,13 @@ class ObservabilityConfig:
             raise ConfigError(
                 "THERAPY_INTERACTION_BACKEND must be one of "
                 f"{sorted(SUPPORTED_BACKENDS)}"
+            )
+        if backend != "journal" and not os.environ.get(
+            "THERAPY_OTLP_RESTRICTED_ENDPOINT", ""
+        ).strip():
+            raise ConfigError(
+                "THERAPY_INTERACTION_BACKEND requires "
+                "THERAPY_OTLP_RESTRICTED_ENDPOINT (never inferred from broad)"
             )
 
         return cls(

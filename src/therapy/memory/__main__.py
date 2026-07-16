@@ -125,7 +125,7 @@ def main(argv: list[str] | None = None) -> int:
             _print_json({"deleted": args.document_id})
             return 0
     except (OSError, ValueError, RuntimeError, json.JSONDecodeError) as exc:
-        print(f"error: {exc}", file=sys.stderr)
+        print(f"error: {type(exc).__name__}", file=sys.stderr)
         return 1
     return 1
 

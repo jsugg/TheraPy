@@ -108,6 +108,7 @@ from therapy.knowledge.user_model import UserModel
 from therapy.memory import MemoryStore, make_summarizer
 from therapy.memory.store import resume_window_secs
 from therapy.memory.summarizer import entitle
+from therapy.observability.logging import emit_event
 from therapy.perception.stt import (
     DEFAULT_LANGUAGE,
     clamp_language,
@@ -178,34 +179,46 @@ async def _generate_session_artifacts(
     try:
         summary_value = (await summarize(turns)).strip() or None
     except Exception as exc:
-        logger.warning(
-            "Session summary failed for %s failure_type=%s",
-            session_id,
-            type(exc).__name__,
+        emit_event(
+            "finalizer.artifact_failed",
+            severity=logging.WARNING,
+            component="voice",
+            operation="summary",
+            outcome="error",
+            error_type=type(exc).__name__,
         )
     try:
         distilled = await distill(model, turns, session_id)
     except Exception as exc:
-        logger.warning(
-            "Session distillation failed for %s failure_type=%s",
-            session_id,
-            type(exc).__name__,
+        emit_event(
+            "finalizer.artifact_failed",
+            severity=logging.WARNING,
+            component="voice",
+            operation="distill",
+            outcome="error",
+            error_type=type(exc).__name__,
         )
     try:
         recap_value = (await recap(turns)).strip() or None
     except Exception as exc:
-        logger.warning(
-            "Session recap failed for %s failure_type=%s",
-            session_id,
-            type(exc).__name__,
+        emit_event(
+            "finalizer.artifact_failed",
+            severity=logging.WARNING,
+            component="voice",
+            operation="recap",
+            outcome="error",
+            error_type=type(exc).__name__,
         )
     try:
         title_value = (await title(turns)).strip() or None
     except Exception as exc:
-        logger.warning(
-            "Session title failed for %s failure_type=%s",
-            session_id,
-            type(exc).__name__,
+        emit_event(
+            "finalizer.artifact_failed",
+            severity=logging.WARNING,
+            component="voice",
+            operation="title",
+            outcome="error",
+            error_type=type(exc).__name__,
         )
     return _SessionArtifacts(
         summary=summary_value,
@@ -573,7 +586,7 @@ class InputAudioProbe(FrameProcessor):
             self._sumsq += float(np.sum(samples.astype(np.float64) ** 2))
             if self._samples >= self._rate:
                 rms = (self._sumsq / self._samples) ** 0.5
-                logger.info(f"Input audio: rms={rms:.0f} over {self._samples} samples @{self._rate}Hz")
+                logger.debug(f"Input audio: rms={rms:.0f} over {self._samples} samples @{self._rate}Hz")
                 self._samples = 0
                 self._sumsq = 0.0
         await self.push_frame(frame, direction)
@@ -593,7 +606,13 @@ class TTFAMonitor(FrameProcessor):
         elif isinstance(frame, TTSAudioRawFrame) and self._turn_started_at is not None:
             ttfa = time.monotonic() - self._turn_started_at
             self._turn_started_at = None
-            logger.info(f"TTFA: {ttfa:.2f}s (user stopped speaking → first audio)")
+            emit_event(
+                "turn.ttfa",
+                component="voice",
+                operation="turn",
+                outcome="success",
+                duration_ms=ttfa * 1000,
+            )
         await self.push_frame(frame, direction)
 
 
@@ -740,7 +759,13 @@ async def run_bot(
         if store.has_session(resume_session_id):
             session_id = resume_session_id
         else:
-            logger.warning(f"Cannot resume unknown session {resume_session_id!r}")
+            emit_event(
+                "voice.resume_unknown",
+                severity=logging.WARNING,
+                component="voice",
+                operation="resume",
+                outcome="rejected",
+            )
     if session_id is None and not new_session:
         session_id = store.resume_candidate(resume_window_secs())
     if session_id:
@@ -749,7 +774,13 @@ async def run_bot(
             pending.cancel()
         store.reopen_session(session_id)
         resumed_turns = store.session_turns(session_id)
-        logger.info(f"Resuming session {session_id} ({len(resumed_turns)} turns)")
+        emit_event(
+            "voice.session_resumed",
+            component="voice",
+            operation="resume",
+            outcome="success",
+            count=len(resumed_turns),
+        )
     else:
         session_id = store.create_session()
     owner = live.claim(session_id)
@@ -905,7 +936,13 @@ async def run_bot(
             try:
                 reply = reply_language.set_pin(code if isinstance(code, str) else None)
             except ValueError:
-                logger.warning(f"Ignoring unsupported reply_language: {code!r}")
+                emit_event(
+                    "voice.reply_language_unsupported",
+                    severity=logging.WARNING,
+                    component="voice",
+                    operation="reply_language",
+                    outcome="rejected",
+                )
                 return
             # Auto asserts nothing on replay; only a pin anchors (the effect
             # helper carries the reasoning). Otherwise the fresh-connect auto
@@ -1007,7 +1044,6 @@ async def run_bot(
         finalized = True
         turns = await asyncio.to_thread(store.session_turns, session_id)
         summary: str | None = None
-        distilled = knowledge_distill.DistillResult(run_id="not-run")
         title: str | None = None
         recap: str | None = None
         if turns:
@@ -1024,7 +1060,7 @@ async def run_bot(
                     "Conversation",
                 )
                 summary = f"The user said: {last_user_text}"
-                distilled = await knowledge_distill.distill_session(
+                await knowledge_distill.distill_session(
                     user_model,
                     turns,
                     session_id,
@@ -1039,7 +1075,6 @@ async def run_bot(
                     turns, user_model, session_id
                 )
                 summary = artifacts.summary
-                distilled = artifacts.distillation
                 recap = artifacts.recap
                 title = artifacts.title
         if title:
@@ -1049,10 +1084,12 @@ async def run_bot(
             await asyncio.to_thread(store.ensure_recap, session_id, recap)
         await asyncio.to_thread(store.end_session, session_id, summary)
         live.release(session_id, owner)
-        logger.info(
-            f"Session {session_id} closed ({len(turns)} turns, "
-            f"summary={bool(summary)}, nodes={len(distilled.promoted_nodes)}, "
-            f"proposed={len(distilled.proposed_patterns)})"
+        emit_event(
+            "voice.session_closed",
+            component="voice",
+            operation="finalize",
+            outcome="success",
+            count=len(turns),
         )
 
     finalize_task: asyncio.Task[None] | None = None
@@ -1078,10 +1115,13 @@ async def run_bot(
             except asyncio.CancelledError:
                 failure = None
             if failure is not None:
-                logger.error(
-                    "Session finalization failed for %s failure_type=%s",
-                    session_id,
-                    type(failure).__name__,
+                emit_event(
+                    "finalizer.failed",
+                    severity=logging.ERROR,
+                    component="voice",
+                    operation="finalize",
+                    outcome="error",
+                    error_type=type(failure).__name__,
                 )
             live.release(session_id, owner)
             if _finalizers.get(session_id) is done:

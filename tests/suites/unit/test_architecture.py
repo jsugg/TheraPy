@@ -167,6 +167,11 @@ def test_pipecat_observability_adapter_is_the_only_pipecat_telemetry_seam(
         "therapy.observability",
         "therapy.observability.model",
         "therapy.observability.context",
+        # framework-free fixed-event emission; Pipecat TYPE conversion still
+        # belongs to observability.py alone.
+        "therapy.observability.logging",
+        "therapy.observability.capture",
+        "therapy.observability.interactions",
     }
     violations: list[str] = []
     pipecat_root = repo_root / PIPECAT_ROOT

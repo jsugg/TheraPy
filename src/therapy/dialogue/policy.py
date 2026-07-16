@@ -95,7 +95,10 @@ def crisis_resources() -> str:
     try:
         contacts = crisis_contacts()
     except CrisisConfigurationError as exc:
-        logger.error("Invalid crisis contact configuration: %s", exc)
+        logger.error(
+            "Invalid crisis contact configuration failure_type=%s",
+            type(exc).__name__,
+        )
         contacts = []
     if contacts:
         return "; ".join(f"{c['label']}: {c['value']}" for c in contacts)
