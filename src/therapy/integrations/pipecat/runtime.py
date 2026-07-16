@@ -162,7 +162,45 @@ class PipecatVoiceGateway:
     async def negotiate(
         self, offer: WebRTCOffer, target: SessionTarget
     ) -> WebRTCAnswer:
-        """Negotiate an offer and atomically replace the single live pipeline."""
+        """Negotiate an offer and atomically replace the single live pipeline.
+
+        Records the finite outcome set success|conflict|invalid|unavailable
+        (obs plan O3.2) — one owned boundary event, no SDP, no peer IDs.
+        """
+        from therapy.observability.logging import emit_event
+        from therapy.observability.telemetry import record_metric
+
+        outcome = "unavailable"
+        try:
+            answer = await self._negotiate_inner(offer, target)
+        except ConnectionConflict:
+            outcome = "conflict"
+            raise
+        except InvalidOffer:
+            outcome = "invalid"
+            raise
+        except Exception:
+            outcome = "unavailable"
+            raise
+        else:
+            outcome = "success"
+            return answer
+        finally:
+            record_metric(
+                "therapy_voice_connections_total",
+                1,
+                {"outcome": outcome, "reason": "negotiate"},
+            )
+            emit_event(
+                "voice.negotiate",
+                component="voice",
+                operation="negotiate",
+                outcome="success" if outcome == "success" else "error",
+            )
+
+    async def _negotiate_inner(
+        self, offer: WebRTCOffer, target: SessionTarget
+    ) -> WebRTCAnswer:
         async with self._lock:
             if self._closed:
                 raise VoiceUnavailable("Voice runtime is shutting down")

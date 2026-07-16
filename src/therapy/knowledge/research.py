@@ -35,6 +35,24 @@ _MAX_REF_CHARS = 1_000
 _SAFE_FILENAME_RE = re.compile(r"[^a-zA-Z0-9._-]+")
 
 
+
+def _traced_storage(component: str, operation: str):
+    """Bounded db.operation instrumentation (obs plan O3.3); no SQL/paths."""
+    import functools
+
+    def decorate(func):
+        @functools.wraps(func)
+        def wrapper(*args, **kwargs):
+            from therapy.observability.telemetry import storage_operation
+
+            with storage_operation(component, operation):
+                return func(*args, **kwargs)
+
+        return wrapper
+
+    return decorate
+
+
 class IngestResult(TypedDict):
     """Outcome of a deduplicated local source import."""
 
@@ -162,6 +180,7 @@ class ResearchKB:
             temporary.unlink(missing_ok=True)
         return destination
 
+    @_traced_storage("research", "ingest_bytes")
     def ingest_bytes(
         self,
         data: bytes,
@@ -330,6 +349,7 @@ class ResearchKB:
         )
         return result["document_id"]
 
+    @_traced_storage("research", "reindex")
     def reindex(self, document_id: int | None = None) -> int:
         """Deterministically rebuild current-model chunks, excluding unreviewed OCR."""
         metadata = self.embedder.metadata
@@ -435,6 +455,7 @@ class ResearchKB:
         for row in stale:
             self.reindex(int(row["id"]))
 
+    @_traced_storage("research", "query")
     def query(
         self,
         text: str,

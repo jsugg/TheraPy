@@ -9,6 +9,7 @@ import json
 import logging
 import os
 import sqlite3
+import time as time_module
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 from datetime import UTC, datetime, time, timedelta
@@ -811,6 +812,12 @@ class ProactivityScheduler:
         while not self._stop.is_set():
             try:
                 processed = await asyncio.to_thread(self.service.tick)
+                from therapy.observability.telemetry import record_metric
+
+                record_metric(
+                    "therapy_proactivity_scheduler_last_tick_unixtime",
+                    time_module.time(),
+                )
                 if processed:
                     # only non-empty batches get a trace root (obs plan
                     # O2.2/O2.3: empty ticks are metric-only, never spans)

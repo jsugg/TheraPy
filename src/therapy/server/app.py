@@ -249,6 +249,19 @@ def ready() -> dict[str, object]:
     }
 
 
+def _audit(operation: str, component: str = "data") -> None:
+    """Minimal content-free audit event for destructive/research/data
+    operations (obs plan O3.1); never IDs, names, paths, or payloads."""
+    from therapy.observability.logging import emit_event
+
+    emit_event(
+        "owner.audit",
+        component=component,
+        operation=operation,
+        outcome="success",
+    )
+
+
 def _resolve_session(
     store: MemoryStore, *, new_session: bool, explicit: str | None
 ) -> tuple[str | None, bool]:
@@ -453,6 +466,7 @@ def delete_session(
     mode: Literal["keep_knowledge", "remove_derived"] = "keep_knowledge",
 ) -> dict[str, object]:
     """Delete conversation artifacts under the owner's selected knowledge policy."""
+    _audit("delete_session", "memory")
     store = _store()
     if not store.has_session(session_id):
         raise HTTPException(status_code=404, detail="Session not found")
@@ -599,6 +613,7 @@ def reject_node(node_id: int) -> dict[str, object]:
 @app.delete("/api/graph/nodes/{node_id}")
 def delete_node(node_id: int) -> dict[str, object]:
     """Delete a node (tombstoned so distillation cannot re-learn it)."""
+    _audit("delete_node", "knowledge")
     if not _model().delete_node(node_id):
         raise HTTPException(status_code=404, detail="Node not found")
     return {"deleted": node_id}
@@ -650,6 +665,7 @@ def reject_edge(edge_id: int) -> dict[str, object]:
 @app.delete("/api/graph/edges/{edge_id}")
 def delete_edge(edge_id: int) -> dict[str, object]:
     """Delete an edge (tombstoned against re-learning)."""
+    _audit("delete_edge", "knowledge")
     if not _model().delete_edge(edge_id):
         raise HTTPException(status_code=404, detail="Edge not found")
     return {"deleted": edge_id}
@@ -671,6 +687,7 @@ def add_boundary(body: BoundaryRequest) -> dict[str, object]:
 @app.delete("/api/graph/boundaries")
 def remove_boundary(body: BoundaryRequest) -> dict[str, object]:
     """Remove a boundary by kind + value."""
+    _audit("remove_boundary", "knowledge")
     if not _model().remove_boundary(body.kind, body.value):
         raise HTTPException(status_code=404, detail="Boundary not found")
     return {"boundaries": _model().boundaries()}
@@ -736,6 +753,7 @@ async def research_ingest(
     force: Annotated[bool, Form()] = False,
 ) -> dict[str, object]:
     """Validate, extract/OCR, preserve, and index one local source."""
+    _audit("research_ingest", "research")
     from therapy.knowledge.research_ingest import MAX_SOURCE_BYTES
 
     filename = file.filename or ""
@@ -798,6 +816,7 @@ def correct_research_block(
     document_id: int, anchor: str, body: ResearchBlockCorrection
 ) -> dict[str, object]:
     """Apply one owner OCR correction and rebuild the semantic index."""
+    _audit("correct_research_block", "research")
     try:
         changed = _research().correct_block(document_id, anchor, body.text)
     except ValueError as exc:
@@ -810,6 +829,7 @@ def correct_research_block(
 @app.post("/api/research/{document_id}/reindex")
 def reindex_research(document_id: int) -> dict[str, int]:
     """Rebuild one document using the configured model/policy version."""
+    _audit("reindex_research", "research")
     if _research().document(document_id) is None:
         raise HTTPException(status_code=404, detail="Research document not found")
     return {"chunks_indexed": _research().reindex(document_id)}
@@ -818,6 +838,7 @@ def reindex_research(document_id: int) -> dict[str, int]:
 @app.delete("/api/research/{document_id}")
 def delete_research(document_id: int) -> dict[str, int]:
     """Delete one source artifact, extraction, and semantic index."""
+    _audit("delete_research", "research")
     if not _research().delete_document(document_id):
         raise HTTPException(status_code=404, detail="Research document not found")
     return {"deleted": document_id}
@@ -906,6 +927,7 @@ def _assert_no_live_sessions() -> None:
 @app.get("/api/data/export")
 def export_owner_data() -> Response:
     """Download one complete inspectable owner-data JSON snapshot."""
+    _audit("export_owner_data", "data")
     payload = _data().export_json()
     return Response(
         payload,
@@ -919,6 +941,7 @@ async def restore_owner_data(
     file: Annotated[UploadFile, File(description="TheraPy owner-data JSON export")],
 ) -> dict[str, object]:
     """Validate completely and restore a prior owner snapshot with rollback."""
+    _audit("restore_owner_data", "data")
     _assert_no_live_sessions()
     maximum_upload = 720 * 1024 * 1024
     payload = await file.read(maximum_upload + 1)
@@ -938,6 +961,7 @@ async def restore_owner_data(
 @app.delete("/api/data")
 def delete_owner_data(body: DeleteAllRequest) -> dict[str, bool]:
     """Erase every Phase 4 personal/corpus store after exact confirmation."""
+    _audit("delete_owner_data", "data")
     del body
     _assert_no_live_sessions()
     _data().delete_all()

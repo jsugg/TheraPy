@@ -38,6 +38,24 @@ def resume_window_secs() -> float:
     return float(os.environ.get("THERAPY_RESUME_WINDOW_SECS", "900"))
 
 
+
+def _traced_storage(component: str, operation: str):
+    """Bounded db.operation instrumentation (obs plan O3.3); no SQL/paths."""
+    import functools
+
+    def decorate(func):
+        @functools.wraps(func)
+        def wrapper(*args, **kwargs):
+            from therapy.observability.telemetry import storage_operation
+
+            with storage_operation(component, operation):
+                return func(*args, **kwargs)
+
+        return wrapper
+
+    return decorate
+
+
 class MemoryStore:
     """Persistent session transcripts, summaries, facts, and audio."""
 
@@ -107,6 +125,7 @@ class MemoryStore:
                 with connection:
                     connection.execute("ALTER TABLE sessions ADD COLUMN recap TEXT")
 
+    @_traced_storage("memory", "create_session")
     def create_session(self) -> str:
         """Create a session row and return its UUID4 hex id."""
         session_id = uuid.uuid4().hex
@@ -118,6 +137,7 @@ class MemoryStore:
                 )
         return session_id
 
+    @_traced_storage("memory", "end_session")
     def end_session(self, session_id: str, summary: str | None = None) -> None:
         """Mark a session ended and store its summary."""
         with self._connect() as connection:
@@ -196,6 +216,7 @@ class MemoryStore:
             ).fetchone()
         return row is not None
 
+    @_traced_storage("memory", "delete_session")
     def delete_session(self, session_id: str) -> bool:
         """Delete one session, its turns (FK cascade), and its audio archive.
 
@@ -210,6 +231,7 @@ class MemoryStore:
         shutil.rmtree(self._audio_dir / session_id, ignore_errors=True)
         return cursor.rowcount > 0
 
+    @_traced_storage("memory", "reopen_session")
     def reopen_session(self, session_id: str) -> None:
         """Clear finalization fields so an interrupted session can continue."""
         with self._connect() as connection:
@@ -223,6 +245,7 @@ class MemoryStore:
                     (session_id,),
                 )
 
+    @_traced_storage("memory", "add_turn")
     def add_turn(
         self,
         session_id: str,
@@ -325,6 +348,7 @@ class MemoryStore:
                 )
         return cursor.rowcount > 0
 
+    @_traced_storage("memory", "ensure_title")
     def ensure_title(self, session_id: str, title: str) -> None:
         """Fill in an auto-generated title only where none exists yet.
 
@@ -338,6 +362,7 @@ class MemoryStore:
                     (title, session_id),
                 )
 
+    @_traced_storage("memory", "ensure_recap")
     def ensure_recap(self, session_id: str, recap: str) -> None:
         """Fill user-facing recap once, independently of internal summary."""
         with self._connect() as connection:

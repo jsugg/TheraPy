@@ -9,10 +9,23 @@ actively writing to. Single event loop: plain dicts, no locking.
 _owners: dict[str, object] = {}
 
 
+def _record(operation: str, outcome: str) -> None:
+    from therapy.observability.telemetry import record_metric
+
+    record_metric(
+        "therapy_voice_pipeline_transitions_total",
+        1,
+        {"transition": operation, "outcome": outcome},
+    )
+    record_metric("therapy_voice_active_connections", len(_owners))
+
+
 def claim(session_id: str) -> object:
     """Register the calling pipeline as the session's current owner."""
     token = object()
+    preempted = session_id in _owners
     _owners[session_id] = token
+    _record("claim", "preemption" if preempted else "success")
     return token
 
 
@@ -25,6 +38,9 @@ def release(session_id: str, token: object) -> None:
     """Drop ownership — only if this token still holds it."""
     if _owners.get(session_id) is token:
         del _owners[session_id]
+        _record("release", "success")
+    else:
+        _record("release", "mismatch")
 
 
 def is_active(session_id: str) -> bool:

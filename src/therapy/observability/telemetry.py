@@ -296,6 +296,48 @@ def instrumented_async_client(destination: str, **kwargs):
     return client
 
 
+def storage_operation(component: str, operation: str):
+    """Finite db.operation instrumentation for owned stores (plan O3.3).
+
+    Records operation count/duration and SQLite busy events; never SQL, DB
+    paths, or row content. Safe no-op when telemetry is off.
+    """
+    import sqlite3 as _sqlite3
+    import time as _time
+    from contextlib import contextmanager
+
+    @contextmanager
+    def _instrumented():
+        started = _time.monotonic()
+        outcome = "success"
+        try:
+            yield
+        except _sqlite3.OperationalError as exc:
+            outcome = "error"
+            if "locked" in str(exc).lower() or "busy" in str(exc).lower():
+                record_metric(
+                    "therapy_sqlite_busy_total", 1, {"component": component}
+                )
+            raise
+        except Exception:
+            outcome = "error"
+            raise
+        finally:
+            dims = {
+                "component": component,
+                "operation": operation,
+                "outcome": outcome,
+            }
+            record_metric("therapy_storage_operations_total", 1, dims)
+            record_metric(
+                "therapy_storage_operation_seconds",
+                _time.monotonic() - started,
+                dims,
+            )
+
+    return _instrumented()
+
+
 def broad_span(name: str, *, component: str, operation: str):
     """Owned broad span helper: records status once, scope `therapy.broad`."""
     from contextlib import contextmanager
