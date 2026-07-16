@@ -8,6 +8,7 @@ health endpoint stops answering.
 
 from __future__ import annotations
 
+import json
 import os
 import shlex
 import signal
@@ -16,7 +17,9 @@ import threading
 import time
 import urllib.request
 from collections.abc import Callable
+from importlib.metadata import PackageNotFoundError, version
 from types import FrameType
+from typing import Literal
 
 # `-m therapy.server` bootstraps JSON logging + the owned OTel provider
 # BEFORE the FastAPI app imports (observability plan O1.1).
@@ -30,11 +33,70 @@ STOP_TIMEOUT = 10.0
 LOOP_SLEEP = 0.05
 
 _SignalHandler = Callable[[int, FrameType | None], object] | int | signal.Handlers | None
+type Operation = Literal["start", "stop", "restart", "probe"]
+type Outcome = Literal["success", "error", "timeout"]
+type Severity = Literal["INFO", "WARNING", "ERROR"]
 
 
-def _log(message: str) -> None:
-    """Write one watchdog log line to container stdout."""
-    print(f"[watchdog] {message}", flush=True)
+def _service_version() -> str:
+    """Return the installed build version without importing the application."""
+    try:
+        return version("therapy")
+    except PackageNotFoundError:
+        return "unknown"
+
+
+SERVICE_VERSION = _service_version()
+
+
+def _log(
+    event_name: str,
+    *,
+    operation: Operation,
+    outcome: Outcome,
+    severity: Severity = "INFO",
+    duration_ms: float | None = None,
+    error_type: str | None = None,
+    retry_count: int | None = None,
+    count: int | None = None,
+) -> None:
+    """Write one fixed-schema watchdog record to container stdout."""
+    try:
+        created = time.time()
+        payload: dict[str, str | float | int] = {
+            "timestamp": time.strftime(
+                "%Y-%m-%dT%H:%M:%S", time.gmtime(created)
+            )
+            + f".{int(created % 1 * 1000):03d}Z",
+            "severity": severity,
+            "event.name": event_name,
+            "service.name": "therapy",
+            "service.version": SERVICE_VERSION,
+            "service.instance.id": f"watchdog-{os.getpid()}",
+            "deployment.environment": _environment(),
+            "component": "watchdog",
+            "operation": operation,
+            "outcome": outcome,
+        }
+        if duration_ms is not None:
+            payload["duration_ms"] = duration_ms
+        if error_type is not None:
+            payload["error.type"] = error_type
+        if retry_count is not None:
+            payload["retry_count"] = retry_count
+        if count is not None:
+            payload["count"] = count
+        print(json.dumps(payload, sort_keys=True), flush=True)
+    except Exception:
+        print(f"[watchdog] {event_name}", flush=True)
+
+
+def _environment() -> str:
+    """Return the bounded deployment environment used by broad telemetry."""
+    environment = os.environ.get("THERAPY_ENVIRONMENT", "development")
+    if environment in {"development", "test", "dogfood", "vps-test"}:
+        return environment
+    return "development"
 
 
 def _exit_code(returncode: int | None) -> int:
@@ -90,6 +152,7 @@ class Watchdog:
         self._consecutive_failures = 0
         self._last_exit_code = 0
         self._last_start = 0.0
+        self._last_success = 0.0
         self._next_probe = 0.0
         self._stop_requested = threading.Event()
 
@@ -99,11 +162,22 @@ class Watchdog:
 
     def start_child(self) -> None:
         """Start the supervised command in its own process session."""
-        _log(f"starting child: {shlex.join(self.cmd)}")
-        self.child = subprocess.Popen(self.cmd, start_new_session=True)
+        try:
+            self.child = subprocess.Popen(self.cmd, start_new_session=True)
+        except OSError as exc:
+            _log(
+                "watchdog.child.start",
+                operation="start",
+                outcome="error",
+                severity="ERROR",
+                error_type=type(exc).__name__,
+            )
+            raise
         self._last_start = time.monotonic()
+        self._last_success = self._last_start
         self._next_probe = self._last_start + self.grace
         self._consecutive_failures = 0
+        _log("watchdog.child.start", operation="start", outcome="success")
 
     def stop_child(self) -> None:
         """Terminate the child process group, escalating to SIGKILL if needed."""
@@ -115,9 +189,14 @@ class Watchdog:
         if child.poll() is not None:
             self._last_exit_code = _exit_code(child.returncode)
             self.child = None
+            _log(
+                "watchdog.child.stop",
+                operation="stop",
+                outcome="success",
+                duration_ms=self._child_uptime_ms(),
+            )
             return
 
-        _log(f"stopping child pid={child.pid}")
         try:
             os.killpg(child.pid, signal.SIGTERM)
         except ProcessLookupError:
@@ -126,7 +205,14 @@ class Watchdog:
         try:
             child.wait(timeout=STOP_TIMEOUT)
         except subprocess.TimeoutExpired:
-            _log(f"child pid={child.pid} ignored SIGTERM; sending SIGKILL")
+            _log(
+                "watchdog.child.stop",
+                operation="stop",
+                outcome="timeout",
+                severity="WARNING",
+                duration_ms=self._child_uptime_ms(),
+                error_type="TimeoutExpired",
+            )
             try:
                 os.killpg(child.pid, signal.SIGKILL)
             except ProcessLookupError:
@@ -135,6 +221,12 @@ class Watchdog:
 
         self._last_exit_code = _exit_code(child.returncode)
         self.child = None
+        _log(
+            "watchdog.child.stop",
+            operation="stop",
+            outcome="success",
+            duration_ms=self._child_uptime_ms(),
+        )
 
     def run_forever(self) -> int:
         """Run until a stop request or signal, returning the child exit code."""
@@ -167,7 +259,7 @@ class Watchdog:
         previous_handlers: list[tuple[int, _SignalHandler]] = []
 
         def handle_stop(signum: int, _frame: FrameType | None) -> None:
-            _log(f"received signal {signum}; shutting down")
+            _log("watchdog.stop.requested", operation="stop", outcome="success")
             self.request_stop()
 
         for signum in (signal.SIGTERM, signal.SIGINT):
@@ -188,34 +280,111 @@ class Watchdog:
         if child is None or child.poll() is None:
             return False
 
+        uptime_ms = self._child_uptime_ms()
         self._last_exit_code = _exit_code(child.returncode)
-        _log(f"child pid={child.pid} exited with code {self._last_exit_code}; restarting")
+        _log(
+            "watchdog.child.exited",
+            operation="restart",
+            outcome="error",
+            severity="WARNING",
+            duration_ms=uptime_ms,
+            retry_count=self.restart_count + 1,
+        )
         self.child = None
         self.restart_count += 1
-        self.start_child()
+        try:
+            self.start_child()
+        except OSError as exc:
+            _log(
+                "watchdog.child.restart",
+                operation="restart",
+                outcome="error",
+                severity="ERROR",
+                duration_ms=uptime_ms,
+                error_type=type(exc).__name__,
+                retry_count=self.restart_count,
+            )
+            raise
+        _log(
+            "watchdog.child.restart",
+            operation="restart",
+            outcome="success",
+            duration_ms=uptime_ms,
+            retry_count=self.restart_count,
+        )
         return True
 
     def _probe_failed(self) -> bool:
         """Probe health and restart the child after too many failures."""
         if probe(self.url, self.timeout):
             if self._consecutive_failures:
-                _log("health probe recovered")
+                _log(
+                    "watchdog.probe.recovered",
+                    operation="probe",
+                    outcome="success",
+                    duration_ms=self._since_last_success_ms(),
+                    count=self._consecutive_failures,
+                )
             self._consecutive_failures = 0
+            self._last_success = time.monotonic()
             return False
 
         self._consecutive_failures += 1
         _log(
-            "health probe failed "
-            f"({self._consecutive_failures}/{self.max_failures})"
+            "watchdog.probe.failed",
+            operation="probe",
+            outcome="error",
+            severity="WARNING",
+            duration_ms=self._since_last_success_ms(),
+            count=self._consecutive_failures,
         )
         if self._consecutive_failures < self.max_failures:
             return False
 
-        _log("health failure threshold reached; restarting child")
+        _log(
+            "watchdog.probe.threshold",
+            operation="probe",
+            outcome="error",
+            severity="ERROR",
+            duration_ms=self._since_last_success_ms(),
+            count=self._consecutive_failures,
+        )
+        uptime_ms = self._child_uptime_ms()
         self.stop_child()
         self.restart_count += 1
-        self.start_child()
+        try:
+            self.start_child()
+        except OSError as exc:
+            _log(
+                "watchdog.child.restart",
+                operation="restart",
+                outcome="error",
+                severity="ERROR",
+                duration_ms=uptime_ms,
+                error_type=type(exc).__name__,
+                retry_count=self.restart_count,
+            )
+            raise
+        _log(
+            "watchdog.child.restart",
+            operation="restart",
+            outcome="success",
+            duration_ms=uptime_ms,
+            retry_count=self.restart_count,
+        )
         return True
+
+    def _child_uptime_ms(self) -> float:
+        """Return current child uptime in milliseconds."""
+        if not self._last_start:
+            return 0.0
+        return round((time.monotonic() - self._last_start) * 1000, 3)
+
+    def _since_last_success_ms(self) -> float:
+        """Return milliseconds since the last successful start or probe."""
+        if not self._last_success:
+            return 0.0
+        return round((time.monotonic() - self._last_success) * 1000, 3)
 
 
 def _float_env(name: str, default: float) -> float:
@@ -253,7 +422,13 @@ def main() -> int:
             grace=_float_env("WATCHDOG_GRACE", DEFAULT_GRACE),
         )
     except ValueError as exc:
-        _log(f"configuration error: {exc}")
+        _log(
+            "watchdog.configuration.invalid",
+            operation="start",
+            outcome="error",
+            severity="ERROR",
+            error_type=type(exc).__name__,
+        )
         return 2
 
     return watchdog.run_forever()

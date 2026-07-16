@@ -1,11 +1,48 @@
 from __future__ import annotations
 
+import json
 import os
 import socket
 import sys
 import threading
 
+import scripts.watchdog as watchdog_module
 from scripts.watchdog import Watchdog, probe
+
+ALLOWED_LOG_FIELDS = frozenset(
+    {
+        "timestamp",
+        "severity",
+        "event.name",
+        "service.name",
+        "service.version",
+        "service.instance.id",
+        "deployment.environment",
+        "trace_id",
+        "span_id",
+        "component",
+        "operation",
+        "outcome",
+        "duration_ms",
+        "error.type",
+        "retry_count",
+        "count",
+    }
+)
+REQUIRED_LOG_FIELDS = frozenset(
+    {
+        "timestamp",
+        "severity",
+        "event.name",
+        "service.name",
+        "service.version",
+        "service.instance.id",
+        "deployment.environment",
+        "component",
+        "operation",
+        "outcome",
+    }
+)
 
 
 def _pid_is_alive(pid: int) -> bool:
@@ -126,3 +163,55 @@ def test_watchdog_restarts_hung_child_and_kills_original_pid(
     assert watchdog.restart_count >= 1
     assert not _pid_is_alive(original_pid)
     assert not thread.is_alive()
+
+
+def test_watchdog_stdout_uses_only_broad_schema_and_hides_child_command(
+    capsys,
+) -> None:
+    command_marker = "full-child-command-must-not-be-logged"
+    watchdog = Watchdog(
+        cmd=[
+            sys.executable,
+            "-c",
+            f"import time; time.sleep(5)  # {command_marker}",
+        ],
+        url="http://127.0.0.1:9/health",
+        interval=1.0,
+        timeout=0.05,
+        max_failures=3,
+        grace=0.0,
+    )
+    try:
+        watchdog.start_child()
+        assert watchdog._probe_failed() is False
+    finally:
+        watchdog.stop_child()
+
+    output = capsys.readouterr().out
+    records = [json.loads(line) for line in output.splitlines()]
+    assert records
+    assert command_marker not in output
+    assert all(REQUIRED_LOG_FIELDS <= record.keys() for record in records)
+    assert all(record.keys() <= ALLOWED_LOG_FIELDS for record in records)
+    assert all(record["component"] == "watchdog" for record in records)
+    probe_failure = next(
+        record
+        for record in records
+        if record["event.name"] == "watchdog.probe.failed"
+    )
+    assert probe_failure["count"] == 1
+
+
+def test_watchdog_plain_fallback_survives_broken_json(monkeypatch, capsys) -> None:
+    def broken_dumps(*_args, **_kwargs) -> str:
+        raise RuntimeError("broken encoder")
+
+    monkeypatch.setattr(watchdog_module.json, "dumps", broken_dumps)
+
+    watchdog_module._log(
+        "watchdog.emitter.failure",
+        operation="probe",
+        outcome="error",
+    )
+
+    assert capsys.readouterr().out == "[watchdog] watchdog.emitter.failure\n"

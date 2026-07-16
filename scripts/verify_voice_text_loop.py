@@ -34,6 +34,8 @@ import sys
 import time
 from dataclasses import dataclass, field
 from fractions import Fraction
+from importlib.metadata import PackageNotFoundError, version
+from typing import Literal
 
 import httpx
 import numpy as np
@@ -47,6 +49,31 @@ SERVER = "http://localhost:8000"
 RATE = 48_000
 FRAME_SAMPLES = RATE // 50  # 20 ms
 VOICED_RMS = 200.0  # int16 RMS above which a frame counts as bot speech
+SCRIPT_NAME = "verify_voice_text_loop"
+SCENARIOS = frozenset({"voice-text-loop"})
+
+type VerificationResult = Literal["pass", "fail"]
+
+
+def build_verification_record(
+    *, scenario: str, duration_s: float, result: VerificationResult
+) -> dict[str, str | float]:
+    """Build the final bounded verification record."""
+    if scenario not in SCENARIOS:
+        raise ValueError("unsupported verification scenario")
+    try:
+        build = version("therapy")
+    except PackageNotFoundError:
+        build = "unknown"
+    return {
+        "record": "verification",
+        "script": SCRIPT_NAME,
+        "build": build,
+        "scenario": scenario,
+        "duration_s": duration_s,
+        "result": result,
+        "environment": "test",
+    }
 
 # Distinct male "user" voices so the harness never hears itself in the
 # assistant's (female) voices.
@@ -429,5 +456,26 @@ async def main() -> None:
     print("\nPASS — all scenarios green.")
 
 
+def _run_with_record() -> None:
+    """Run the verifier and always leave its machine record last on stdout."""
+    started = time.monotonic()
+    result: VerificationResult = "fail"
+    try:
+        asyncio.run(main())
+    except SystemExit as exc:
+        if exc.code in (None, 0):
+            result = "pass"
+        raise
+    else:
+        result = "pass"
+    finally:
+        record = build_verification_record(
+            scenario="voice-text-loop",
+            duration_s=time.monotonic() - started,
+            result=result,
+        )
+        print(json.dumps(record), flush=True)
+
+
 if __name__ == "__main__":
-    asyncio.run(main())
+    _run_with_record()

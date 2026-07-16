@@ -139,6 +139,8 @@ services:
       - --no-cli
       - --no-tls
       - --no-dtls
+      - --prometheus
+      - --prometheus-port=9641
       # Relay sockets stay on the compose network (reachable by the pipeline);
       # only the control port is published to the host.
       - --min-port=49160

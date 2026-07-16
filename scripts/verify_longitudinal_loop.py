@@ -19,12 +19,38 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
-from typing import BinaryIO
+from typing import BinaryIO, Literal
 
 import httpx
 
 RESULTS: list[str] = []
+SCRIPT_NAME = "verify_longitudinal_loop"
+SCENARIOS = frozenset({"longitudinal-loop"})
+
+type VerificationResult = Literal["pass", "fail"]
+
+
+def build_verification_record(
+    *, scenario: str, duration_s: float, result: VerificationResult
+) -> dict[str, str | float]:
+    """Build the final bounded verification record."""
+    if scenario not in SCENARIOS:
+        raise ValueError("unsupported verification scenario")
+    try:
+        build = version("therapy")
+    except PackageNotFoundError:
+        build = "unknown"
+    return {
+        "record": "verification",
+        "script": SCRIPT_NAME,
+        "build": build,
+        "scenario": scenario,
+        "duration_s": duration_s,
+        "result": result,
+        "environment": "test",
+    }
 
 
 def _pass(label: str, detail: str) -> None:
@@ -383,5 +409,22 @@ def main() -> int:
     return 0
 
 
+def _run_with_record() -> int:
+    """Run the verifier and always leave its machine record last on stdout."""
+    started = time.monotonic()
+    exit_code = 1
+    try:
+        exit_code = main()
+        return exit_code
+    finally:
+        result: VerificationResult = "pass" if exit_code == 0 else "fail"
+        record = build_verification_record(
+            scenario="longitudinal-loop",
+            duration_s=time.monotonic() - started,
+            result=result,
+        )
+        print(json.dumps(record), flush=True)
+
+
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(_run_with_record())

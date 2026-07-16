@@ -24,6 +24,8 @@ import subprocess
 import sys
 import time
 from fractions import Fraction
+from importlib.metadata import PackageNotFoundError, version
+from typing import Literal
 
 import httpx
 import numpy as np
@@ -35,6 +37,33 @@ SERVER = "http://localhost:8000"
 RATE = 48_000
 FRAME_SAMPLES = RATE // 50  # 20 ms
 FACT_TOKEN = "Nebulosa"  # distinctive enough to be unambiguous in replies
+SCRIPT_NAME = "verify_memory_continuity"
+SCENARIOS = frozenset({"memory-continuity"})
+
+type VerificationResult = Literal["pass", "fail"]
+
+
+def build_verification_record(
+    *, scenario: str, duration_s: float, result: VerificationResult
+) -> dict[str, str | float]:
+    """Build the final bounded verification record."""
+    if scenario not in SCENARIOS:
+        raise ValueError("unsupported verification scenario")
+    try:
+        build = version("therapy")
+    except PackageNotFoundError:
+        build = "unknown"
+    return {
+        "record": "verification",
+        "script": SCRIPT_NAME,
+        "build": build,
+        "scenario": scenario,
+        "duration_s": duration_s,
+        "result": result,
+        "environment": "test",
+    }
+
+
 SESSION_A_TURNS = [
     f"Hola, te quería contar algo: acabo de adoptar una perrita y le puse {FACT_TOKEN}.",
     f"Sí, {FACT_TOKEN} es una cachorra mestiza, la encontré cerca del trabajo.",
@@ -295,5 +324,26 @@ async def main() -> None:
     print("\nPASS — continuity, export, and delete all verified.")
 
 
+def _run_with_record() -> None:
+    """Run the verifier and always leave its machine record last on stdout."""
+    started = time.monotonic()
+    result: VerificationResult = "fail"
+    try:
+        asyncio.run(main())
+    except SystemExit as exc:
+        if exc.code in (None, 0):
+            result = "pass"
+        raise
+    else:
+        result = "pass"
+    finally:
+        record = build_verification_record(
+            scenario="memory-continuity",
+            duration_s=time.monotonic() - started,
+            result=result,
+        )
+        print(json.dumps(record), flush=True)
+
+
 if __name__ == "__main__":
-    asyncio.run(main())
+    _run_with_record()
