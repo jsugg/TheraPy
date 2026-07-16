@@ -177,6 +177,59 @@ def health() -> dict[str, str]:
     return {"status": "ok", "version": __version__}
 
 
+@app.get("/ready")
+def ready() -> dict[str, object]:
+    """Readiness model (obs plan O3.1): bounded checks, enums only.
+
+    External LLM/push state may degrade readiness detail but never fails
+    liveness or restarts the process. No paths, errors, or IDs in the body.
+    """
+    import shutil
+
+    checks: dict[str, str] = {}
+    data_dir = Path(os.environ.get("THERAPY_DATA_DIR", "data"))
+
+    try:
+        connection = sqlite3.connect(data_dir / "therapy.db", timeout=2.0)
+        try:
+            connection.execute("SELECT 1").fetchone()
+            row = connection.execute("PRAGMA user_version").fetchone()
+            checks["db"] = "ready"
+            checks["schema"] = f"v{row[0]}" if row else "unknown"
+        finally:
+            connection.close()
+    except sqlite3.Error:
+        checks["db"] = "degraded"
+        checks["schema"] = "unknown"
+
+    try:
+        probe = data_dir / ".ready-probe"
+        probe.write_text("ok")
+        probe.unlink()
+        free = shutil.disk_usage(data_dir).free
+        checks["data_dir"] = "ready" if free > 512 * 1024 * 1024 else "degraded"
+    except OSError:
+        checks["data_dir"] = "degraded"
+
+    from therapy.observability.capture import capture_service
+    from therapy.observability.health import registry
+
+    checks["capture"] = (
+        "ready"
+        if capture_service() is not None and capture_service().writer is not None
+        else "degraded"
+    )
+    checks["voice"] = "ready" if _voice_gateway is not None else "starting"
+    for name, snapshot in registry().snapshot().items():
+        checks[f"component.{name}"] = str(snapshot["state"])
+
+    degraded = [name for name, state in checks.items() if state == "degraded"]
+    return {
+        "status": "degraded" if degraded else "ready",
+        "checks": checks,
+    }
+
+
 def _resolve_session(
     store: MemoryStore, *, new_session: bool, explicit: str | None
 ) -> tuple[str | None, bool]:

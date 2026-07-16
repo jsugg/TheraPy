@@ -239,6 +239,7 @@ class RoutePolicy:
 
 HTTP_ROUTE_MANIFEST: tuple[RoutePolicy, ...] = (
     RoutePolicy("GET", "/health", "health", broad_traced=False),
+    RoutePolicy("GET", "/ready", "ready", broad_traced=False),
     RoutePolicy("POST", "/api/offer", "offer"),
     RoutePolicy("POST", "/api/voice/disconnect", "disconnect_voice"),
     RoutePolicy("GET", "/api/ice-config", "ice_config"),

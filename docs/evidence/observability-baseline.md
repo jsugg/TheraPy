@@ -117,6 +117,40 @@ Storage at run time: data dir **334,248,194 B**; container stdout log since
 start **397,948 B / 5,406 lines** (Docker default `json-file`, unbounded —
 O1.5 replaces it with the `local` driver + caps).
 
+## 2.5 O2 telemetry off/on comparison (2026-07-16)
+
+Matched disposable instances (identical image/volumes, fresh data dirs;
+`baseline-offd-*` vs `baseline-on-*` under `.local/obs-baseline/`); the on
+instance exported to the compose collector -> LGTM and Phoenix.
+
+| Workload (p50 s) | off | on |
+|---|---:|---:|
+| /health | 0.0013 | 0.0012 |
+| /api/sessions | 0.0029 | 0.0036 |
+| /api/graph | 0.0089 | 0.0084 |
+| research query | 0.0041 | 0.0042 |
+| agent turn (deterministic) | 0.0556 | 0.0553 |
+| scheduler run | 0.0275 | 0.0382 |
+| research ingest (n=2, warm-up variance) | 0.029 | 0.085 |
+
+Idle CPU mean: off 1.40% vs on 0.24% (both noise-level); under-load CPU
+mean off 7.0% vs on 4.0% — **steady-state overhead well under the 2%
+budget**. Idle RSS: off 55.7 MB vs on 74.1 MB (+18 MB, the OTel SDK).
+The ingest p50 delta (2 samples, embedding warm-up) is flagged for O4
+re-measurement.
+
+Scripted voice off/on: both runs **PASS all scenarios**. Warm steady-state
+turns show no meaningful TTFA regression (off 15.55/7.96/27.97 s vs on
+13.04/9.98/15.79 s for pinned/unpinned/anchor); the on run's first turns
+were slower (66.6 s cold es) because that instance was freshly started
+while the off reference ran on a long-warm container — an instance-warmth
+confound, re-measured on one instance across the flag flip in O4 dogfood.
+
+Live routing verification (same session): broad Prometheus series carry
+route templates only (`/api/sessions/{session_id}`); zero canary hits in
+metric names/labels and Tempo; Phoenix holds the restricted attempt,
+ACK-recorded against journaled IDs.
+
 ## 3. Remaining measurements (named deferrals)
 
 - **Data restore duration:** destructive against the live owner volume;

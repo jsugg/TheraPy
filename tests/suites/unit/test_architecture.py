@@ -172,6 +172,8 @@ def test_pipecat_observability_adapter_is_the_only_pipecat_telemetry_seam(
         "therapy.observability.logging",
         "therapy.observability.capture",
         "therapy.observability.interactions",
+        # owned span/link helpers (lazy OTel; no Pipecat types cross here)
+        "therapy.observability.telemetry",
     }
     violations: list[str] = []
     pipecat_root = repo_root / PIPECAT_ROOT

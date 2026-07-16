@@ -810,7 +810,23 @@ class ProactivityScheduler:
         """Tick until application shutdown without blocking the event loop."""
         while not self._stop.is_set():
             try:
-                await asyncio.to_thread(self.service.tick)
+                processed = await asyncio.to_thread(self.service.tick)
+                if processed:
+                    # only non-empty batches get a trace root (obs plan
+                    # O2.2/O2.3: empty ticks are metric-only, never spans)
+                    from therapy.observability.context import current_trace_context
+                    from therapy.observability.telemetry import link_root
+
+                    parent = current_trace_context()
+                    with link_root(
+                        "proactivity.batch",
+                        component="scheduler",
+                        operation="tick",
+                        parent_trace_id=parent.trace_id,
+                        parent_span_id=parent.span_id,
+                    ) as span:
+                        if span is not None:
+                            span.set_attribute("count", processed)
             except Exception as exc:
                 emit_event(
                     "scheduler.tick_failed",

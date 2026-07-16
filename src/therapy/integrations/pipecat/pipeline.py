@@ -1032,12 +1032,30 @@ async def run_bot(
         await task.queue_frames(frames)
 
     finalized = False
+    # Detached finalizers get a NEW linked trace root, never a multi-hour
+    # parent span (obs plan O2.2); the link joins it to the voice connection.
+    from therapy.observability.context import current_trace_context
+
+    _finalize_parent = current_trace_context()
 
     async def finalize_session() -> None:
         """Summarize, distill, and close the session (SPEC §8) off the pipeline path."""
         nonlocal finalized
         if finalized:
             return
+        from therapy.observability.telemetry import link_root
+
+        with link_root(
+            "session.finalize",
+            component="voice",
+            operation="finalize",
+            parent_trace_id=_finalize_parent.trace_id,
+            parent_span_id=_finalize_parent.span_id,
+        ):
+            await _finalize_session_inner()
+
+    async def _finalize_session_inner() -> None:
+        nonlocal finalized
         # A reconnect may have resumed this session before this task ran
         # (preemption schedules finalize during cancellation, possibly after
         # the new pipeline already took ownership) — then it is no longer
