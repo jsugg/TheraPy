@@ -32,6 +32,41 @@ MAX_EXTRACTION_ATTEMPTS = 3
 type RawCandidate = Mapping[str, object]
 type Extractor = Callable[[str, list[str]], Awaitable[list[RawCandidate]]]
 type Judger = Callable[[Literal["node", "edge"], Mapping[str, object]], Awaitable[bool]]
+type DistillationAttemptOutcome = Literal["success", "invalid", "retry", "error"]
+type CandidateDisposition = Literal["candidate", "promoted", "proposed", "deferred"]
+
+
+def _record_attempt(outcome: DistillationAttemptOutcome) -> None:
+    """Record one content-free extraction attempt."""
+    from therapy.observability import telemetry
+
+    telemetry.record_metric(
+        "therapy_distillation_attempts_total", 1, {"outcome": outcome}
+    )
+
+
+def _record_candidates(disposition: CandidateDisposition, count: int) -> None:
+    """Record a positive aggregate candidate disposition."""
+    if count <= 0:
+        return
+    from therapy.observability import telemetry
+
+    telemetry.record_metric(
+        "therapy_distillation_candidates_total",
+        count,
+        {"disposition": disposition},
+    )
+
+
+def _record_run(outcome: Literal["success", "error"], *, idempotent: bool) -> None:
+    """Record a content-free session distillation result."""
+    from therapy.observability import telemetry
+
+    telemetry.record_metric(
+        "therapy_distillation_runs_total",
+        1,
+        {"outcome": outcome, "idempotent": str(idempotent).lower()},
+    )
 
 
 class CandidateValidationError(ValueError):
@@ -343,18 +378,27 @@ async def _extract_with_retry(
     for attempt in range(MAX_EXTRACTION_ATTEMPTS):
         try:
             validated = validate_candidates(await extractor(transcript, observations))
-            return verify_quotes(validated, turns, session_id)
+            verified = verify_quotes(validated, turns, session_id)
+        except TimeoutError as error:
+            _record_attempt("retry")
+            last_error = error
         except (
             CandidateValidationError,
             json.JSONDecodeError,
-            TimeoutError,
             ValueError,
         ) as error:
+            _record_attempt("invalid")
             last_error = error
-            if attempt + 1 == MAX_EXTRACTION_ATTEMPTS:
-                break
-            delay = (0.05 * (2**attempt)) + random.uniform(0.0, 0.03)
-            await asyncio.sleep(delay)
+        except Exception:
+            _record_attempt("error")
+            raise
+        else:
+            _record_attempt("success")
+            return verified
+        if attempt + 1 == MAX_EXTRACTION_ATTEMPTS:
+            break
+        delay = (0.05 * (2**attempt)) + random.uniform(0.0, 0.03)
+        await asyncio.sleep(delay)
     if last_error is None:
         raise RuntimeError("extractor retry loop ended without result")
     raise last_error
@@ -387,8 +431,10 @@ async def graduate(
                     (proposed_nodes if claim_kind == "node" else proposed_edges).append(
                         claim_id
                     )
+                    _record_candidates("proposed", 1)
             else:
                 model.defer_proposal(claim_kind, claim_id)
+                _record_candidates("deferred", 1)
     return proposed_nodes, proposed_edges
 
 
@@ -419,28 +465,34 @@ async def distill_session(
     extractor_version: str = EXTRACTOR_VERSION,
 ) -> DistillResult:
     """Distill one session idempotently; failed validation consumes nothing."""
-    if session_id is None:
-        raise ValueError("session_id is required")
-    run_id = model.start_distillation_run(session_id, extractor_version)
-    existing = model.distillation_run(run_id)
-    if existing is not None and existing["state"] == "succeeded":
-        result = cast(dict[str, list[int]], existing.get("result", {}))
-        return DistillResult(
-            run_id=run_id,
-            promoted_nodes=[int(item) for item in result.get("node_ids", [])],
-            promoted_edges=[int(item) for item in result.get("edge_ids", [])],
-            processed_observations=[
-                int(row["id"])
-                for row in model.pending_observations(
-                    session_id, include_processed=True
-                )
-                if row.get("distillation_run_id") == run_id
-            ],
-        )
-    pending = model.pending_observations(session_id)
-    observation_texts = [str(row["text"]) for row in pending]
-    transcript = render_transcript(turns)
+    run_id: str | None = None
     try:
+        if session_id is None:
+            raise ValueError("session_id is required")
+        run_id = model.start_distillation_run(session_id, extractor_version)
+        existing = model.distillation_run(run_id)
+        if existing is not None and existing["state"] == "succeeded":
+            result = cast(dict[str, list[int]], existing.get("result", {}))
+            promoted_nodes = [int(item) for item in result.get("node_ids", [])]
+            promoted_edges = [int(item) for item in result.get("edge_ids", [])]
+            idempotent_result = DistillResult(
+                run_id=run_id,
+                promoted_nodes=promoted_nodes,
+                promoted_edges=promoted_edges,
+                processed_observations=[
+                    int(row["id"])
+                    for row in model.pending_observations(
+                        session_id, include_processed=True
+                    )
+                    if row.get("distillation_run_id") == run_id
+                ],
+            )
+            _record_candidates("promoted", len(promoted_nodes) + len(promoted_edges))
+            _record_run("success", idempotent=True)
+            return idempotent_result
+        pending = model.pending_observations(session_id)
+        observation_texts = [str(row["text"]) for row in pending]
+        transcript = render_transcript(turns)
         verified = await _extract_with_retry(
             extractor or extract_candidates,
             transcript,
@@ -448,6 +500,7 @@ async def distill_session(
             turns,
             session_id,
         )
+        _record_candidates("candidate", len(verified))
         inbox_ids = [int(row["id"]) for row in pending]
         run_id, node_ids, edge_ids = model.apply_distillation(
             session_id=session_id,
@@ -455,11 +508,14 @@ async def distill_session(
             candidates=cast(list[Mapping[str, object]], verified),
             inbox_ids=inbox_ids,
         )
+        _record_candidates("promoted", len(node_ids) + len(edge_ids))
         proposed_nodes, proposed_edges = await graduate(model, judger=judger)
     except Exception as error:
-        model.fail_distillation_run(run_id, error)
+        _record_run("error", idempotent=False)
+        if run_id is not None:
+            model.fail_distillation_run(run_id, error)
         raise
-    return DistillResult(
+    result = DistillResult(
         run_id=run_id,
         promoted_nodes=node_ids,
         promoted_edges=edge_ids,
@@ -467,6 +523,8 @@ async def distill_session(
         proposed_edges=proposed_edges,
         processed_observations=inbox_ids,
     )
+    _record_run("success", idempotent=False)
+    return result
 
 
 __all__ = [

@@ -18,6 +18,23 @@ from therapy.knowledge.user_model import (
 )
 from therapy.memory import MemoryStore
 
+type MetricCall = tuple[str, float, dict[str, str]]
+
+
+@pytest.fixture
+def metric_calls(monkeypatch: pytest.MonkeyPatch) -> list[MetricCall]:
+    from therapy.observability import telemetry
+
+    calls: list[MetricCall] = []
+
+    def capture(
+        name: str, value: float, attrs: dict[str, str] | None = None
+    ) -> None:
+        calls.append((name, value, attrs or {}))
+
+    monkeypatch.setattr(telemetry, "record_metric", capture)
+    return calls
+
 
 def _reinforce_node(model: UserModel, statement: str = "Skips lunch when busy.") -> int:
     node_id: int | None = None
@@ -514,3 +531,192 @@ def test_export_contains_full_provenance_and_no_plaintext_tombstone(
     assert "distillation_runs" in snapshot
     assert "Writes clear plans" not in encoded
     assert len(snapshot["tombstones"][0]["digest"]) == 64
+
+
+def test_graph_mutation_metrics_cover_success_rejection_and_cardinality(
+    tmp_path: Path, metric_calls: list[MetricCall]
+) -> None:
+    model = UserModel(tmp_path)
+    metric_calls.clear()
+
+    source = model.add_user_statement("thread", "A private scheduling thread.")
+    target = model.add_user_statement("pattern", "Uses a written checklist.")
+    assert source is not None
+    assert target is not None
+    edge = model.add_user_edge(
+        source,
+        target,
+        "supports",
+        "The scheduling thread supports checklist use.",
+    )
+    assert edge is not None
+    assert model.edit_node(target, never_initiate=True)
+    assert model.edit_edge(edge, statement="Planning supports checklist use.")
+    assert model.revalidate_stale(datetime.now(UTC) + timedelta(days=100)) == 3
+    _, distilled_nodes, distilled_edges = model.apply_distillation(
+        session_id="metric-session",
+        extractor_version="metric-v1",
+        candidates=[
+            {
+                "kind": "node",
+                "type": "strength",
+                "statement": "Keeps plans concise.",
+            }
+        ],
+        inbox_ids=[],
+    )
+    assert len(distilled_nodes) == 1
+    assert distilled_edges == []
+    assert model.delete_edge(edge)
+    assert model.delete_node(source)
+    assert model.delete_node(999_999) is False
+
+    mutations = [
+        attrs
+        for name, _, attrs in metric_calls
+        if name == "therapy_graph_mutations_total"
+    ]
+    assert {
+        "add_node",
+        "add_edge",
+        "edit",
+        "delete",
+        "revalidate",
+        "distill_apply",
+    } <= {attrs["operation"] for attrs in mutations}
+    assert all(set(attrs) == {"operation", "outcome"} for attrs in mutations)
+    assert all(
+        attrs["operation"]
+        in {
+            "add_node",
+            "add_edge",
+            "edit",
+            "delete",
+            "purge",
+            "revalidate",
+            "distill_apply",
+        }
+        and attrs["outcome"] in {"success", "error", "timeout", "rejected"}
+        for attrs in mutations
+    )
+    assert ("therapy_graph_mutations_total", 1, {"operation": "delete", "outcome": "rejected"}) in metric_calls
+    encoded = json.dumps(metric_calls)
+    assert "private scheduling" not in encoded.casefold()
+    assert "metric-session" not in encoded
+
+
+def test_never_store_metrics_count_only_bounded_storage_classes(
+    tmp_path: Path, metric_calls: list[MetricCall]
+) -> None:
+    model = UserModel(tmp_path)
+    sensitive = model.add_user_statement("thread", "A private recurring matter.")
+    safe = model.add_user_statement("strength", "Uses clear plans.")
+    assert sensitive is not None
+    assert safe is not None
+    edge = model.add_user_edge(
+        sensitive, safe, "about", "The private matter affects planning."
+    )
+    assert edge is not None
+    assert model.add_observation("A private follow-up.") is not None
+    with sqlite3.connect(tmp_path / "therapy.db") as connection:
+        connection.execute(
+            """
+            INSERT INTO research_documents (
+                source_title, source_ref, filename, media_type, format,
+                content_hash, original_size, artifact_path, extracted_markdown,
+                status, ingested_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?)
+            """,
+            (
+                "Private notes",
+                "owner-upload",
+                "notes.txt",
+                "text/plain",
+                "text",
+                "test-hash",
+                10,
+                "A private research note.",
+                "indexed",
+                datetime.now(UTC).isoformat(),
+                datetime.now(UTC).isoformat(),
+            ),
+        )
+    metric_calls.clear()
+
+    purge = model.add_boundary("never_store", "private")
+    assert purge["graph_claims_removed"] == 2
+    assert purge["inbox_rows_removed"] == 1
+    assert purge["research_documents_removed"] == 1
+    assert model.add_observation("Another private follow-up.") is None
+    assert model.add_user_statement("thread", "Another private matter.") is None
+    assert model.edit_node(safe, statement="A private plan.") is False
+
+    suppressions = [
+        (value, attrs)
+        for name, value, attrs in metric_calls
+        if name == "therapy_never_store_suppressions_total"
+    ]
+    assert all(set(attrs) == {"table_class"} for _, attrs in suppressions)
+    assert all(
+        attrs["table_class"] in {"node", "edge", "file", "turn"}
+        for _, attrs in suppressions
+    )
+    totals = {
+        table_class: sum(
+            value
+            for value, attrs in suppressions
+            if attrs["table_class"] == table_class
+        )
+        for table_class in {"node", "edge", "file", "turn"}
+    }
+    assert totals["node"] == 3
+    assert totals["edge"] == 1
+    assert totals["file"] == 1
+    assert totals["turn"] == 2
+    assert (
+        "therapy_graph_mutations_total",
+        1,
+        {"operation": "purge", "outcome": "success"},
+    ) in metric_calls
+    assert "private" not in json.dumps(metric_calls).casefold()
+
+
+def test_graph_mutation_unexpected_exception_records_error_without_content(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    metric_calls: list[MetricCall],
+) -> None:
+    model = UserModel(tmp_path)
+    metric_calls.clear()
+
+    def fail(*_args: object, **_kwargs: object) -> int | None:
+        raise RuntimeError("private statement and node 42")
+
+    monkeypatch.setattr(model, "_upsert_node", fail)
+    with pytest.raises(RuntimeError, match="private statement"):
+        model.add_user_statement("thread", "Content must stay restricted.")
+
+    assert metric_calls == [
+        (
+            "therapy_graph_mutations_total",
+            1,
+            {"operation": "add_node", "outcome": "error"},
+        )
+    ]
+    assert "private statement" not in json.dumps(metric_calls).casefold()
+
+
+def test_graph_read_paths_do_not_emit_mutation_metrics(
+    tmp_path: Path, metric_calls: list[MetricCall]
+) -> None:
+    model = UserModel(tmp_path)
+    assert model.add_user_statement("strength", "Uses clear plans.") is not None
+    metric_calls.clear()
+
+    model.nodes()
+    model.edges()
+    model.graph_walk("clear plans")
+
+    assert not any(
+        name == "therapy_graph_mutations_total" for name, _, _ in metric_calls
+    )

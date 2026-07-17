@@ -30,6 +30,18 @@ type Recapper = Callable[[str], Awaitable[str]]
 type InsightState = Literal[
     "queued", "delivered", "snoozed", "confirmed", "rejected", "dismissed"
 ]
+type InsightMetricState = Literal[
+    "proposed", "delivered", "snoozed", "dismissed", "confirmed", "rejected"
+]
+
+
+def _record_transition(state: InsightMetricState) -> None:
+    """Record one content-free insight state transition."""
+    from therapy.observability import telemetry
+
+    telemetry.record_metric(
+        "therapy_insight_transitions_total", 1, {"state": state}
+    )
 
 
 class InsightRecord(TypedDict):
@@ -154,6 +166,16 @@ class InsightService:
         finally:
             connection.close()
 
+    def _record_queue_depth(self) -> None:
+        """Record the number of records currently eligible for delivery."""
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT count(*) AS count FROM pending_insights WHERE state = 'queued'"
+            ).fetchone()
+        from therapy.observability import telemetry
+
+        telemetry.record_metric("therapy_insight_queue_depth", int(row["count"]), {})
+
     def sync_proposals(self) -> int:
         """Materialize graph proposal events into durable queue records."""
         created = 0
@@ -199,7 +221,11 @@ class InsightService:
                             now,
                         ),
                     )
-                    created += int(cursor.rowcount > 0)
+                    inserted = cursor.rowcount > 0
+                    created += int(inserted)
+            if inserted:
+                _record_transition("proposed")
+                self._record_queue_depth()
         return created
 
     def list(self, *, state: InsightState | None = None) -> list[InsightRecord]:
@@ -224,13 +250,15 @@ class InsightService:
         now = _utc_now()
         with self._connect() as connection:
             with connection:
-                connection.execute(
+                cursor = connection.execute(
                     """
                     UPDATE pending_insights SET state = 'queued', updated_at = ?
                     WHERE state = 'snoozed' AND snoozed_until <= ?
                     """,
                     (now, now),
                 )
+        if cursor.rowcount:
+            self._record_queue_depth()
         return self.list(state="queued")
 
     def next_for_topic(
@@ -285,6 +313,8 @@ class InsightService:
                 if cursor.rowcount != 1:
                     return None
                 self._history(connection, selected["id"], "delivered", session_id)
+        _record_transition("delivered")
+        self._record_queue_depth()
         count = selected["evidence_snapshot"]["auditable_sessions"]
         reflection = (
             f"I have noticed this across {count} conversations: "
@@ -380,6 +410,8 @@ class InsightService:
                 updated = connection.execute(
                     "SELECT * FROM pending_insights WHERE id = ?", (insight["id"],)
                 ).fetchone()
+        _record_transition(cast(InsightMetricState, target))
+        self._record_queue_depth()
         return self._shape(updated)
 
     def snooze(self, insight_id: str, *, days: int = 7) -> bool:
@@ -399,7 +431,11 @@ class InsightService:
                 )
                 if cursor.rowcount:
                     self._history(connection, insight_id, "snoozed", None)
-        return cursor.rowcount > 0
+        changed = cursor.rowcount > 0
+        if changed:
+            _record_transition("snoozed")
+            self._record_queue_depth()
+        return changed
 
     def resolve(
         self,
@@ -461,6 +497,8 @@ class InsightService:
                 updated = connection.execute(
                     "SELECT * FROM pending_insights WHERE id = ?", (insight_id,)
                 ).fetchone()
+        _record_transition(target)
+        self._record_queue_depth()
         return self._shape(updated)
 
     def resolve_claim(
@@ -495,7 +533,11 @@ class InsightService:
                 if target == "confirmed"
                 else self.model.reject_edge
             )
-        return callback(claim_id)
+        changed = callback(claim_id)
+        if changed:
+            _record_transition(target)
+            self._record_queue_depth()
+        return changed
 
     def dismiss_claim(self, claim_kind: ClaimKind, claim_id: int) -> int:
         """Dismiss active queue snapshots superseded by an authoritative edit."""
@@ -523,7 +565,11 @@ class InsightService:
                 )
                 if cursor.rowcount:
                     self._history(connection, insight_id, "dismissed", None)
-        return cursor.rowcount > 0
+        changed = cursor.rowcount > 0
+        if changed:
+            _record_transition("dismissed")
+            self._record_queue_depth()
+        return changed
 
     def history(self, insight_id: str) -> list[dict[str, object]]:
         """Return delivery/snooze/resolution audit history."""
