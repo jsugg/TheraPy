@@ -8,9 +8,12 @@ owner-controlled cache on first use. Tests inject a deterministic backend.
 from __future__ import annotations
 
 import os
+import time
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Protocol
+from typing import Literal, Protocol
 
 import numpy as np
 
@@ -18,6 +21,38 @@ MODEL_NAME = "intfloat/multilingual-e5-small"
 MODEL_REVISION = "fd1525a9fd15316a2d503bf26ab031a61d056e98"
 MODEL_DIMENSION = 384
 MODEL_FILE = "onnx/model_O4.onnx"
+
+type EmbeddingCache = Literal["cold", "warm"]
+
+
+def _record_metric(name: str, value: float, attributes: dict[str, str]) -> None:
+    """Record a content-free embedding metric through the manifest guard."""
+    from therapy.observability import telemetry
+
+    telemetry.record_metric(name, value, attributes)
+
+
+@contextmanager
+def _embedding_batch(cache: EmbeddingCache) -> Iterator[None]:
+    """Time one embedding call without exposing inputs, vectors, or cache paths."""
+    started = time.monotonic()
+    outcome = "success"
+    try:
+        yield
+    except Exception:
+        outcome = "error"
+        raise
+    finally:
+        _record_metric(
+            "therapy_embedding_batches_total",
+            1,
+            {"cache": cache, "outcome": outcome},
+        )
+        _record_metric(
+            "therapy_embedding_seconds",
+            time.monotonic() - started,
+            {"cache": cache},
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -46,6 +81,12 @@ class EmbeddingBackend(Protocol):
         ...
 
 
+class _EmbeddingModel(Protocol):
+    """Structural subset of FastEmbed used by this adapter."""
+
+    def embed(self, texts: list[str]) -> Iterator[object]: ...
+
+
 class FastEmbedBackend:
     """Lazy CPU ONNX backend with owner-local versioned cache."""
 
@@ -53,13 +94,13 @@ class FastEmbedBackend:
         root = data_dir or Path(os.environ.get("THERAPY_DATA_DIR", "./data"))
         self.cache_dir = root / "models" / "embeddings" / MODEL_REVISION
         self.cache_dir.mkdir(parents=True, exist_ok=True)
-        self._model: object | None = None
+        self._model: _EmbeddingModel | None = None
 
     @property
     def metadata(self) -> EmbeddingMetadata:
         return EmbeddingMetadata(MODEL_NAME, MODEL_REVISION, MODEL_DIMENSION)
 
-    def _load(self):
+    def _load(self) -> _EmbeddingModel:
         if self._model is not None:
             return self._model
         try:
@@ -69,7 +110,9 @@ class FastEmbedBackend:
             raise RuntimeError(
                 "fastembed is required for local semantic retrieval; install project dependencies"
             ) from error
-        supported = {str(item["model"]) for item in TextEmbedding.list_supported_models()}
+        supported = {
+            str(item["model"]) for item in TextEmbedding.list_supported_models()
+        }
         if MODEL_NAME not in supported:
             TextEmbedding.add_custom_model(
                 model=MODEL_NAME,
@@ -98,17 +141,21 @@ class FastEmbedBackend:
         """Embed passages with E5-required task prefix."""
         if not texts:
             return []
-        model = self._load()
-        vectors = list(model.embed([f"passage: {text}" for text in texts]))
-        return [self._validated(vector) for vector in vectors]
+        cache: EmbeddingCache = "cold" if self._model is None else "warm"
+        with _embedding_batch(cache):
+            model = self._load()
+            vectors = list(model.embed([f"passage: {text}" for text in texts]))
+            return [self._validated(vector) for vector in vectors]
 
     def embed_query(self, text: str) -> np.ndarray:
         """Embed query with E5-required task prefix."""
         if not text.strip():
             raise ValueError("query text must not be empty")
-        model = self._load()
-        vector = next(iter(model.embed([f"query: {text}"])))
-        return self._validated(vector)
+        cache: EmbeddingCache = "cold" if self._model is None else "warm"
+        with _embedding_batch(cache):
+            model = self._load()
+            vector = next(iter(model.embed([f"query: {text}"])))
+            return self._validated(vector)
 
     def _validated(self, value: object) -> np.ndarray:
         vector = np.asarray(value, dtype=np.float32)

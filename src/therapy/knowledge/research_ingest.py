@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import io
+import logging
 import os
 import re
+import time
 from dataclasses import dataclass
 from html.parser import HTMLParser
 from pathlib import Path
-from typing import TYPE_CHECKING, Protocol
+from typing import TYPE_CHECKING, Literal, Protocol
 
 if TYPE_CHECKING:
     from PIL.Image import Image
@@ -18,6 +20,7 @@ MAX_SOURCE_PAGES = 300
 MAX_SOURCE_CHARS = 5_000_000
 MAX_IMAGE_PIXELS = 40_000_000
 OCR_REVIEW_THRESHOLD = 0.75
+OCR_TIMEOUT_SECONDS = 30.0
 
 _SUPPORTED_EXTENSIONS = {
     ".pdf": "pdf",
@@ -37,6 +40,51 @@ _IGNORED_HTML = {"script", "style", "nav", "header", "footer", "form", "svg"}
 _HEADING_RE = re.compile(r"^(#{1,6})\s+(.+?)\s*$")
 _SPACE_RE = re.compile(r"\s+")
 _SLUG_RE = re.compile(r"[^a-z0-9]+")
+
+type OCROutcome = Literal["success", "timeout", "error", "skipped"]
+type OCRStageOutcome = Literal["success", "error", "timeout", "rejected"]
+
+
+def _record_metric(name: str, value: float, attributes: dict[str, str]) -> None:
+    """Record content-free OCR telemetry through the shared manifest guard."""
+    from therapy.observability import telemetry
+
+    telemetry.record_metric(name, value, attributes)
+
+
+def _record_ocr_run(
+    outcome: OCROutcome,
+    *,
+    duration: float | None = None,
+    count: int = 1,
+) -> None:
+    """Record an aggregate OCR attempt using only manifest enums."""
+    _record_metric("therapy_ocr_runs_total", float(count), {"outcome": outcome})
+    if duration is not None and outcome != "skipped":
+        _record_metric("therapy_ocr_seconds", duration, {"outcome": outcome})
+
+
+def _record_ocr_stage(duration: float, outcome: OCRStageOutcome) -> None:
+    """Record the OCR portion of research extraction without page labels."""
+    _record_metric(
+        "therapy_research_stage_seconds",
+        duration,
+        {"stage": "ocr", "outcome": outcome},
+    )
+
+
+def _emit_ocr_validation(outcome: str, error_type: str | None) -> None:
+    """Emit the one-time local OCR backend validity result."""
+    from therapy.observability import logging as observability_logging
+
+    observability_logging.emit_event(
+        "research_ocr_cold_start",
+        component="research_ocr",
+        operation="validate_backend",
+        outcome=outcome,
+        severity=logging.INFO if outcome == "success" else logging.ERROR,
+        error_type=error_type,
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -162,23 +210,43 @@ class TesseractOCR:
 
     def __init__(self, languages: str | None = None) -> None:
         self.languages = languages or os.getenv("THERAPY_OCR_LANGUAGES", "eng+spa+por")
+        self._validation_reported = False
+        self._metadata: dict[str, object] | None = None
 
     @property
     def metadata(self) -> dict[str, object]:
-        import pytesseract
+        if self._metadata is not None:
+            return dict(self._metadata)
+        try:
+            import pytesseract
 
-        requested = self.languages.split("+")
-        installed = set(pytesseract.get_languages(config=""))
-        missing = sorted(set(requested) - installed)
-        if missing:
-            raise RuntimeError(
-                "Missing local Tesseract language packs: " + ", ".join(missing)
-            )
-        return {
-            "engine": "tesseract",
-            "version": str(pytesseract.get_tesseract_version()).splitlines()[0],
-            "languages": requested,
-        }
+            requested = self.languages.split("+")
+            installed = set(pytesseract.get_languages(config=""))
+            missing = sorted(set(requested) - installed)
+            if missing:
+                raise RuntimeError(
+                    "Missing local Tesseract language packs: " + ", ".join(missing)
+                )
+            metadata = {
+                "engine": "tesseract",
+                "version": str(pytesseract.get_tesseract_version()).splitlines()[0],
+                "languages": requested,
+            }
+        except Exception as error:
+            if not self._validation_reported:
+                error_type = (
+                    "missing_dependency"
+                    if isinstance(error, ImportError)
+                    else "invalid_backend"
+                )
+                _emit_ocr_validation("error", error_type)
+                self._validation_reported = True
+            raise
+        if not self._validation_reported:
+            _emit_ocr_validation("success", None)
+            self._validation_reported = True
+        self._metadata = metadata
+        return dict(metadata)
 
     @staticmethod
     def _prepare(image: Image) -> Image:
@@ -189,7 +257,7 @@ class TesseractOCR:
         if prepared.width * prepared.height > MAX_IMAGE_PIXELS:
             raise ValueError("image exceeds pixel limit")
         try:
-            osd = pytesseract.image_to_osd(prepared)
+            osd = pytesseract.image_to_osd(prepared, timeout=OCR_TIMEOUT_SECONDS)
             match = re.search(r"Rotate:\s*(90|180|270)", osd)
             if match:
                 prepared = prepared.rotate(-int(match.group(1)), expand=True)
@@ -203,12 +271,18 @@ class TesseractOCR:
         from pytesseract import Output
 
         _ = self.metadata
-        data = pytesseract.image_to_data(
-            self._prepare(image),
-            lang=self.languages,
-            config="--psm 6",
-            output_type=Output.DICT,
-        )
+        try:
+            data = pytesseract.image_to_data(
+                self._prepare(image),
+                lang=self.languages,
+                config="--psm 6",
+                output_type=Output.DICT,
+                timeout=OCR_TIMEOUT_SECONDS,
+            )
+        except RuntimeError as error:
+            if "timeout" in str(error).casefold():
+                raise TimeoutError("local OCR timed out") from error
+            raise
         lines: dict[tuple[int, int, int], list[int]] = {}
         for index, text in enumerate(data["text"]):
             if not str(text).strip():
@@ -348,8 +422,29 @@ def _html_blocks(text: str) -> list[SourceBlock]:
 def _ocr_blocks(
     image: Image, backend: OCRBackend, *, prefix: str, page: int
 ) -> list[SourceBlock]:
+    started = time.monotonic()
+    try:
+        recognized = backend.recognize(image)
+    except TimeoutError:
+        duration = time.monotonic() - started
+        _record_ocr_run("timeout", duration=duration)
+        _record_ocr_stage(duration, "timeout")
+        raise
+    except ValueError:
+        duration = time.monotonic() - started
+        _record_ocr_run("error", duration=duration)
+        _record_ocr_stage(duration, "rejected")
+        raise
+    except Exception:
+        duration = time.monotonic() - started
+        _record_ocr_run("error", duration=duration)
+        _record_ocr_stage(duration, "error")
+        raise
+    duration = time.monotonic() - started
+    _record_ocr_run("success", duration=duration)
+    _record_ocr_stage(duration, "success")
     blocks: list[SourceBlock] = []
-    for index, item in enumerate(backend.recognize(image), start=1):
+    for index, item in enumerate(recognized, start=1):
         text = _normalize(item.text)
         if not text:
             continue
@@ -367,7 +462,9 @@ def _ocr_blocks(
     return blocks
 
 
-def _pdf_blocks(data: bytes, backend: OCRBackend | None) -> list[SourceBlock]:
+def _pdf_blocks(
+    data: bytes, backend: OCRBackend | None
+) -> tuple[list[SourceBlock], dict[str, object]]:
     try:
         import pymupdf
     except ImportError as exc:
@@ -379,43 +476,59 @@ def _pdf_blocks(data: bytes, backend: OCRBackend | None) -> list[SourceBlock]:
     except Exception as exc:
         raise ValueError("invalid or encrypted PDF") from exc
     blocks: list[SourceBlock] = []
-    with document:
-        if document.needs_pass:
-            raise ValueError("encrypted PDF is not supported")
-        if document.page_count > MAX_SOURCE_PAGES:
-            raise ValueError("PDF exceeds page limit")
-        for page_index, page in enumerate(document, start=1):
-            digital = [
-                _normalize(str(item[4]))
-                for item in page.get_text("blocks")
-                if len(item) >= 5 and _normalize(str(item[4]))
-            ]
-            if len(" ".join(digital)) >= 40:
-                blocks.extend(
-                    SourceBlock(
-                        anchor=f"page-{page_index}-block-{index}",
-                        text=text,
-                        extraction_method="digital",
-                        page=page_index,
-                        confidence=1.0,
+    skipped_ocr_runs = 0
+    local_backend = backend
+    ocr_metadata: dict[str, object] = {}
+    try:
+        with document:
+            if document.needs_pass:
+                raise ValueError("encrypted PDF is not supported")
+            if document.page_count > MAX_SOURCE_PAGES:
+                raise ValueError("PDF exceeds page limit")
+            for page_index, page in enumerate(document, start=1):
+                digital = [
+                    _normalize(str(item[4]))
+                    for item in page.get_text("blocks")
+                    if len(item) >= 5 and _normalize(str(item[4]))
+                ]
+                if len(" ".join(digital)) >= 40:
+                    skipped_ocr_runs += 1
+                    blocks.extend(
+                        SourceBlock(
+                            anchor=f"page-{page_index}-block-{index}",
+                            text=text,
+                            extraction_method="digital",
+                            page=page_index,
+                            confidence=1.0,
+                        )
+                        for index, text in enumerate(digital, start=1)
                     )
-                    for index, text in enumerate(digital, start=1)
+                    continue
+                if local_backend is None:
+                    local_backend = TesseractOCR()
+                pixmap = page.get_pixmap(dpi=150, alpha=False, annots=False)
+                if pixmap.width * pixmap.height > MAX_IMAGE_PIXELS:
+                    raise ValueError("rendered PDF page exceeds pixel limit")
+                image = Image.open(io.BytesIO(pixmap.tobytes("png")))
+                blocks.extend(
+                    _ocr_blocks(
+                        image,
+                        local_backend,
+                        prefix=f"page-{page_index}",
+                        page=page_index,
+                    )
                 )
-                continue
-            local_backend = backend or TesseractOCR()
-            pixmap = page.get_pixmap(dpi=150, alpha=False, annots=False)
-            if pixmap.width * pixmap.height > MAX_IMAGE_PIXELS:
-                raise ValueError("rendered PDF page exceeds pixel limit")
-            image = Image.open(io.BytesIO(pixmap.tobytes("png")))
-            blocks.extend(
-                _ocr_blocks(
-                    image, local_backend, prefix=f"page-{page_index}", page=page_index
-                )
-            )
-    return blocks
+                if not ocr_metadata:
+                    ocr_metadata = local_backend.metadata
+    finally:
+        if skipped_ocr_runs:
+            _record_ocr_run("skipped", count=skipped_ocr_runs)
+    return blocks, ocr_metadata
 
 
-def _image_blocks(data: bytes, backend: OCRBackend | None) -> list[SourceBlock]:
+def _image_blocks(
+    data: bytes, backend: OCRBackend | None
+) -> tuple[list[SourceBlock], dict[str, object]]:
     from PIL import Image
 
     try:
@@ -426,7 +539,11 @@ def _image_blocks(data: bytes, backend: OCRBackend | None) -> list[SourceBlock]:
         raise ValueError("invalid image source") from exc
     if image.width * image.height > MAX_IMAGE_PIXELS:
         raise ValueError("image exceeds pixel limit")
-    return _ocr_blocks(image, backend or TesseractOCR(), prefix="image-1", page=1)
+    local_backend = backend or TesseractOCR()
+    return (
+        _ocr_blocks(image, local_backend, prefix="image-1", page=1),
+        local_backend.metadata,
+    )
 
 
 def _markdown(blocks: list[SourceBlock]) -> str:
@@ -455,10 +572,10 @@ def extract_source(
     """Validate and normalize one supported local source without network access."""
     format_ = _validate_input(data, filename, declared_type)
     if format_ == "pdf":
-        blocks = _pdf_blocks(data, ocr_backend)
+        blocks, metadata = _pdf_blocks(data, ocr_backend)
         media_type = "application/pdf"
     elif format_ == "image":
-        blocks = _image_blocks(data, ocr_backend)
+        blocks, metadata = _image_blocks(data, ocr_backend)
         media_type = declared_type or "image/*"
     else:
         text = _decode_text(data)
@@ -472,12 +589,11 @@ def extract_source(
             "markdown": "text/markdown",
             "text": "text/plain",
         }[format_]
+        metadata = {}
     if not blocks:
         raise ValueError("source contains no extractable text")
     if sum(len(block.text) for block in blocks) > MAX_SOURCE_CHARS:
         raise ValueError("extracted source exceeds character limit")
-    used_ocr = any(block.extraction_method == "ocr" for block in blocks)
-    metadata = (ocr_backend or TesseractOCR()).metadata if used_ocr else {}
     status = (
         "review_required" if any(block.needs_review for block in blocks) else "indexed"
     )
