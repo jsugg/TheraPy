@@ -1299,7 +1299,12 @@ if (window.Companion) {
 }
 
 if ("serviceWorker" in navigator) {
-  navigator.serviceWorker.register("/sw.js");
+  // Registration failure means no SW lifecycle events will ever arrive, so
+  // the page itself must record the outcome (O4 audit F-07).
+  navigator.serviceWorker.register("/sw.js").then(
+    () => telemetry.enqueue({ name: "sw_lifecycle", outcome: "success" }),
+    () => telemetry.enqueue({ name: "sw_lifecycle", outcome: "error" }),
+  );
 }
 
 refreshConnectLabel();

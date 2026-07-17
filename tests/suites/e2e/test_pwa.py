@@ -700,3 +700,152 @@ def test_registered_service_worker_telemetry_handles_push_and_notification_click
             "event": {"name": "push_lifecycle", "outcome": "clicked"},
         }
     ]
+
+
+def test_service_worker_posts_telemetry_directly_with_no_open_window(
+    page: Page, e2e_server: str
+) -> None:
+    """O4 audit F-07: a push that wakes the worker with zero window clients
+    must still deliver bounded diagnostics (single-event direct POST)."""
+    import json
+
+    page.goto(f"{e2e_server}/")
+    page.wait_for_function(
+        "navigator.serviceWorker.ready.then(r => !!r.active)", timeout=20_000
+    )
+    worker = page.context.service_workers[0]
+
+    posts = worker.evaluate(
+        """async () => {
+          const posts = [];
+          const realFetch = self.fetch;
+          self.fetch = async (resource, options) => {
+            posts.push({url: String(resource), body: options && options.body});
+            return new Response("{}", {status: 200});
+          };
+          Object.defineProperty(self.clients, "matchAll", {
+            configurable: true, value: async () => [],
+          });
+          Object.defineProperty(self.registration, "showNotification", {
+            configurable: true, value: async () => {},
+          });
+          let settled;
+          const event = new Event("push");
+          Object.defineProperties(event, {
+            data: {value: {json: () => ({title: "TheraPy"})}},
+            waitUntil: {value: (promise) => { settled = Promise.resolve(promise); }},
+          });
+          self.dispatchEvent(event);
+          await settled;
+          self.fetch = realFetch;
+          return posts;
+        }"""
+    )
+    assert [post["url"] for post in posts] == [
+        "/api/telemetry/client",
+        "/api/telemetry/client",
+    ]
+    batches = [json.loads(post["body"]) for post in posts]
+    assert all(batch["schema_version"] == 1 for batch in batches)
+    assert all(len(batch["events"]) == 1 for batch in batches)
+    assert [batch["events"][0]["outcome"] for batch in batches] == [
+        "received",
+        "shown",
+    ]
+
+
+def test_http_error_shell_responses_are_not_cached_or_counted_success(
+    page: Page, e2e_server: str
+) -> None:
+    """O4 audit F-07: a resolved 4xx/5xx is not shell success and is never
+    cached; an ok response is cached."""
+    page.goto(f"{e2e_server}/")
+    page.wait_for_function(
+        "navigator.serviceWorker.ready.then(r => !!r.active)", timeout=20_000
+    )
+    worker = page.context.service_workers[0]
+
+    result = worker.evaluate(
+        """async () => {
+          const dispatchShellFetch = async (path, response) => {
+            const realFetch = self.fetch;
+            self.fetch = async () => response;
+            let responded;
+            const event = new Event("fetch");
+            Object.defineProperties(event, {
+              request: {value: new Request(self.location.origin + path)},
+              respondWith: {value: (p) => { responded = Promise.resolve(p); }},
+            });
+            self.dispatchEvent(event);
+            const res = await responded;
+            self.fetch = realFetch;
+            return res;
+          };
+          const errorRes = await dispatchShellFetch(
+            "/error-probe.css", new Response("boom", {status: 500})
+          );
+          const okRes = await dispatchShellFetch(
+            "/ok-probe.css", new Response("ok", {status: 200})
+          );
+          // cache.put runs without await on the ok path; poll briefly.
+          let okCached = null;
+          for (let i = 0; i < 20 && !okCached; i += 1) {
+            await new Promise((r) => setTimeout(r, 100));
+            okCached = await caches.match(self.location.origin + "/ok-probe.css");
+          }
+          const errorCached = await caches.match(
+            self.location.origin + "/error-probe.css"
+          );
+          return {
+            errorStatus: errorRes.status,
+            okStatus: okRes.status,
+            errorCached: !!errorCached,
+            okCached: !!okCached,
+          };
+        }"""
+    )
+    assert result == {
+        "errorStatus": 500,
+        "okStatus": 200,
+        "errorCached": False,
+        "okCached": True,
+    }
+
+
+def test_registration_outcome_and_waituntil_rejection_are_observable(
+    page: Page, e2e_server: str
+) -> None:
+    page.goto(f"{e2e_server}/")
+    page.wait_for_function(
+        "navigator.serviceWorker.ready.then(r => !!r.active)", timeout=20_000
+    )
+    # Successful registration queues a page-side sw_lifecycle event.
+    page.wait_for_function("window.telemetry.size >= 1", timeout=10_000)
+
+    worker = page.context.service_workers[0]
+    messages = worker.evaluate(
+        """async () => {
+          const messages = [];
+          Object.defineProperty(self.clients, "matchAll", {
+            configurable: true,
+            value: async () => [{postMessage: (m) => messages.push(m)}],
+          });
+          Object.defineProperty(self.registration, "showNotification", {
+            configurable: true,
+            value: async () => { throw new Error("notification blocked"); },
+          });
+          let settled;
+          const event = new Event("push");
+          Object.defineProperties(event, {
+            data: {value: {json: () => ({title: "TheraPy"})}},
+            waitUntil: {value: (promise) => {
+              settled = Promise.resolve(promise).catch(() => "rejected");
+            }},
+          });
+          self.dispatchEvent(event);
+          const outcome = await settled;
+          return {outcome, events: messages.map((m) => m.event)};
+        }"""
+    )
+    assert messages["outcome"] == "rejected"
+    assert {"name": "sw_lifecycle", "outcome": "failed"} in messages["events"]

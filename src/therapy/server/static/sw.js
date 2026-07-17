@@ -13,23 +13,37 @@ const SHELL = [
 ];
 const FETCH_TIMEOUT_MS = 8000;
 const SHELL_FETCH_REPORT_MS = 30000;
-let shellFetchCount = 0;
+const SHELL_FETCH_REPORT_CAP = 10000;
+let shellFetchCounts = { success: 0, error: 0 };
 let shellFetchTimer = null;
 let shellFallbackActive = false;
 
 function postTelemetry(event) {
   // Events stay content-free; the controlled page owns validation and delivery.
+  // A push normally wakes this worker with NO open window — in that case fall
+  // back to one direct bounded POST (single event, no SW-side queue, no
+  // retries) so the diagnostic is not silently lost.
   return self.clients.matchAll({ type: "window", includeUncontrolled: true })
     .then((clients) => {
+      if (clients.length === 0) {
+        return fetch("/api/telemetry/client", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ schema_version: 1, events: [event] }),
+        }).then(() => undefined, () => undefined);
+      }
       for (const client of clients) client.postMessage({ type: "telemetry", event });
     });
 }
 
 async function reportWaitUntil(promise) {
+  // Completion of each waitUntil'd handler is observable through its own
+  // terminal lifecycle event (installed/activated/shown/...); this hook makes
+  // the REJECTION leg observable with the bounded "failed" outcome.
   try {
     return await promise;
   } catch (error) {
-    await postTelemetry({ name: "sw_lifecycle", outcome: "error" }).catch(() => {});
+    await postTelemetry({ name: "sw_lifecycle", outcome: "failed" }).catch(() => {});
     throw error;
   }
 }
@@ -40,18 +54,22 @@ function waitUntilWithTelemetry(event, promise) {
 
 function reportShellFetches() {
   shellFetchTimer = null;
-  const count = shellFetchCount;
-  shellFetchCount = 0;
-  if (count > 0) {
-    void postTelemetry({
-      name: "shell_fetch", outcome: "success", dropped_events: count,
-    }).catch(() => {});
+  const counts = shellFetchCounts;
+  shellFetchCounts = { success: 0, error: 0 };
+  for (const outcome of ["success", "error"]) {
+    if (counts[outcome] > 0) {
+      void postTelemetry({
+        name: "shell_fetch", outcome, dropped_events: counts[outcome],
+      }).catch(() => {});
+    }
   }
 }
 
-function countShellFetch() {
-  shellFetchCount = Math.min(10000, shellFetchCount + 1);
-  if (shellFetchCount === 10000) {
+function countShellFetch(outcome) {
+  shellFetchCounts[outcome] = Math.min(
+    SHELL_FETCH_REPORT_CAP, shellFetchCounts[outcome] + 1,
+  );
+  if (shellFetchCounts.success + shellFetchCounts.error >= SHELL_FETCH_REPORT_CAP) {
     if (shellFetchTimer !== null) clearTimeout(shellFetchTimer);
     reportShellFetches();
   } else if (shellFetchTimer === null) {
@@ -93,7 +111,13 @@ self.addEventListener("fetch", (e) => {
   e.respondWith(
     fetch(e.request, { signal: AbortSignal.timeout(FETCH_TIMEOUT_MS) })
       .then(async (res) => {
-        countShellFetch();
+        if (!res.ok) {
+          // A resolved 4xx/5xx is NOT shell success: never cache it, never
+          // clear fallback state, count it as an error (O4 audit F-07).
+          countShellFetch("error");
+          return res;
+        }
+        countShellFetch("success");
         if (shellFallbackActive) {
           shellFallbackActive = false;
           await postTelemetry({ name: "cache_recovery", outcome: "recovered" })
