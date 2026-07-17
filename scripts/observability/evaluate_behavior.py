@@ -92,6 +92,18 @@ class BehaviorCase(TypedDict):
     response_schema: NotRequired[ResponseSchema | None]
 
 
+class BehaviorCaseVerdict(TypedDict):
+    """Stable fields exposed to downstream experiment consumers."""
+
+    case_id: str
+    dimension: str
+    high_risk: bool
+    human_review_required: bool
+    response_sha256: str
+    verdict: Verdict
+    reason: str
+
+
 def _result(verdict: Verdict, reason: str, **details: JsonValue) -> JsonObject:
     return {"verdict": verdict, "reason": reason, **details}
 
@@ -307,6 +319,65 @@ def evaluate_behavior_cases(
         "cases": results,
         "summary": counts,
     }
+
+
+def behavior_case_verdicts(
+    evaluation: Mapping[str, JsonValue],
+) -> list[BehaviorCaseVerdict]:
+    """Validate and expose deterministic verdicts to experiment runners.
+
+    This is deliberately a read-only projection. It does not reinterpret a
+    deterministic result or turn a semantic review verdict into a pass.
+
+    Args:
+        evaluation: Result returned by :func:`evaluate_behavior_cases`.
+
+    Returns:
+        Validated stable fields for each evaluated case.
+
+    Raises:
+        ValueError: If the evaluation payload is malformed.
+    """
+    raw_cases = evaluation.get("cases")
+    if not isinstance(raw_cases, list):
+        raise ValueError("behavior evaluation cases must be a list")
+
+    verdicts: list[BehaviorCaseVerdict] = []
+    allowed_verdicts = {"pass", "fail", REVIEW_VERDICT}
+    for index, raw_case in enumerate(raw_cases):
+        if not isinstance(raw_case, Mapping):
+            raise ValueError(f"behavior evaluation cases[{index}] must be an object")
+        case_id = raw_case.get("case_id")
+        dimension = raw_case.get("dimension")
+        high_risk = raw_case.get("high_risk")
+        human_review_required = raw_case.get("human_review_required")
+        response_sha256 = raw_case.get("response_sha256")
+        verdict = raw_case.get("verdict")
+        reason = raw_case.get("reason")
+        if (
+            not isinstance(case_id, str)
+            or not isinstance(dimension, str)
+            or not isinstance(high_risk, bool)
+            or not isinstance(human_review_required, bool)
+            or not isinstance(response_sha256, str)
+            or verdict not in allowed_verdicts
+            or not isinstance(reason, str)
+        ):
+            raise ValueError(
+                f"behavior evaluation cases[{index}] has invalid verdict fields"
+            )
+        verdicts.append(
+            BehaviorCaseVerdict(
+                case_id=case_id,
+                dimension=dimension,
+                high_risk=high_risk,
+                human_review_required=human_review_required,
+                response_sha256=response_sha256,
+                verdict=cast(Verdict, verdict),
+                reason=reason,
+            )
+        )
+    return verdicts
 
 
 def _json_object(value: object, label: str) -> dict[str, object]:
