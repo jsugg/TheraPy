@@ -23,6 +23,8 @@ groups:
             datasourceUid: prometheus
             model:
               expr: sum(rate(therapy_llm_capture_records_total{status="failed"}[5m]))
+              instant: true
+              range: false
               refId: A
           - refId: C
             datasourceUid: __expr__
@@ -46,6 +48,8 @@ groups:
             datasourceUid: prometheus
             model:
               expr: time() - therapy_llm_capture_oldest_unexported_unixtime_seconds
+              instant: true
+              range: false
               refId: A
           - refId: C
             datasourceUid: __expr__
@@ -69,6 +73,33 @@ groups:
             datasourceUid: prometheus
             model:
               expr: sum(rate(therapy_broad_span_drops_total{reason=~"forbidden_attribute|unknown_scope"}[5m]))
+              instant: true
+              range: false
+              refId: A
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              expression: A
+              conditions:
+                - evaluator: {type: gt, params: [0]}
+              refId: C
+      - uid: capture-incomplete-evidence
+        title: Incomplete interaction or evaluation evidence
+        condition: C
+        for: 0m
+        annotations:
+          runbook: deploy/observability/runbooks/capture.md
+          summary: At least one LLM attempt has explicit incomplete terminal evidence.
+        labels: {severity: critical, group: capture}
+        data:
+          - refId: A
+            relativeTimeRange: {from: 600, to: 0}
+            datasourceUid: prometheus
+            model:
+              expr: sum(increase(therapy_llm_capture_records_total{status="incomplete"}[10m]))
+              instant: true
+              range: false
               refId: A
           - refId: C
             datasourceUid: __expr__
@@ -97,6 +128,33 @@ groups:
             datasourceUid: prometheus
             model:
               expr: sum(increase(therapy_voice_connections_total{outcome="error"}[5m]))
+              instant: true
+              range: false
+              refId: A
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              expression: A
+              conditions:
+                - evaluator: {type: gt, params: [2]}
+              refId: C
+      - uid: voice-pipeline-start-failures
+        title: Three consecutive voice pipeline-start failures
+        condition: C
+        for: 3m
+        annotations:
+          runbook: deploy/observability/runbooks/availability.md
+          summary: Voice pipelines repeatedly fail before becoming active.
+        labels: {severity: critical, group: availability}
+        data:
+          - refId: A
+            relativeTimeRange: {from: 600, to: 0}
+            datasourceUid: prometheus
+            model:
+              expr: sum(increase(therapy_voice_pipeline_transitions_total{transition="replace", outcome="startup_failed"}[5m]))
+              instant: true
+              range: false
               refId: A
           - refId: C
             datasourceUid: __expr__
@@ -120,6 +178,8 @@ groups:
             datasourceUid: prometheus
             model:
               expr: time() - therapy_proactivity_scheduler_last_tick_unixtime_seconds
+              instant: true
+              range: false
               refId: A
           - refId: C
             datasourceUid: __expr__
@@ -128,6 +188,81 @@ groups:
               expression: A
               conditions:
                 - evaluator: {type: gt, params: [120]}
+              refId: C
+      - uid: scheduler-tick-failures
+        title: Repeated proactivity scheduler failures
+        condition: C
+        for: 3m
+        annotations:
+          runbook: deploy/observability/runbooks/availability.md
+          summary: The scheduler is ticking but repeatedly failing its work loop.
+        labels: {severity: critical, group: availability}
+        data:
+          - refId: A
+            relativeTimeRange: {from: 600, to: 0}
+            datasourceUid: prometheus
+            model:
+              expr: sum(increase(therapy_proactivity_ticks_total{outcome="error"}[5m]))
+              instant: true
+              range: false
+              refId: A
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              expression: A
+              conditions:
+                - evaluator: {type: gt, params: [2]}
+              refId: C
+      - uid: turn-relay-down
+        title: Two consecutive TURN relay failures
+        condition: C
+        for: 2m
+        annotations:
+          runbook: deploy/observability/runbooks/availability.md
+          summary: The collector cannot scrape the TURN relay for two evaluations.
+        labels: {severity: critical, group: availability}
+        data:
+          - refId: A
+            relativeTimeRange: {from: 600, to: 0}
+            datasourceUid: prometheus
+            model:
+              expr: up{job="turn"}
+              instant: true
+              range: false
+              refId: A
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              expression: A
+              conditions:
+                - evaluator: {type: lt, params: [1]}
+              refId: C
+      - uid: voice-pipeline-orphan
+        title: Voice pipeline ownership mismatch
+        condition: C
+        for: 5m
+        annotations:
+          runbook: deploy/observability/runbooks/availability.md
+          summary: Active pipeline and connection-owner gauges disagree.
+        labels: {severity: warning, group: availability}
+        data:
+          - refId: A
+            relativeTimeRange: {from: 600, to: 0}
+            datasourceUid: prometheus
+            model:
+              expr: abs(therapy_voice_pipeline_active - therapy_voice_active_connections)
+              instant: true
+              range: false
+              refId: A
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              expression: A
+              conditions:
+                - evaluator: {type: gt, params: [0]}
               refId: C
   - orgId: 1
     name: therapy-resources
@@ -148,6 +283,8 @@ groups:
             datasourceUid: prometheus
             model:
               expr: histogram_quantile(0.95, sum(rate(therapy_event_loop_lag_seconds_bucket[5m])) by (le))
+              instant: true
+              range: false
               refId: A
           - refId: C
             datasourceUid: __expr__
@@ -156,4 +293,239 @@ groups:
               expression: A
               conditions:
                 - evaluator: {type: gt, params: [0.5]}
+              refId: C
+      - uid: repeated-process-restarts
+        title: Repeated therapy process restarts
+        condition: C
+        for: 0m
+        annotations:
+          runbook: deploy/observability/runbooks/resources.md
+          summary: The therapy process restarted more than once in 15 minutes.
+        labels: {severity: critical, group: resources}
+        data:
+          - refId: A
+            relativeTimeRange: {from: 1200, to: 0}
+            datasourceUid: prometheus
+            model:
+              expr: changes(process_start_time_seconds{service_name="therapy"}[15m])
+              instant: true
+              range: false
+              refId: A
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              expression: A
+              conditions:
+                - evaluator: {type: gt, params: [1]}
+              refId: C
+      - uid: memory-pressure-trend
+        title: Therapy memory trend approaches the dev-stack limit
+        condition: C
+        for: 10m
+        annotations:
+          runbook: deploy/observability/runbooks/resources.md
+          summary: One-hour projected RSS exceeds 4.5 GB under the 5 GB limit.
+        labels: {severity: warning, group: resources}
+        data:
+          - refId: A
+            relativeTimeRange: {from: 2400, to: 0}
+            datasourceUid: prometheus
+            model:
+              expr: predict_linear(process_memory_usage{service_name="therapy"}[30m], 3600)
+              instant: true
+              range: false
+              refId: A
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              expression: A
+              conditions:
+                - evaluator: {type: gt, params: [4500000000]}
+              refId: C
+  - orgId: 1
+    name: therapy-persistence
+    folder: TheraPy
+    interval: 1m
+    rules:
+      - uid: acknowledged-persistence-failure
+        title: Acknowledged persistence or storage failure
+        condition: C
+        for: 0m
+        annotations:
+          runbook: deploy/observability/runbooks/persistence.md
+          summary: An instrumented storage operation returned an error after acceptance.
+        labels: {severity: critical, group: persistence}
+        data:
+          - refId: A
+            relativeTimeRange: {from: 600, to: 0}
+            datasourceUid: prometheus
+            model:
+              expr: sum(increase(therapy_storage_operations_total{outcome="error"}[5m]))
+              instant: true
+              range: false
+              refId: A
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              expression: A
+              conditions:
+                - evaluator: {type: gt, params: [0]}
+              refId: C
+      - uid: sqlite-contention
+        title: Sustained SQLite contention
+        condition: C
+        for: 10m
+        annotations:
+          runbook: deploy/observability/runbooks/persistence.md
+          summary: SQLite busy events exceed the dev-stack contention budget.
+        labels: {severity: warning, group: persistence}
+        data:
+          - refId: A
+            relativeTimeRange: {from: 900, to: 0}
+            datasourceUid: prometheus
+            model:
+              expr: sum(increase(therapy_sqlite_busy_total[10m]))
+              instant: true
+              range: false
+              refId: A
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              expression: A
+              conditions:
+                - evaluator: {type: gt, params: [20]}
+              refId: C
+      - uid: journal-checkpoint-stale
+        title: Journal checkpoint success is stale
+        condition: C
+        for: 5m
+        annotations:
+          runbook: deploy/observability/runbooks/persistence.md
+          summary: The ten-minute journal checkpoint has not succeeded for 20 minutes.
+        labels: {severity: critical, group: persistence}
+        data:
+          - refId: A
+            relativeTimeRange: {from: 1800, to: 0}
+            datasourceUid: prometheus
+            model:
+              expr: time() - therapy_sqlite_checkpoint_last_success_unixtime_seconds{component="journal"}
+              instant: true
+              range: false
+              refId: A
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              expression: A
+              conditions:
+                - evaluator: {type: gt, params: [1200]}
+              refId: C
+      - uid: journal-integrity-stale
+        title: Journal integrity verification is stale
+        condition: C
+        for: 10m
+        annotations:
+          runbook: deploy/observability/runbooks/persistence.md
+          summary: The hourly journal integrity check has not succeeded for two hours.
+        labels: {severity: critical, group: persistence}
+        data:
+          - refId: A
+            relativeTimeRange: {from: 9000, to: 0}
+            datasourceUid: prometheus
+            model:
+              expr: time() - therapy_sqlite_integrity_last_success_unixtime_seconds{component="journal"}
+              instant: true
+              range: false
+              refId: A
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              expression: A
+              conditions:
+                - evaluator: {type: gt, params: [7200]}
+              refId: C
+  - orgId: 1
+    name: therapy-providers
+    folder: TheraPy
+    interval: 1m
+    rules:
+      - uid: llm-provider-failures
+        title: Repeated LLM provider failures
+        condition: C
+        for: 5m
+        annotations:
+          runbook: deploy/observability/runbooks/providers.md
+          summary: A provider has at least three errors or timeouts in 10 minutes.
+        labels: {severity: warning, group: providers}
+        data:
+          - refId: A
+            relativeTimeRange: {from: 900, to: 0}
+            datasourceUid: prometheus
+            model:
+              expr: sum(increase(therapy_llm_requests_total{outcome=~"error|timeout"}[10m])) by (provider)
+              instant: true
+              range: false
+              refId: A
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              expression: A
+              conditions:
+                - evaluator: {type: gt, params: [2]}
+              refId: C
+      - uid: llm-rate-limit-spike
+        title: Repeated LLM provider rate limits
+        condition: C
+        for: 5m
+        annotations:
+          runbook: deploy/observability/runbooks/providers.md
+          summary: A provider has at least three rate limits in 10 minutes.
+        labels: {severity: warning, group: providers}
+        data:
+          - refId: A
+            relativeTimeRange: {from: 900, to: 0}
+            datasourceUid: prometheus
+            model:
+              expr: sum(increase(therapy_llm_rate_limits_total[10m])) by (provider)
+              instant: true
+              range: false
+              refId: A
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              expression: A
+              conditions:
+                - evaluator: {type: gt, params: [2]}
+              refId: C
+      - uid: ttfa-provider-regression
+        title: TTFA exceeds 2x same-provider rolling baseline
+        condition: C
+        for: 10m
+        annotations:
+          runbook: deploy/observability/runbooks/providers.md
+          summary: Current TTFA p95 is over twice the one-hour provider/mode baseline.
+        labels: {severity: warning, group: providers}
+        data:
+          - refId: A
+            relativeTimeRange: {from: 3900, to: 0}
+            datasourceUid: prometheus
+            model:
+              expr: histogram_quantile(0.95, sum(rate(therapy_turn_ttfa_seconds_bucket[5m])) by (le, provider, mode)) / clamp_min(histogram_quantile(0.95, sum(rate(therapy_turn_ttfa_seconds_bucket[1h])) by (le, provider, mode)), 0.001)
+              instant: true
+              range: false
+              refId: A
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              expression: A
+              conditions:
+                - evaluator: {type: gt, params: [2]}
               refId: C

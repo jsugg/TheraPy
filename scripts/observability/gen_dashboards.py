@@ -18,8 +18,15 @@ OUT = Path(__file__).resolve().parents[2] / "deploy/observability/dashboards"
 PROM = {"type": "prometheus", "uid": "prometheus"}
 
 
-def timeseries(title: str, expr: str, *, unit: str = "s", grid: dict) -> dict:
-    return {
+def timeseries(
+    title: str,
+    expr: str,
+    *,
+    unit: str = "s",
+    grid: dict,
+    description: str | None = None,
+) -> dict:
+    panel = {
         "type": "timeseries",
         "title": title,
         "datasource": PROM,
@@ -27,16 +34,39 @@ def timeseries(title: str, expr: str, *, unit: str = "s", grid: dict) -> dict:
         "gridPos": grid,
         "targets": [{"expr": expr, "refId": "A", "datasource": PROM}],
     }
+    if description is not None:
+        panel["description"] = description
+    return panel
 
 
-def stat(title: str, expr: str, *, unit: str = "short", grid: dict) -> dict:
-    return {
+def stat(
+    title: str,
+    expr: str,
+    *,
+    unit: str = "short",
+    grid: dict,
+    description: str | None = None,
+) -> dict:
+    panel = {
         "type": "stat",
         "title": title,
         "datasource": PROM,
         "fieldConfig": {"defaults": {"unit": unit}, "overrides": []},
         "gridPos": grid,
         "targets": [{"expr": expr, "refId": "A", "datasource": PROM}],
+    }
+    if description is not None:
+        panel["description"] = description
+    return panel
+
+
+def row(title: str, *, grid: dict) -> dict:
+    return {
+        "type": "row",
+        "title": title,
+        "collapsed": False,
+        "panels": [],
+        "gridPos": grid,
     }
 
 
@@ -157,6 +187,51 @@ DASHBOARDS: dict[str, dict] = {
                 'histogram_quantile(0.95, sum(rate(therapy_storage_operation_seconds_bucket{component="research"}[5m])) by (le, operation))',
                 grid=g(12, 0),
             ),
+            timeseries(
+                "Research stage duration p95",
+                "histogram_quantile(0.95, sum(rate(therapy_research_stage_seconds_bucket[5m])) by (le, stage, outcome))",
+                grid=g(0, 8),
+            ),
+            timeseries(
+                "Research queries by outcome",
+                "sum(rate(therapy_research_queries_total[15m])) by (outcome)",
+                unit="ops",
+                grid=g(12, 8),
+            ),
+            timeseries(
+                "Index rebuilds by outcome",
+                "sum(rate(therapy_research_reindex_total[15m])) by (outcome)",
+                unit="ops",
+                grid=g(0, 16),
+            ),
+            timeseries(
+                "Research divergence by kind",
+                "sum(rate(therapy_research_divergence_total[15m])) by (kind)",
+                unit="ops",
+                grid=g(12, 16),
+            ),
+            timeseries(
+                "OCR runs and duration p95",
+                "histogram_quantile(0.95, sum(rate(therapy_ocr_seconds_bucket[15m])) by (le, outcome))",
+                grid=g(0, 24),
+            ),
+            timeseries(
+                "OCR runs by outcome",
+                "sum(rate(therapy_ocr_runs_total[15m])) by (outcome)",
+                unit="ops",
+                grid=g(12, 24),
+            ),
+            timeseries(
+                "Embedding batches by cache/outcome",
+                "sum(rate(therapy_embedding_batches_total[15m])) by (cache, outcome)",
+                unit="ops",
+                grid=g(0, 32),
+            ),
+            timeseries(
+                "Embedding duration p95 by cache",
+                "histogram_quantile(0.95, sum(rate(therapy_embedding_seconds_bucket[15m])) by (le, cache))",
+                grid=g(12, 32),
+            ),
         ],
     ),
     "proactivity-push": dashboard(
@@ -174,6 +249,41 @@ DASHBOARDS: dict[str, dict] = {
                 'sum(rate(therapy_storage_operations_total{component="proactivity"}[15m])) by (operation, outcome)',
                 unit="ops",
                 grid=g(6, 0, 18),
+            ),
+            timeseries(
+                "Scheduler ticks by outcome",
+                "sum(rate(therapy_proactivity_ticks_total[15m])) by (outcome)",
+                unit="ops",
+                grid=g(0, 8),
+            ),
+            timeseries(
+                "Scheduler tick duration p95",
+                "histogram_quantile(0.95, sum(rate(therapy_proactivity_tick_seconds_bucket[15m])) by (le, outcome))",
+                grid=g(12, 8),
+            ),
+            timeseries(
+                "Proactivity jobs by stage/channel",
+                "sum(rate(therapy_proactivity_jobs_total[15m])) by (stage, channel)",
+                unit="ops",
+                grid=g(0, 16),
+            ),
+            stat(
+                "Oldest due enabled job age",
+                "therapy_proactivity_oldest_due_age_seconds",
+                unit="s",
+                grid=g(12, 16),
+            ),
+            timeseries(
+                "Web Push deliveries by status class",
+                "sum(rate(therapy_webpush_deliveries_total[15m])) by (status_class)",
+                unit="ops",
+                grid=g(0, 24),
+            ),
+            timeseries(
+                "Web Push subscription events",
+                "sum(rate(therapy_webpush_subscription_events_total[15m])) by (event)",
+                unit="ops",
+                grid=g(12, 24),
             ),
         ],
     ),
@@ -226,13 +336,13 @@ DASHBOARDS: dict[str, dict] = {
             ),
             timeseries(
                 "STUN bindings (incl. synthetic healthcheck probe)",
-                'sum(rate({__name__=~"stun_binding_(request|response)_total", job="turn"}[5m])) by (__name__)',
+                'sum by (__name__) ({__name__=~"stun_binding_(request|response)_total", job="turn"})',
                 unit="ops",
                 grid=g(6, 24, 9),
             ),
             timeseries(
                 "TURN allocations/traffic (populates on first relay use)",
-                'sum(rate({__name__=~"turn_.+", job="turn"}[5m])) by (__name__)',
+                'sum by (__name__) ({__name__=~"turn_.+", job="turn"})',
                 unit="ops",
                 grid=g(15, 24, 9),
             ),
@@ -244,6 +354,128 @@ DASHBOARDS: dict[str, dict] = {
                 "time() - process_start_time_seconds",
                 unit="s",
                 grid=g(0, 32, 24),
+            ),
+            row("§9 service-level indicators", grid=g(0, 40, 24, 1)),
+            stat(
+                "SLI: external liveness/readiness success ratio",
+                'sum(rate(http_server_duration_milliseconds_count{service_name="therapy", http_route=~"/health|/ready", http_status_code=~"2.."}[30m])) / clamp_min(sum(rate(http_server_duration_milliseconds_count{service_name="therapy", http_route=~"/health|/ready"}[30m])), 0.000001)',
+                unit="percentunit",
+                grid=g(0, 41),
+                description=(
+                    "Definition: successful external /health and /ready probes divided "
+                    "by all such probes, evaluated only inside the owner-declared service "
+                    "window; deliberate host sleep/shutdown is excluded. Target: numeric "
+                    "objective unset until hostwatch service-window evidence exists."
+                ),
+            ),
+            stat(
+                "SLI: voice connection success ratio",
+                'sum(rate(therapy_webrtc_connection_total{outcome="connected"}[30m])) / clamp_min(sum(rate(therapy_offers_total{outcome!="rejected"}[30m])), 0.000001)',
+                unit="percentunit",
+                grid=g(12, 41),
+                description=(
+                    "Definition: client-confirmed connected states after successful SDP/"
+                    "pipeline start divided by all syntactically valid offers; rejected "
+                    "offers are excluded. Target: numeric objective unset pending baseline."
+                ),
+            ),
+            stat(
+                "SLI: turn completion ratio",
+                '((sum(rate(therapy_persist_total{artifact="assistant", outcome="success"}[30m])) or vector(0)) + (sum(rate(therapy_conversation_turns_total{outcome="classified_failure"}[30m])) or vector(0))) / clamp_min(sum(rate(therapy_persist_total{artifact="user", outcome="success"}[30m])), 0.000001)',
+                unit="percentunit",
+                grid=g(0, 49),
+                description=(
+                    "Definition: persisted assistant responses plus explicit classified "
+                    "failures divided by accepted, durably persisted user turns. Target: "
+                    "numeric objective unset pending baseline; no accepted turn may vanish."
+                ),
+            ),
+            timeseries(
+                "SLI: TTFA p95 / same-provider rolling baseline",
+                "histogram_quantile(0.95, sum(rate(therapy_turn_ttfa_seconds_bucket[5m])) by (le, provider, mode)) / clamp_min(histogram_quantile(0.95, sum(rate(therapy_turn_ttfa_seconds_bucket[1h])) by (le, provider, mode)), 0.001)",
+                unit="short",
+                grid=g(12, 49),
+                description=(
+                    "Definition: five-minute TTFA p95 divided by the one-hour p95 for the "
+                    "same provider and cold/warm mode; stage panels provide STT/context/LLM/"
+                    "TTS/network decomposition. Target: <= 2x rolling baseline; no absolute "
+                    "latency objective until baseline evidence supports one."
+                ),
+            ),
+            stat(
+                "SLI: acknowledged persistence success ratio",
+                'sum(rate(therapy_persist_total{outcome="success"}[30m])) / clamp_min(sum(rate(therapy_persist_total[30m])), 0.000001)',
+                unit="percentunit",
+                grid=g(0, 57),
+                description=(
+                    "Definition: acknowledged persisted artifacts committed successfully "
+                    "divided by all acknowledged persistence attempts. Target: 100%; "
+                    "integrity, backup, and rollback failures must remain zero."
+                ),
+            ),
+            stat(
+                "SLI: integrity/backup/rollback failures",
+                '(sum(rate(therapy_schema_migrations_total{outcome="error"}[30m])) or vector(0)) + (sum(rate(therapy_backups_total{outcome="error"}[30m])) or vector(0)) + (sum(rate(therapy_sovereignty_rollbacks_total{outcome="error"}[30m])) or vector(0))',
+                unit="ops",
+                grid=g(12, 57),
+                description=(
+                    "Definition: migration, backup, and sovereignty rollback error rate; "
+                    "periodic isolated export/restore verification is companion evidence. "
+                    "Target: exactly zero."
+                ),
+            ),
+            stat(
+                "SLI: capture journaled-vs-failed ratio",
+                'sum(rate(therapy_llm_capture_records_total{status="journaled"}[30m])) / clamp_min(sum(rate(therapy_llm_capture_records_total{status=~"journaled|failed"}[30m])), 0.000001)',
+                unit="percentunit",
+                grid=g(0, 65),
+                description=(
+                    "Definition: initiated LLM attempts durably journaled before dispatch "
+                    "divided by journaled plus pre-dispatch failed attempts. Target: 100%."
+                ),
+            ),
+            stat(
+                "SLI: evaluation evidence completeness ratio",
+                '1 - (sum(rate(therapy_llm_capture_records_total{status="incomplete"}[30m])) / clamp_min(sum(rate(therapy_llm_capture_records_total{status="journaled"}[30m])), 0.000001))',
+                unit="percentunit",
+                grid=g(12, 65),
+                description=(
+                    "Definition: journaled LLM attempts without explicit incomplete evidence "
+                    "divided by all journaled attempts; terminal completions and exact provider "
+                    "errors are complete. Target: 100%, with zero incomplete accepted evaluations."
+                ),
+            ),
+            stat(
+                "SLI: restricted export backlog age",
+                "time() - therapy_llm_capture_oldest_unexported_unixtime_seconds",
+                unit="s",
+                grid=g(0, 73),
+                description=(
+                    "Definition: current time minus the oldest unexported restricted-record "
+                    "timestamp. Target: < 3600 seconds; the journal remains authoritative."
+                ),
+            ),
+            stat(
+                "SLI: proactivity terminal-state ratio",
+                'sum(rate(therapy_proactivity_jobs_total{stage=~"delivered|retry|finalized"}[30m])) / clamp_min(sum(rate(therapy_proactivity_jobs_total{stage="due"}[30m])), 0.000001)',
+                unit="percentunit",
+                grid=g(12, 73),
+                description=(
+                    "Definition: enabled, unsuppressed due jobs reaching delivered, retry, or "
+                    "terminal finalized state divided by due jobs. Target: 100% inside the "
+                    "owner-agreed tolerance; the numeric tolerance is not set yet."
+                ),
+            ),
+            stat(
+                "SLI: broad-plane routing violations",
+                'sum(rate(therapy_broad_span_drops_total{reason=~"forbidden_attribute|unknown_scope"}[30m]))',
+                unit="ops",
+                grid=g(0, 81, 24),
+                description=(
+                    "Definition: forbidden content/infrastructure canary or unknown-scope "
+                    "attempts reaching the broad-plane guard; restricted-canary presence is "
+                    "verified separately. Target: exactly zero; this is a hard release gate."
+                ),
             ),
         ],
     ),
