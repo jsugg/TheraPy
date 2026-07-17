@@ -471,3 +471,37 @@ def llm_boundary_manifest_json() -> list[dict[str, object]]:
         }
         for boundary in LLM_BOUNDARY_MANIFEST
     ]
+
+
+#: Frozen bounded bucket vocabularies (plan O3.1/O3.3): raw counts and byte
+#: sizes never become labels — only these enumerated buckets do.
+COUNT_BUCKETS: tuple[str, ...] = ("0", "1-9", "10-99", "100-999", "1000+")
+BYTE_BUCKETS: tuple[str, ...] = ("0", "<4k", "<64k", "<1m", "<16m", "16m+")
+
+
+def count_bucket(count: int) -> str:
+    """Map a result/row count to its frozen bucket label."""
+    if count <= 0:
+        return "0"
+    if count < 10:
+        return "1-9"
+    if count < 100:
+        return "10-99"
+    if count < 1000:
+        return "100-999"
+    return "1000+"
+
+
+def byte_bucket(size: int) -> str:
+    """Map a byte size to its frozen bucket label."""
+    if size <= 0:
+        return "0"
+    if size < 4_096:
+        return "<4k"
+    if size < 65_536:
+        return "<64k"
+    if size < 1_048_576:
+        return "<1m"
+    if size < 16_777_216:
+        return "<16m"
+    return "16m+"

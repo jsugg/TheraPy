@@ -72,6 +72,26 @@ async def lifespan(app: FastAPI):
     from therapy.observability import telemetry
     from therapy.observability.capture import start_capture
     from therapy.observability.config import ObservabilityConfig
+    from therapy.observability.logging import emit_event
+
+    emit_event(
+        "app.starting", component="server", operation="lifecycle",
+        outcome="success",
+    )
+    if os.getenv("THERAPY_TEST_MODE") == "1" and os.getenv(
+        "THERAPY_ENVIRONMENT", ""
+    ) not in ("test", "acceptance"):
+        # Test-mode routes outside an explicit test deployment are a
+        # misconfiguration alarm (plan O3.1), never silent.
+        import logging as logging_module
+
+        emit_event(
+            "test_mode_outside_test_deployment",
+            severity=logging_module.ERROR,
+            component="server",
+            operation="lifecycle",
+            outcome="error",
+        )
 
     # Interaction capture (plan O1.1/O1.2): journal opens and recovers before
     # any LLM boundary can run; failure degrades visibly, never blocks start.
@@ -81,7 +101,6 @@ async def lifespan(app: FastAPI):
 
     scheduler = ProactivityScheduler(_proactivity())
     scheduler_task = asyncio.create_task(scheduler.run(), name="therapy-proactivity")
-    from therapy.observability.logging import emit_event
 
     emit_event(
         "app.ready", component="server", operation="lifecycle", outcome="success"
@@ -98,14 +117,31 @@ async def lifespan(app: FastAPI):
         scheduler.stop()
         try:
             await asyncio.wait_for(scheduler_task, 10.0)
-        except (TimeoutError, asyncio.CancelledError):
+        except TimeoutError:
+            # A hung tick must not stall shutdown, but its cancellation is
+            # awaited so the drain is bounded AND complete (O3 audit).
             scheduler_task.cancel()
+            try:
+                await asyncio.wait_for(scheduler_task, 5.0)
+            except (TimeoutError, asyncio.CancelledError):
+                emit_event(
+                    "component.scheduler", component="server",
+                    operation="shutdown", outcome="timeout",
+                )
+        except asyncio.CancelledError:
+            pass
         gateway, _voice_gateway = _voice_gateway, None
         if gateway is not None:
             try:
                 await asyncio.wait_for(gateway.close(), 15.0)
-            except Exception:
-                pass
+            except Exception as exc:
+                # Swallowed for shutdown progress, but never silently (O3
+                # audit): one bounded component event, class only.
+                emit_event(
+                    "component.gateway", component="voice",
+                    operation="shutdown", outcome="error",
+                    error_type=type(exc).__name__,
+                )
         await capture_runtime.close()
         telemetry.shutdown()
         emit_event(
@@ -205,22 +241,37 @@ def ready() -> dict[str, object]:
     liveness or restarts the process. No paths, errors, or IDs in the body.
     """
     import shutil
+    import socket
+    import time
 
     checks: dict[str, str] = {}
     data_dir = Path(os.environ.get("THERAPY_DATA_DIR", "data"))
+    db_path = data_dir / "therapy.db"
 
     try:
-        connection = sqlite3.connect(data_dir / "therapy.db", timeout=2.0)
+        connection = sqlite3.connect(db_path, timeout=2.0)
         try:
             connection.execute("SELECT 1").fetchone()
             row = connection.execute("PRAGMA user_version").fetchone()
             checks["db"] = "ready"
-            checks["schema"] = f"v{row[0]}" if row else "unknown"
+            version = int(row[0]) if row else -1
+            # Frozen enum: known versions only, never an arbitrary number.
+            checks["schema"] = f"v{version}" if 0 <= version <= 16 else "unknown"
         finally:
             connection.close()
     except sqlite3.Error:
         checks["db"] = "degraded"
         checks["schema"] = "unknown"
+
+    try:
+        db_bytes = db_path.stat().st_size if db_path.exists() else 0
+        wal_path = Path(str(db_path) + "-wal")
+        wal_bytes = wal_path.stat().st_size if wal_path.exists() else 0
+        checks["db_size"] = "ok" if db_bytes < 1_073_741_824 else "large"
+        checks["wal_size"] = "ok" if wal_bytes < 67_108_864 else "large"
+    except OSError:
+        checks["db_size"] = "unknown"
+        checks["wal_size"] = "unknown"
 
     try:
         probe = data_dir / ".ready-probe"
@@ -231,14 +282,39 @@ def ready() -> dict[str, object]:
     except OSError:
         checks["data_dir"] = "degraded"
 
+    from therapy.dialogue import outreach
     from therapy.observability.capture import capture_service
     from therapy.observability.health import registry
+    from therapy.observability.telemetry import state as telemetry_state
+
+    last_tick = outreach.last_scheduler_tick()
+    if last_tick is None:
+        checks["scheduler"] = "starting"
+    else:
+        checks["scheduler"] = (
+            "ready" if time.time() - last_tick < 150 else "degraded"
+        )
+
+    # TURN synthetic reachability: external relay state degrades detail
+    # only (enum ready|unreachable), never overall readiness (plan O3.1).
+    try:
+        with socket.create_connection(
+            (
+                os.environ.get("THERAPY_TURN_PROBE_HOST", "turn"),
+                int(os.environ.get("THERAPY_TURN_PORT", "3478")),
+            ),
+            timeout=0.5,
+        ):
+            checks["turn"] = "ready"
+    except OSError:
+        checks["turn"] = "unreachable"
 
     checks["capture"] = (
         "ready"
         if capture_service() is not None and capture_service().writer is not None
         else "degraded"
     )
+    checks["telemetry"] = "ready" if telemetry_state().enabled else "disabled"
     checks["voice"] = "ready" if _voice_gateway is not None else "starting"
     for name, snapshot in registry().snapshot().items():
         checks[f"component.{name}"] = str(snapshot["state"])
@@ -276,6 +352,21 @@ def _audit(operation: str, component: str = "data") -> Iterator[None]:
             operation=operation,
             outcome=outcome,
         )
+
+
+def _read_rows(route_class: str, count: int) -> None:
+    """Bounded result-count evidence for read routes (plan O3.1).
+
+    Only the frozen route class and count bucket become labels — no
+    filters, SQL, content, or IDs."""
+    from therapy.observability.model import count_bucket
+    from therapy.observability.telemetry import record_metric
+
+    record_metric(
+        "therapy_http_read_rows_total",
+        1,
+        {"route_class": route_class, "bucket": count_bucket(count)},
+    )
 
 
 def _resolve_session(
@@ -318,28 +409,41 @@ async def offer(
     transcript over HTTP; the resolved id is also what run_bot joins, so the
     two never disagree.
     """
-    content_length = request.headers.get("content-length")
-    if content_length is not None:
-        try:
-            if int(content_length) > MAX_OFFER_BODY_BYTES:
-                raise HTTPException(status_code=413, detail="Offer body is too large")
-        except ValueError:
-            raise HTTPException(
-                status_code=400, detail="Invalid Content-Length"
-            ) from None
-    body = await request.body()
-    if len(body) > MAX_OFFER_BODY_BYTES:
-        raise HTTPException(status_code=413, detail="Offer body is too large")
-    try:
-        payload = json.loads(body)
-    except (json.JSONDecodeError, RecursionError, UnicodeDecodeError):
-        raise HTTPException(status_code=400, detail="Invalid JSON body") from None
-    try:
-        webrtc_offer = WebRTCOffer.from_payload(payload)
-    except InvalidOffer as exc:
-        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    from therapy.observability.telemetry import broad_span, record_metric
 
-    from therapy.observability.telemetry import broad_span
+    # Stage children (plan O3.1): validate / resolve / transcript-state /
+    # negotiate, so the waterfall isolates each cost. No body/SDP/IDs broadly.
+    try:
+        with broad_span("offer.validate", component="voice", operation="validate"):
+            content_length = request.headers.get("content-length")
+            if content_length is not None:
+                try:
+                    if int(content_length) > MAX_OFFER_BODY_BYTES:
+                        raise HTTPException(
+                            status_code=413, detail="Offer body is too large"
+                        )
+                except ValueError:
+                    raise HTTPException(
+                        status_code=400, detail="Invalid Content-Length"
+                    ) from None
+            body = await request.body()
+            if len(body) > MAX_OFFER_BODY_BYTES:
+                raise HTTPException(
+                    status_code=413, detail="Offer body is too large"
+                )
+            try:
+                payload = json.loads(body)
+            except (json.JSONDecodeError, RecursionError, UnicodeDecodeError):
+                raise HTTPException(
+                    status_code=400, detail="Invalid JSON body"
+                ) from None
+            try:
+                webrtc_offer = WebRTCOffer.from_payload(payload)
+            except InvalidOffer as exc:
+                raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except HTTPException:
+        record_metric("therapy_offers_total", 1, {"outcome": "rejected"})
+        raise
 
     store = _store()
     new_session = request.query_params.get("new_session") == "1"
@@ -352,9 +456,12 @@ async def offer(
     # Carry the resumed transcript in the answer so the client renders it
     # synchronously on connect — an async fetch after connect raced a reconnect
     # (rendering the wrong session) and live turns (duplicating/mis-ordering).
-    state = session_state_message(
-        resolved or "", resumed, store.session_turns(resolved) if resolved else []
-    )
+    with broad_span(
+        "offer.transcript_state", component="voice", operation="read"
+    ):
+        state = session_state_message(
+            resolved or "", resumed, store.session_turns(resolved) if resolved else []
+        )
 
     try:
         with broad_span("offer.negotiate", component="voice", operation="negotiate"):
@@ -363,11 +470,17 @@ async def offer(
                 SessionTarget(session_id=resolved, new_session=resolved is None),
             )
     except ConnectionConflict as exc:
+        record_metric("therapy_offers_total", 1, {"outcome": "conflict"})
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     except InvalidOffer as exc:
+        record_metric("therapy_offers_total", 1, {"outcome": "rejected"})
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     except VoiceUnavailable as exc:
+        record_metric("therapy_offers_total", 1, {"outcome": "unavailable"})
         raise HTTPException(status_code=503, detail=str(exc)) from exc
+    record_metric(
+        "therapy_offers_total", 1, {"outcome": "resumed" if resumed else "fresh"}
+    )
     return {
         **answer.as_payload(),
         "session_id": resolved,
@@ -382,10 +495,25 @@ async def disconnect_voice(
     gateway: Annotated[VoiceGateway, Depends(get_voice_gateway)],
 ) -> dict[str, bool]:
     """End only the caller's current peer, leaving the voice runtime reusable."""
+    from therapy.observability.telemetry import record_metric
+
     try:
         disconnected = await gateway.disconnect(pc_id)
     except VoiceUnavailable as exc:
+        record_metric(
+            "therapy_voice_signal_total",
+            1,
+            {"operation": "disconnect", "outcome": "unavailable"},
+        )
         raise HTTPException(status_code=503, detail=str(exc)) from exc
+    record_metric(
+        "therapy_voice_signal_total",
+        1,
+        {
+            "operation": "disconnect",
+            "outcome": "disconnected" if disconnected else "stale",
+        },
+    )
     return {"disconnected": disconnected}
 
 
@@ -398,6 +526,13 @@ def ice_config() -> dict[str, object]:
     and the tailnet. Credentials are static (tailnet-only exposure; the
     VPN identity is the auth boundary for the MVP, SPEC §8).
     """
+    from therapy.observability.telemetry import record_metric
+
+    record_metric(
+        "therapy_voice_signal_total",
+        1,
+        {"operation": "ice_config", "outcome": "success"},
+    )
     return {
         "username": os.environ.get("THERAPY_TURN_USER", "therapy"),
         "credential": os.environ.get("THERAPY_TURN_PASSWORD", "therapy-local"),
@@ -413,7 +548,18 @@ def resumable() -> dict[str, object]:
     look like "Start", or a user expecting a fresh conversation lands in
     an old one unawares.
     """
-    return {"session_id": _store().resume_candidate(resume_window_secs())}
+    from therapy.observability.telemetry import record_metric
+
+    candidate = _store().resume_candidate(resume_window_secs())
+    record_metric(
+        "therapy_voice_signal_total",
+        1,
+        {
+            "operation": "resumable",
+            "outcome": "resumable" if candidate else "none",
+        },
+    )
+    return {"session_id": candidate}
 
 
 @app.get("/api/sessions")
@@ -425,6 +571,7 @@ def sessions() -> dict[str, list[dict[str, object]]]:
         session_row: dict[str, object] = dict(session)
         session_row["turn_count"] = len(store.session_turns(str(session["id"])))
         session_rows.append(session_row)
+    _read_rows("sessions", len(session_rows))
     return {"sessions": session_rows}
 
 
@@ -454,11 +601,13 @@ def session_detail(session_id: str) -> dict[str, object]:
     )
     if session is None:
         raise HTTPException(status_code=404, detail="Session not found")
-    return {"session": session, "turns": _client_turns(store.session_turns(session_id))}
+    turns = _client_turns(store.session_turns(session_id))
+    _read_rows("session_detail", len(turns))
+    return {"session": session, "turns": turns}
 
 
 @app.get("/api/sessions/{session_id}/turns/{turn_id}/audio")
-def turn_audio(session_id: str, turn_id: int) -> FileResponse:
+def turn_audio(session_id: str, turn_id: int, request: Request) -> FileResponse:
     """Serve a turn's archived voice WAV for in-transcript playback (SPEC §8).
 
     The client asks by session + turn id; the store resolves the path from
@@ -466,9 +615,19 @@ def turn_audio(session_id: str, turn_id: int) -> FileResponse:
     utterance audio stays on the host, within the tailnet the whole app is
     already scoped to.
     """
+    from therapy.observability.telemetry import record_metric
+
     path = _store().turn_audio_path(session_id, turn_id)
     if path is None:
+        record_metric("therapy_audio_serve_total", 1, {"outcome": "missing"})
         raise HTTPException(status_code=404, detail="No audio for this turn")
+    # range|full outcome + response bytes (plan O3.1); never the archive path.
+    outcome = "range" if request.headers.get("range") else "full"
+    record_metric("therapy_audio_serve_total", 1, {"outcome": outcome})
+    try:
+        record_metric("therapy_audio_serve_bytes", Path(path).stat().st_size)
+    except OSError:
+        pass
     return FileResponse(path, media_type="audio/wav")
 
 
@@ -486,17 +645,29 @@ def delete_session(
     mode: Literal["keep_knowledge", "remove_derived"] = "keep_knowledge",
 ) -> dict[str, object]:
     """Delete conversation artifacts under the owner's selected knowledge policy."""
+    from therapy.observability.telemetry import broad_span
+
+    # Distinct staged children (plan O3.1): guard / evidence-policy / delete
+    # (the store adds db-delete and audio-delete children of its own).
     with _audit("delete_session", "memory"):
         store = _store()
-        if not store.has_session(session_id):
-            raise HTTPException(status_code=404, detail="Session not found")
-        if live.is_active(session_id):
-            raise HTTPException(
-                status_code=409, detail="Session is live — disconnect first"
+        with broad_span(
+            "session_delete.guard", component="memory", operation="guard"
+        ):
+            if not store.has_session(session_id):
+                raise HTTPException(status_code=404, detail="Session not found")
+            if live.is_active(session_id):
+                raise HTTPException(
+                    status_code=409, detail="Session is live — disconnect first"
+                )
+        with broad_span(
+            "session_delete.evidence_policy",
+            component="knowledge",
+            operation="delete",
+        ):
+            provenance = _model().delete_session_evidence(
+                session_id, remove_derived=mode == "remove_derived"
             )
-        provenance = _model().delete_session_evidence(
-            session_id, remove_derived=mode == "remove_derived"
-        )
         store.delete_session(session_id)
         return {
             "deleted": session_id,
@@ -533,6 +704,7 @@ def graph(
         edges = [edge for edge in edges if edge["source"] == source]
     insights = _insights()
     insights.sync_proposals()
+    _read_rows("graph", len(nodes) + len(edges))
     return {
         "nodes": nodes,
         "edges": edges,
@@ -551,7 +723,9 @@ def pending_insights(
     """Return durable pending insight queue records."""
     service = _insights()
     service.sync_proposals()
-    return {"pending_insights": service.list(state=state)}
+    pending = service.list(state=state)
+    _read_rows("graph_pending", len(pending))
+    return {"pending_insights": pending}
 
 
 @app.get("/api/graph/nodes/{node_id}")
@@ -762,7 +936,9 @@ def insight_history(insight_id: str) -> dict[str, object]:
 @app.get("/api/research")
 def research_documents() -> dict[str, object]:
     """List the curated research documents the user has ingested."""
-    return {"documents": _research().documents()}
+    documents = _research().documents()
+    _read_rows("research_documents", len(documents))
+    return {"documents": documents}
 
 
 @app.post("/api/research/ingest")
@@ -806,6 +982,7 @@ def research_query(
 ) -> dict[str, object]:
     """Answer a psychoeducation query from the literature, with citations."""
     results = _research().query(q, k=k, threshold=threshold)
+    _read_rows("research_query", len(results))
     return {
         "answer": "\n\n".join(
             f"{result['text']} {result['citation']}" for result in results
@@ -874,7 +1051,9 @@ def delete_research(document_id: int) -> dict[str, int]:
 @app.get("/api/proactivity")
 def proactivity_settings() -> dict[str, object]:
     """Return all four opt-in channel settings."""
-    return {"channels": _proactivity().settings()}
+    channels = _proactivity().settings()
+    _read_rows("proactivity_settings", len(channels))
+    return {"channels": channels}
 
 
 @app.put("/api/proactivity/{channel}")
@@ -940,7 +1119,9 @@ def in_app_outreach(consume: bool = True) -> dict[str, object]:
 @app.get("/api/proactivity/digests")
 def proactivity_digests() -> dict[str, object]:
     """Return owner-local written daily/weekly reflection digests."""
-    return {"digests": _proactivity().digests()}
+    digests = _proactivity().digests()
+    _read_rows("proactivity_digests", len(digests))
+    return {"digests": digests}
 
 
 def _assert_no_live_sessions() -> None:
@@ -1238,6 +1419,18 @@ def crisis_resources_config() -> dict[str, object]:
     try:
         contacts = crisis_contacts()
     except CrisisConfigurationError as exc:
+        # Config validity only — never crisis activity inference (plan O3.1).
+        import logging as logging_module
+
+        from therapy.observability.logging import emit_event
+
+        emit_event(
+            "crisis_config_invalid",
+            severity=logging_module.ERROR,
+            component="server",
+            operation="crisis_config",
+            outcome="error",
+        )
         raise HTTPException(status_code=503, detail=str(exc)) from exc
     return {
         "contacts": contacts,

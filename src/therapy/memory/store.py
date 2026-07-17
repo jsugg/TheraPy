@@ -223,12 +223,22 @@ class MemoryStore:
         Returns:
             True when a session row was deleted, False for an unknown id.
         """
-        with self._connect() as connection:
-            with connection:
-                cursor = connection.execute(
-                    "DELETE FROM sessions WHERE id = ?", (session_id,)
-                )
-        shutil.rmtree(self._audio_dir / session_id, ignore_errors=True)
+        from therapy.observability.telemetry import broad_span
+
+        # Distinct db-delete/audio-delete children (plan O3.1) — the two can
+        # fail independently and the waterfall must show which.
+        with broad_span(
+            "session_delete.db_delete", component="memory", operation="delete"
+        ):
+            with self._connect() as connection:
+                with connection:
+                    cursor = connection.execute(
+                        "DELETE FROM sessions WHERE id = ?", (session_id,)
+                    )
+        with broad_span(
+            "session_delete.audio_delete", component="memory", operation="delete"
+        ):
+            shutil.rmtree(self._audio_dir / session_id, ignore_errors=True)
         return cursor.rowcount > 0
 
     @_traced_storage("memory", "reopen_session")

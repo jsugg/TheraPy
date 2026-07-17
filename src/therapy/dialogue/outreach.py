@@ -797,6 +797,18 @@ class ProactivityService:
         self.vapid.path.unlink(missing_ok=True)
 
 
+_scheduler_heartbeat: dict[str, float | None] = {"last_tick": None}
+
+
+def last_scheduler_tick() -> float | None:
+    """Unix time of the last completed scheduler tick in this process.
+
+    Feeds the `/ready` scheduler check (plan O3.1) without reaching into
+    the scheduler instance owned by the application lifespan.
+    """
+    return _scheduler_heartbeat["last_tick"]
+
+
 class ProactivityScheduler:
     """Bounded in-process scheduler whose durable state lives in SQLite."""
 
@@ -810,13 +822,23 @@ class ProactivityScheduler:
     async def run(self) -> None:
         """Tick until application shutdown without blocking the event loop."""
         while not self._stop.is_set():
+            tick_started = time_module.monotonic()
             try:
                 processed = await asyncio.to_thread(self.service.tick)
                 from therapy.observability.telemetry import record_metric
 
+                _scheduler_heartbeat["last_tick"] = time_module.time()
                 record_metric(
                     "therapy_proactivity_scheduler_last_tick_unixtime",
                     time_module.time(),
+                )
+                record_metric(
+                    "therapy_proactivity_ticks_total", 1, {"outcome": "success"}
+                )
+                record_metric(
+                    "therapy_proactivity_tick_seconds",
+                    time_module.monotonic() - tick_started,
+                    {"outcome": "success"},
                 )
                 if processed:
                     # only non-empty batches get a trace root (obs plan
@@ -835,6 +857,16 @@ class ProactivityScheduler:
                         if span is not None:
                             span.set_attribute("count", processed)
             except Exception as exc:
+                from therapy.observability.telemetry import record_metric
+
+                record_metric(
+                    "therapy_proactivity_ticks_total", 1, {"outcome": "error"}
+                )
+                record_metric(
+                    "therapy_proactivity_tick_seconds",
+                    time_module.monotonic() - tick_started,
+                    {"outcome": "error"},
+                )
                 emit_event(
                     "scheduler.tick_failed",
                     severity=logging.ERROR,
