@@ -172,59 +172,76 @@ async def _generate_session_artifacts(
     title: TextArtifactGenerator = entitle,
 ) -> _SessionArtifacts:
     """Generate independent finalization artifacts without failure coupling."""
+
+    def _artifact_outcome(artifact: str, outcome: str) -> None:
+        """Per-artifact finalization evidence (plan O3.2) — success AND
+        failure, so a silently skipped artifact is visible."""
+        from therapy.observability.telemetry import record_metric
+
+        record_metric(
+            "therapy_session_finalizations_total",
+            1,
+            {"artifact": artifact, "outcome": outcome},
+        )
+
+    def _artifact_failed(artifact: str, exc: Exception) -> None:
+        _artifact_outcome(artifact, "error")
+        emit_event(
+            "finalizer.artifact_failed",
+            severity=logging.WARNING,
+            component="voice",
+            operation=artifact,
+            outcome="error",
+            error_type=type(exc).__name__,
+        )
+
     summary_value: str | None = None
     distilled = knowledge_distill.DistillResult(run_id="not-run")
     recap_value: str | None = None
     title_value: str | None = None
     try:
         summary_value = (await summarize(turns)).strip() or None
+        _artifact_outcome("summary", "success")
     except Exception as exc:
-        emit_event(
-            "finalizer.artifact_failed",
-            severity=logging.WARNING,
-            component="voice",
-            operation="summary",
-            outcome="error",
-            error_type=type(exc).__name__,
-        )
+        _artifact_failed("summary", exc)
     try:
         distilled = await distill(model, turns, session_id)
+        _artifact_outcome("distill", "success")
     except Exception as exc:
-        emit_event(
-            "finalizer.artifact_failed",
-            severity=logging.WARNING,
-            component="voice",
-            operation="distill",
-            outcome="error",
-            error_type=type(exc).__name__,
-        )
+        _artifact_failed("distill", exc)
     try:
         recap_value = (await recap(turns)).strip() or None
+        _artifact_outcome("recap", "success")
     except Exception as exc:
-        emit_event(
-            "finalizer.artifact_failed",
-            severity=logging.WARNING,
-            component="voice",
-            operation="recap",
-            outcome="error",
-            error_type=type(exc).__name__,
-        )
+        _artifact_failed("recap", exc)
     try:
         title_value = (await title(turns)).strip() or None
+        _artifact_outcome("title", "success")
     except Exception as exc:
-        emit_event(
-            "finalizer.artifact_failed",
-            severity=logging.WARNING,
-            component="voice",
-            operation="title",
-            outcome="error",
-            error_type=type(exc).__name__,
-        )
+        _artifact_failed("title", exc)
     return _SessionArtifacts(
         summary=summary_value,
         distillation=distilled,
         recap=recap_value,
         title=title_value,
+    )
+
+
+def _record_finalizers_pending() -> None:
+    from therapy.observability.telemetry import record_metric
+
+    record_metric("therapy_session_finalizers_pending", len(_finalizers))
+
+
+def _count_data_channel(type_class: str, outcome: str) -> None:
+    """Bounded data-channel send evidence (plan O3.2): message class and
+    outcome only — never the protocol payload."""
+    from therapy.observability.telemetry import record_metric
+
+    record_metric(
+        "therapy_data_channel_messages_total",
+        1,
+        {"type_class": type_class, "outcome": outcome},
     )
 
 
@@ -235,6 +252,14 @@ async def drain_session_finalizers(timeout: float) -> None:
         return
     _, pending = await asyncio.wait(tasks, timeout=timeout)
     if pending:
+        emit_event(
+            "finalizer.drain_timeout",
+            severity=logging.ERROR,
+            component="voice",
+            operation="finalize",
+            outcome="timeout",
+            count=len(pending),
+        )
         raise TimeoutError("Session finalization did not finish in time")
     await asyncio.sleep(0)
 
@@ -259,12 +284,30 @@ def vad_params() -> VADParams:
 
 def tts_settings_for(language: str) -> TTSUpdateSettingsFrame:
     """TTS voice+language switch frame for a supported language code."""
-    return TTSUpdateSettingsFrame(
-        delta=KokoroTTSSettings(
-            voice=voice_for(language),
-            language=LANGUAGE_ENUM[language],
+    from therapy.observability.telemetry import record_metric
+
+    try:
+        frame = TTSUpdateSettingsFrame(
+            delta=KokoroTTSSettings(
+                voice=voice_for(language),
+                language=LANGUAGE_ENUM[language],
+            )
         )
+    except (KeyError, ValueError):
+        # Output-config failure is a finite transition (plan O3.2) — the
+        # offending code never becomes a label.
+        record_metric(
+            "therapy_language_transitions_total",
+            1,
+            {"kind": "tts_config", "outcome": "invalid"},
+        )
+        raise
+    record_metric(
+        "therapy_language_transitions_total",
+        1,
+        {"kind": "tts_config", "outcome": "changed"},
     )
+    return frame
 
 
 def _transcribe_utterance(
@@ -328,7 +371,25 @@ class MultilingualWhisperSTTService(WhisperSTTService):
         # live at a time (connection preemption), so sharing is safe.
         global _whisper_model
         if _whisper_model is None:
-            super()._load()
+            import time as time_module
+
+            from therapy.observability.telemetry import record_metric
+
+            load_started = time_module.monotonic()
+            try:
+                super()._load()
+            except Exception:
+                record_metric(
+                    "therapy_stt_model_load_seconds",
+                    time_module.monotonic() - load_started,
+                    {"outcome": "error"},
+                )
+                raise
+            record_metric(
+                "therapy_stt_model_load_seconds",
+                time_module.monotonic() - load_started,
+                {"outcome": "success"},
+            )
             _whisper_model = self._model
         else:
             self._model = _whisper_model
@@ -336,13 +397,36 @@ class MultilingualWhisperSTTService(WhisperSTTService):
     async def run_stt(self, audio: bytes):
         if not self._model:
             return
+        import time as time_module
+
+        from therapy.observability.telemetry import record_metric
+
         await self.start_processing_metrics()
         audio_float = np.frombuffer(audio, dtype=np.int16).astype(np.float32) / 32768.0
+        # 16 kHz mono int16 — duration from sample count, never the audio.
+        audio_seconds = len(audio_float) / 16_000.0
+        record_metric("therapy_utterance_audio_seconds", audio_seconds)
         threshold = self._settings.no_speech_prob
         no_speech = threshold if isinstance(threshold, float) else 0.6
 
+        decode_started = time_module.monotonic()
         text, detected, probability = await asyncio.to_thread(
             _transcribe_utterance, self._model, audio_float, None, no_speech
+        )
+        if audio_seconds > 0:
+            record_metric(
+                "therapy_stt_realtime_factor",
+                (time_module.monotonic() - decode_started) / audio_seconds,
+                {"outcome": "success"},
+            )
+        record_metric(
+            "therapy_stt_language_probability",
+            probability,
+            {
+                "language_group": detected
+                if detected in ("es", "en", "pt")
+                else "other"
+            },
         )
         if probability <= 0.5:
             detected = None
@@ -366,6 +450,11 @@ class MultilingualWhisperSTTService(WhisperSTTService):
                 # in field testing), not a user switching languages.
                 # Re-decode anchored to the conversation to recover it.
                 logger.debug("stt_unsupported_detection_redecode")
+                record_metric(
+                    "therapy_stt_redecode_total",
+                    1,
+                    {"reason": "unsupported_detection"},
+                )
                 text, _, _ = await asyncio.to_thread(
                     _transcribe_utterance,
                     self._model,
@@ -378,6 +467,13 @@ class MultilingualWhisperSTTService(WhisperSTTService):
             self.current_language = language
         await self.stop_processing_metrics()
 
+        record_metric(
+            "therapy_vad_utterances_total",
+            1,
+            {"outcome": "speech" if text else "silence"},
+        )
+        if not text:
+            record_metric("therapy_stt_empty_total", 1, {"reason": "no_speech"})
         if text:
             if self._recorder:
                 await asyncio.to_thread(self._recorder, audio, text, language)
@@ -489,6 +585,7 @@ class TurnRelay(FrameProcessor):
                     }
                 )
             )
+            _count_data_channel("transcript", "sent")
         await self.push_frame(frame, direction)
 
 
@@ -522,6 +619,7 @@ class BotTextRelay(FrameProcessor):
                             }
                         )
                     )
+                    _count_data_channel("transcript", "sent")
         await self.push_frame(frame, direction)
 
 
@@ -598,6 +696,9 @@ class TTFAMonitor(FrameProcessor):
     def __init__(self) -> None:
         super().__init__()
         self._turn_started_at: float | None = None
+        # First reply of a pipeline pays model warm-up; label it honestly
+        # (plan O3.2/O3 audit: mode was hard-coded "warm").
+        self._cold = True
 
     async def process_frame(self, frame: Frame, direction: FrameDirection) -> None:
         await super().process_frame(frame, direction)
@@ -606,6 +707,17 @@ class TTFAMonitor(FrameProcessor):
         elif isinstance(frame, TTSAudioRawFrame) and self._turn_started_at is not None:
             ttfa = time.monotonic() - self._turn_started_at
             self._turn_started_at = None
+            from therapy.observability.telemetry import record_metric
+
+            record_metric(
+                "therapy_turn_ttfa_seconds",
+                ttfa,
+                {
+                    "provider": _env_provider_label(),
+                    "mode": "cold" if self._cold else "warm",
+                },
+            )
+            self._cold = False
             emit_event(
                 "turn.ttfa",
                 component="voice",
@@ -614,6 +726,14 @@ class TTFAMonitor(FrameProcessor):
                 duration_ms=ttfa * 1000,
             )
         await self.push_frame(frame, direction)
+
+
+def _env_provider_label() -> str:
+    from therapy.observability.model import Provider, normalize_enum
+
+    return normalize_enum(
+        os.environ.get("THERAPY_LLM", "anthropic"), Provider, Provider.UNKNOWN
+    ).value
 
 
 class PresenceRelay(FrameProcessor):
@@ -643,6 +763,7 @@ class PresenceRelay(FrameProcessor):
         await self.push_frame(
             OutputTransportMessageUrgentFrame(message=presence_message(state))
         )
+        _count_data_channel("presence", "sent")
 
     async def process_frame(self, frame: Frame, direction: FrameDirection) -> None:
         await super().process_frame(frame, direction)
@@ -816,22 +937,50 @@ async def run_bot(
         )
         return turn_context["note"]
 
-    def record_user_voice(audio: bytes, text: str, language: str) -> None:
-        store.add_turn(
-            session_id, "user", VOICE, language, text, audio=audio, sample_rate=16_000
+    def _persisted(artifact: str, outcome: str, size: int | None = None) -> None:
+        """Bounded persistence-boundary evidence (plan O3.2): artifact class,
+        outcome, and byte size only — never text, audio, or IDs."""
+        from therapy.observability.telemetry import record_metric
+
+        record_metric(
+            "therapy_persist_total", 1, {"artifact": artifact, "outcome": outcome}
         )
+        if size is not None:
+            record_metric("therapy_persist_bytes", size, {"artifact": artifact})
+
+    def record_user_voice(audio: bytes, text: str, language: str) -> None:
+        try:
+            store.add_turn(
+                session_id, "user", VOICE, language, text,
+                audio=audio, sample_rate=16_000,
+            )
+        except Exception:
+            _persisted("audio", "error")
+            raise
+        _persisted("audio", "success", len(audio))
+        _persisted("turn", "success", len(text.encode("utf-8")))
         # Freeform observation inbox (W2): distillation promotes it between
         # sessions. never_store is enforced inside add_observation.
-        user_model.add_observation(text, session_id=session_id, language=language)
+        try:
+            user_model.add_observation(text, session_id=session_id, language=language)
+        except Exception:
+            _persisted("observation", "error")
+            raise
+        _persisted("observation", "success")
 
     def record_assistant(text: str) -> None:
-        store.add_turn(
-            session_id,
-            "assistant",
-            VOICE if modality.speak else TEXT,
-            reply_language.language,
-            text,
-        )
+        try:
+            store.add_turn(
+                session_id,
+                "assistant",
+                VOICE if modality.speak else TEXT,
+                reply_language.language,
+                text,
+            )
+        except Exception:
+            _persisted("turn", "error")
+            raise
+        _persisted("turn", "success", len(text.encode("utf-8")))
 
     stt = (
         _DeterministicTestPassthrough(initial_language)
@@ -911,9 +1060,20 @@ async def run_bot(
         **build_task_telemetry(llm, session_id=session_id),
     )
 
+    def _count_app_message(type_class: str, outcome: str) -> None:
+        """Finite accepted/rejected/queued evidence per message class (O3.2)."""
+        from therapy.observability.telemetry import record_metric
+
+        record_metric(
+            "therapy_app_messages_total",
+            1,
+            {"type_class": type_class, "outcome": outcome},
+        )
+
     @transport.event_handler("on_app_message")
     async def on_app_message(transport: Any, message: Any, sender: str) -> None:
         if not isinstance(message, dict):
+            _count_app_message("invalid", "rejected")
             return
 
         # Client's channel just opened — send the server-truth chat state so
@@ -923,6 +1083,8 @@ async def run_bot(
                 session_id, bool(resumed_turns), resumed_turns
             )
             await task.queue_frames([OutputTransportMessageUrgentFrame(message=state)])
+            _count_data_channel("session", "replayed")
+            _count_app_message("client_ready", "accepted")
             return
 
         # Speaker override from the client: true/false, or null for auto.
@@ -930,6 +1092,7 @@ async def run_bot(
             enabled = message.get("enabled")
             speak = modality.set_override(enabled if isinstance(enabled, bool) else None)
             await task.queue_frames([LLMConfigureOutputFrame(skip_tts=not speak)])
+            _count_app_message("voice_reply", "accepted")
             return
 
         # Reply-language pin from the client: es/en/pt, or null for auto
@@ -946,6 +1109,7 @@ async def run_bot(
                     operation="reply_language",
                     outcome="rejected",
                 )
+                _count_app_message("reply_language", "rejected")
                 return
             # Auto asserts nothing on replay; only a pin anchors (the effect
             # helper carries the reasoning). Otherwise the fresh-connect auto
@@ -965,13 +1129,16 @@ async def run_bot(
                 )
             if frames:
                 await task.queue_frames(frames)
+            _count_app_message("reply_language", "accepted")
             return
 
         # Typed turn from the data channel — same conversation, text modality.
         if message.get("type") != "user_text":
+            _count_app_message("unknown", "rejected")
             return
         text = str(message.get("text", "")).strip()
         if not text:
+            _count_app_message("text", "rejected")
             return
         # No audio to detect from: lingua's word-level majority picks the reply
         # language (es/en/pt); label_language names the turn honestly for the
@@ -1030,6 +1197,8 @@ async def run_bot(
         # Queued at the pipeline source — frames must not be pushed from the
         # transport's event task directly.
         await task.queue_frames(frames)
+        _count_data_channel("transcript", "queued")
+        _count_app_message("text", "queued")
 
     finalized = False
     # Detached finalizers get a NEW linked trace root, never a multi-hour
@@ -1056,13 +1225,23 @@ async def run_bot(
 
     async def _finalize_session_inner() -> None:
         nonlocal finalized
+        import time as time_module
+
+        from therapy.observability.telemetry import record_metric
+
         # A reconnect may have resumed this session before this task ran
         # (preemption schedules finalize during cancellation, possibly after
         # the new pipeline already took ownership) — then it is no longer
         # ours to close.
         if not live.owns(session_id, owner):
+            record_metric(
+                "therapy_session_finalizations_total",
+                1,
+                {"artifact": "session", "outcome": "ownership_skip"},
+            )
             return
         finalized = True
+        finalize_started = time_module.monotonic()
         turns = await asyncio.to_thread(store.session_turns, session_id)
         summary: str | None = None
         title: str | None = None
@@ -1105,6 +1284,11 @@ async def run_bot(
             await asyncio.to_thread(store.ensure_recap, session_id, recap)
         await asyncio.to_thread(store.end_session, session_id, summary)
         live.release(session_id, owner)
+        record_metric(
+            "therapy_session_finalization_seconds",
+            time_module.monotonic() - finalize_started,
+            {"outcome": "success"},
+        )
         emit_event(
             "voice.session_closed",
             component="voice",
@@ -1129,12 +1313,24 @@ async def run_bot(
             return
         finalize_task = asyncio.create_task(finalize_session())
         _finalizers[session_id] = finalize_task
+        _record_finalizers_pending()
 
         def _forget(done: asyncio.Task[None]) -> None:
+            from therapy.observability.telemetry import record_metric
+
+            cancelled = False
             try:
                 failure = done.exception()
             except asyncio.CancelledError:
                 failure = None
+                cancelled = True
+            if cancelled:
+                # Cancellation-on-resume is a normal, visible outcome (O3.2).
+                record_metric(
+                    "therapy_session_finalizations_total",
+                    1,
+                    {"artifact": "session", "outcome": "cancelled"},
+                )
             if failure is not None:
                 emit_event(
                     "finalizer.failed",
@@ -1147,6 +1343,7 @@ async def run_bot(
             live.release(session_id, owner)
             if _finalizers.get(session_id) is done:
                 del _finalizers[session_id]
+            _record_finalizers_pending()
 
         finalize_task.add_done_callback(_forget)
 

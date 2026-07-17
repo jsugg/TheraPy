@@ -156,9 +156,28 @@ but you never bring up a topic they have asked you not to raise.
 """
 
 
+def _count_prompt_build(outcome: str, sections: int) -> None:
+    """Bounded prompt-assembly evidence (plan O3.2): outcome and section
+    count bucket only; the exact rendered prompt stays restricted."""
+    from therapy.observability.model import count_bucket
+    from therapy.observability.telemetry import record_metric
+
+    record_metric(
+        "therapy_prompt_builds_total",
+        1,
+        {"outcome": outcome, "sections": count_bucket(sections)},
+    )
+
+
 def build_system_prompt() -> str:
     """Render the system prompt with runtime configuration."""
-    return _SYSTEM_PROMPT_TEMPLATE.format(crisis_resources=crisis_resources())
+    try:
+        rendered = _SYSTEM_PROMPT_TEMPLATE.format(crisis_resources=crisis_resources())
+    except Exception:
+        _count_prompt_build("fallback", 0)
+        raise
+    _count_prompt_build("success", 1)
+    return rendered
 
 
 def continuity_note(summaries: list[dict], facts: list[dict]) -> str | None:
@@ -169,7 +188,9 @@ def continuity_note(summaries: list[dict], facts: list[dict]) -> str | None:
     there is no history yet, so first sessions carry no empty scaffolding.
     """
     if not summaries and not facts:
+        _count_prompt_build("success", 0)
         return None
+    _count_prompt_build("success", len(summaries) + len(facts))
     parts = ["# What you remember"]
     if facts:
         parts.append(

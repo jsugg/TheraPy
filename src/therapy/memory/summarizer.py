@@ -123,6 +123,10 @@ async def complete(
     dispatch (plan O1.3); `operation` defaults to SUMMARY only for direct
     compatibility callers — production callers pass it explicitly.
     """
+    # Hard boundary (plan O3.2): raw audio objects/bytes must be
+    # unrepresentable at every cloud LLM adapter — only text crosses here.
+    if not isinstance(system, str) or not isinstance(user, str):
+        raise TypeError("LLM boundaries accept text only; raw audio/bytes are forbidden")
     provider = (provider or os.environ.get("THERAPY_LLM", "anthropic")).lower()
     if provider == "anthropic":
         resolved_model = model or "claude-opus-4-8"

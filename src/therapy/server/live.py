@@ -31,7 +31,12 @@ def claim(session_id: str) -> object:
 
 def owns(session_id: str, token: object) -> bool:
     """Whether this token is still the session's current owner."""
-    return _owners.get(session_id) is token
+    owned = _owners.get(session_id) is token
+    if not owned:
+        # A stale finalizer discovering it lost ownership is a signal the
+        # ownership-leak alert consumes (plan O3.2); never the session ID.
+        _record("owns", "mismatch")
+    return owned
 
 
 def release(session_id: str, token: object) -> None:

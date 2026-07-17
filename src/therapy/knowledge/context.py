@@ -190,46 +190,79 @@ class ContextAssembler:
                         result[entity_id] = normalized
         return result
 
+    @staticmethod
+    def _record_items(source: str, count: int) -> None:
+        """Bounded per-source context evidence (plan O3.2): count buckets
+        only; exact selected/rendered context stays restricted."""
+        from therapy.observability.model import count_bucket
+        from therapy.observability.telemetry import record_metric
+
+        record_metric(
+            "therapy_context_items_total",
+            1,
+            {"source": source, "bucket": count_bucket(count)},
+        )
+
     def assemble(self, topic: str, session_id: str) -> TurnContext:
         """Refresh semantic/episodic memory and adjacent insight for one turn."""
+        import time as time_module
+
+        from therapy.observability.telemetry import record_metric
+
         if not session_id:
             raise ValueError("session_id is required")
-        if not topic.strip():
-            graph = self.model.assemble_context("")
-            return {
-                "note": self._render(graph, [], None),
-                "graph": graph,
-                "episodes": [],
-                "insight": None,
-                "resolution": None,
-                "research": "",
+        assemble_started = time_module.monotonic()
+        outcome = "success"
+        try:
+            if not topic.strip():
+                graph = self.model.assemble_context("")
+                return {
+                    "note": self._render(graph, [], None),
+                    "graph": graph,
+                    "episodes": [],
+                    "insight": None,
+                    "resolution": None,
+                    "research": "",
+                }
+            resolution = self.insights.resolve_conversational(session_id, topic)
+            query = self.embedder.embed_query(topic)
+            graph = self._graph_context(topic, query)
+            episodes = self._episodes(topic, query)
+            adjacent_claim_ids = {
+                node["id"]
+                for key in ("identity", "preferences", "goals", "threads", "walk_nodes")
+                for node in graph[key]
             }
-        resolution = self.insights.resolve_conversational(session_id, topic)
-        query = self.embedder.embed_query(topic)
-        graph = self._graph_context(topic, query)
-        episodes = self._episodes(topic, query)
-        adjacent_claim_ids = {
-            node["id"]
-            for key in ("identity", "preferences", "goals", "threads", "walk_nodes")
-            for node in graph[key]
-        }
-        insight = (
-            None
-            if resolution is not None
-            else self.insights.next_for_topic(
-                topic, session_id, adjacent_claim_ids=adjacent_claim_ids
+            insight = (
+                None
+                if resolution is not None
+                else self.insights.next_for_topic(
+                    topic, session_id, adjacent_claim_ids=adjacent_claim_ids
+                )
             )
-        )
-        research = self.research.grounding_context(topic)
-        note = self._render(graph, episodes, insight, research, resolution)
-        return {
-            "note": note,
-            "graph": graph,
-            "episodes": episodes,
-            "insight": insight,
-            "resolution": resolution,
-            "research": research,
-        }
+            research = self.research.grounding_context(topic)
+            note = self._render(graph, episodes, insight, research, resolution)
+            self._record_items("graph", len(adjacent_claim_ids))
+            self._record_items("episode", len(episodes))
+            self._record_items("insight", 1 if insight else 0)
+            self._record_items("research", 1 if research else 0)
+            return {
+                "note": note,
+                "graph": graph,
+                "episodes": episodes,
+                "insight": insight,
+                "resolution": resolution,
+                "research": research,
+            }
+        except Exception:
+            outcome = "error"
+            raise
+        finally:
+            record_metric(
+                "therapy_context_assembly_seconds",
+                time_module.monotonic() - assemble_started,
+                {"outcome": outcome},
+            )
 
     def _allows_node(
         self, node: GraphNode, topic: str, semantic_similarity: float

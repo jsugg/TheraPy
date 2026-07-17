@@ -276,11 +276,9 @@ class MetricsFrameAdapter(BaseObserver):
                             {"language_group": "unknown", "outcome": "success"},
                         )
                 elif isinstance(item, TTFAMetricsData):
-                    record_metric(
-                        "therapy_turn_ttfa_seconds",
-                        item.ttfa,
-                        {"provider": _env_provider(), "mode": "warm"},
-                    )
+                    # TTFAMonitor is the single TTFA producer (honest
+                    # cold/warm labeling); recording here double-counted.
+                    pass
                 elif isinstance(item, LLMUsageMetricsData):
                     usage = item.value
                     record_metric(

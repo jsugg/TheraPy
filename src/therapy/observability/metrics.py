@@ -43,6 +43,7 @@ INSTRUMENTS: tuple[InstrumentSpec, ...] = (
     InstrumentSpec("therapy_voice_connections_total", InstrumentKind.COUNTER, "1",
                    {"outcome": None, "reason": None}),
     InstrumentSpec("therapy_voice_active_connections", InstrumentKind.GAUGE, "1"),
+    InstrumentSpec("therapy_voice_pipeline_active", InstrumentKind.GAUGE, "1"),
     InstrumentSpec("therapy_voice_pipeline_transitions_total", InstrumentKind.COUNTER,
                    "1", {"transition": None, "outcome": None}),
     InstrumentSpec("therapy_voice_pipeline_shutdown_seconds", InstrumentKind.HISTOGRAM,
@@ -176,7 +177,7 @@ INSTRUMENTS: tuple[InstrumentSpec, ...] = (
     # --- O3.2 voice/speech/context ---
     InstrumentSpec("therapy_app_messages_total", InstrumentKind.COUNTER, "1",
                    {"type_class": ("client_ready", "text", "voice_reply",
-                                   "unknown", "invalid"),
+                                   "reply_language", "unknown", "invalid"),
                     "outcome": ("accepted", "rejected", "queued")}),
     InstrumentSpec("therapy_language_transitions_total", InstrumentKind.COUNTER,
                    "1", {"kind": ("reply_language", "modality", "tts_config"),
