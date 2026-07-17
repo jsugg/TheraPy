@@ -12,6 +12,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum, StrEnum
+from typing import Literal
 
 #: Version of the bounded-enum vocabulary below. Bump when a member is added
 #: so exported records/labels can be interpreted against the right set.
@@ -470,6 +471,88 @@ def llm_boundary_manifest_json() -> list[dict[str, object]]:
             "fail_policy": boundary.fail_policy.value,
         }
         for boundary in LLM_BOUNDARY_MANIFEST
+    ]
+
+
+# --------------------------------------------------------------------------
+# Retrieval and tool boundary manifest (plan O3 gate)
+# --------------------------------------------------------------------------
+
+type RetrievalToolBoundaryKind = Literal["retrieval", "tool"]
+type BoundaryEvidence = Literal["restricted_capture", "product_store"]
+
+
+@dataclass(frozen=True, slots=True)
+class RetrievalToolBoundary:
+    """One audited retrieval or owner-operated tool boundary."""
+
+    name: str
+    kind: RetrievalToolBoundaryKind
+    module: str
+    entrypoint: str
+    evidence: BoundaryEvidence
+    notes: str
+
+
+RETRIEVAL_TOOL_BOUNDARY_MANIFEST: tuple[RetrievalToolBoundary, ...] = (
+    RetrievalToolBoundary(
+        name="research_semantic_query",
+        kind="retrieval",
+        module="therapy.knowledge.research",
+        entrypoint="ResearchKB.query",
+        evidence="product_store",
+        notes="Ranked passages and scores derive from the owned research store.",
+    ),
+    RetrievalToolBoundary(
+        name="research_grounding_context",
+        kind="retrieval",
+        module="therapy.knowledge.research",
+        entrypoint="ResearchKB.grounding_context",
+        evidence="restricted_capture",
+        notes="Rendered grounding enters the exact captured turn context.",
+    ),
+    RetrievalToolBoundary(
+        name="turn_context_assembly",
+        kind="retrieval",
+        module="therapy.knowledge.context",
+        entrypoint="ContextAssembler.assemble",
+        evidence="restricted_capture",
+        notes="Graph, episode, insight, and research selections enter captured context.",
+    ),
+    RetrievalToolBoundary(
+        name="episodic_memory_selection",
+        kind="retrieval",
+        module="therapy.knowledge.context",
+        entrypoint="ContextAssembler._episodes",
+        evidence="restricted_capture",
+        notes="Selected summaries and relevance scores enter captured turn context.",
+    ),
+    RetrievalToolBoundary(
+        name="owner_destructive_routes",
+        kind="tool",
+        module="therapy.server.app",
+        entrypoint="_audit",
+        evidence="product_store",
+        notes=(
+            "Owner-authorized destructive routes commit through owned stores and "
+            "emit a bounded terminal audit outcome; no model runtime invokes them."
+        ),
+    ),
+)
+
+
+def retrieval_tool_boundary_manifest_json() -> list[dict[str, str]]:
+    """Machine-readable retrieval/tool boundary manifest."""
+    return [
+        {
+            "name": boundary.name,
+            "kind": boundary.kind,
+            "module": boundary.module,
+            "entrypoint": boundary.entrypoint,
+            "evidence": boundary.evidence,
+            "notes": boundary.notes,
+        }
+        for boundary in RETRIEVAL_TOOL_BOUNDARY_MANIFEST
     ]
 
 
