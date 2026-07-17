@@ -7,14 +7,24 @@ during field testing (docs/SPEC.md Hardening 7-9), and this keeps the browser
 tests deterministic besides.
 """
 
+from __future__ import annotations
+
 import socket
 import subprocess
 import sys
 import time
 import urllib.request
 from collections.abc import Iterator
+from pathlib import Path
+from typing import TYPE_CHECKING, cast
 
 import pytest
+
+if TYPE_CHECKING:
+    from playwright.sync_api import Page, Playwright
+
+
+_TELEMETRY_BROWSERS = ("chromium", "firefox")
 
 
 def _free_port() -> int:
@@ -96,3 +106,23 @@ def browser_type_launch_args(browser_type_launch_args: dict) -> dict:
 @pytest.fixture
 def browser_context_args(browser_context_args: dict) -> dict:
     return {**browser_context_args, "permissions": ["microphone", "notifications"]}
+
+
+@pytest.fixture(params=_TELEMETRY_BROWSERS, ids=_TELEMETRY_BROWSERS)
+def telemetry_page(
+    request: pytest.FixtureRequest,
+    playwright: Playwright,
+) -> Iterator[Page]:
+    """Isolated Chromium/Firefox page for content-free telemetry tests."""
+    browser_name = cast(str, request.param)
+    browser_type = getattr(playwright, browser_name)
+    if not Path(browser_type.executable_path).is_file():
+        pytest.skip(f"Playwright {browser_name} browser is not installed")
+
+    browser = browser_type.launch(headless=True)
+    context = browser.new_context()
+    try:
+        yield context.new_page()
+    finally:
+        context.close()
+        browser.close()

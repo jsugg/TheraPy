@@ -1,8 +1,15 @@
 """Strict client telemetry endpoint (plan O4.1; O4 gate schema tests)."""
 
 import random
+from collections.abc import Iterator
 
 import pytest
+from opentelemetry import trace as trace_api
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+from opentelemetry.sdk.trace.export.in_memory_span_exporter import (
+    InMemorySpanExporter,
+)
 
 
 @pytest.fixture
@@ -19,6 +26,23 @@ def enabled(client, monkeypatch: pytest.MonkeyPatch):
 
 def _batch(events: list[dict]) -> dict:
     return {"schema_version": 1, "events": events}
+
+
+@pytest.fixture
+def otel_spans(
+    monkeypatch: pytest.MonkeyPatch,
+) -> Iterator[tuple[TracerProvider, InMemorySpanExporter]]:
+    """Capture owned and instrumented spans without changing the global provider."""
+    from therapy.observability import telemetry
+
+    exporter = InMemorySpanExporter()
+    provider = TracerProvider()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    monkeypatch.setattr(telemetry.state(), "enabled", True)
+    try:
+        yield provider, exporter
+    finally:
+        provider.shutdown()
 
 
 def test_disabled_by_default_is_404(client, monkeypatch) -> None:
@@ -50,6 +74,126 @@ def test_valid_batch_accepted(client, enabled) -> None:
     )
     assert response.status_code == 200
     assert response.json() == {"status": "accepted"}
+
+
+def test_valid_and_malformed_traceparents_control_owned_broad_span(
+    client,
+    enabled,
+    monkeypatch: pytest.MonkeyPatch,
+    otel_spans: tuple[TracerProvider, InMemorySpanExporter],
+) -> None:
+    provider, exporter = otel_spans
+    monkeypatch.setattr(trace_api, "get_tracer", provider.get_tracer)
+    trace_id_hex = "0123456789abcdef0123456789abcdef"
+    traceparent = f"00-{trace_id_hex}-0123456789abcdef-01"
+
+    response = client.post(
+        "/api/telemetry/client",
+        json=_batch([{"name": "shell_fetch", "outcome": "success"}]),
+        headers={"traceparent": traceparent},
+    )
+    assert response.status_code == 200
+    spans = [
+        span
+        for span in exporter.get_finished_spans()
+        if span.name == "client_telemetry"
+        and span.instrumentation_scope.name == "therapy.broad"
+    ]
+    assert len(spans) == 1
+    assert spans[0].context.trace_id == int(trace_id_hex, 16)
+    assert spans[0].parent is not None
+    assert spans[0].parent.is_remote
+    assert dict(spans[0].attributes or {}) == {
+        "component": "server",
+        "operation": "client_telemetry",
+    }
+
+    exporter.clear()
+    malformed = client.post(
+        "/api/telemetry/client",
+        json=_batch([{"name": "shell_fetch", "outcome": "success"}]),
+        headers={"traceparent": "not-a-traceparent"},
+    )
+    assert malformed.status_code == 200
+    malformed_spans = [
+        span
+        for span in exporter.get_finished_spans()
+        if span.name == "client_telemetry"
+        and span.instrumentation_scope.name == "therapy.broad"
+    ]
+    assert len(malformed_spans) == 1
+    assert malformed_spans[0].context.trace_id != int(trace_id_hex, 16)
+    assert malformed_spans[0].context.trace_id != 0
+    assert malformed_spans[0].parent is None
+    assert dict(malformed_spans[0].attributes or {}) == {
+        "component": "server",
+        "operation": "client_telemetry",
+    }
+
+
+def test_offer_fastapi_instrumentation_extracts_traceparent(
+    data_dir,
+    monkeypatch: pytest.MonkeyPatch,
+    otel_spans: tuple[TracerProvider, InMemorySpanExporter],
+) -> None:
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+    from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
+    from opentelemetry.trace import SpanKind
+
+    from therapy.server import app as app_mod
+    from therapy.voice.contracts import (
+        SessionTarget,
+        WebRTCAnswer,
+        WebRTCOffer,
+    )
+
+    class FakeGateway:
+        async def negotiate(
+            self, offer: WebRTCOffer, target: SessionTarget
+        ) -> WebRTCAnswer:
+            return WebRTCAnswer(sdp="answer-sdp", type="answer", pc_id="peer-1")
+
+    provider, exporter = otel_spans
+    traced_app = FastAPI()
+    traced_app.add_api_route("/api/offer", app_mod.offer, methods=["POST"])
+    traced_app.dependency_overrides[app_mod.get_voice_gateway] = FakeGateway
+    FastAPIInstrumentor.instrument_app(
+        traced_app,
+        tracer_provider=provider,
+        exclude_spans=["receive", "send"],
+    )
+    monkeypatch.setattr(trace_api, "get_tracer", provider.get_tracer)
+    trace_id_hex = "fedcba9876543210fedcba9876543210"
+    traceparent = f"00-{trace_id_hex}-fedcba9876543210-01"
+    app_mod._store.cache_clear()
+    try:
+        with TestClient(traced_app) as traced_client:
+            response = traced_client.post(
+                "/api/offer?new_session=1",
+                json={"sdp": "offer-sdp", "type": "offer"},
+                headers={"traceparent": traceparent},
+            )
+    finally:
+        FastAPIInstrumentor.uninstrument_app(traced_app)
+        app_mod._store.cache_clear()
+
+    assert response.status_code == 200
+    trace_id = int(trace_id_hex, 16)
+    server_spans = [
+        span for span in exporter.get_finished_spans() if span.kind is SpanKind.SERVER
+    ]
+    assert len(server_spans) == 1
+    assert server_spans[0].context.trace_id == trace_id
+    assert server_spans[0].parent is not None
+    assert server_spans[0].parent.is_remote
+    owned_spans = [
+        span
+        for span in exporter.get_finished_spans()
+        if span.instrumentation_scope.name == "therapy.broad"
+    ]
+    assert owned_spans
+    assert {span.context.trace_id for span in owned_spans} == {trace_id}
 
 
 @pytest.mark.parametrize(

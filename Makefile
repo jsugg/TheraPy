@@ -79,7 +79,7 @@ integration: test-integration
 
 .PHONY: test-e2e e2e
 test-e2e: ## ALL browser e2e (auto-installs Chromium if missing)
-	$(RUN) playwright install chromium >/dev/null
+	$(RUN) playwright install --with-deps chromium firefox >/dev/null # WebKit deps are unavailable in the pinned image.
 	$(RUN) pytest -m e2e $(ARGS)
 
 e2e: test-e2e

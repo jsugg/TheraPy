@@ -1,4 +1,4 @@
-"""Full PWA browser end-to-end (Playwright, headless Chromium).
+"""Full PWA browser end-to-end (Playwright, headless Chromium/Firefox).
 
 Covers what only a real browser can: PWA installability (the field-tested
 gap — the manifest, service worker and icons Chrome checks before offering
@@ -6,7 +6,7 @@ gap — the manifest, service worker and icons Chrome checks before offering
 typed turn, its transcript rendering, and the resume-label logic).
 
 Run: `docker compose exec therapy uv run pytest -m e2e`
-(a one-time `uv run playwright install chromium` populates the cache volume).
+(a one-time `uv run playwright install chromium firefox` populates the cache volume).
 """
 
 import re
@@ -21,17 +21,18 @@ import pytest
 # stays behind `TYPE_CHECKING` so the type checker only ever sees the real
 # Playwright types.
 if TYPE_CHECKING:
-    from playwright.sync_api import Page, expect
+    from playwright.sync_api import Page, Request, expect
 
     _HAS_PLAYWRIGHT = True
 else:
     try:
-        from playwright.sync_api import Page, expect
+        from playwright.sync_api import Page, Request, expect
 
         _HAS_PLAYWRIGHT = True
     except ImportError:
         _HAS_PLAYWRIGHT = False
         Page = object
+        Request = object
 
         def expect(*args, **kwargs):
             raise RuntimeError("playwright is not installed")
@@ -564,8 +565,9 @@ def test_model_workspace_graph_pending_corpus_and_sovereignty(
 
 
 def test_client_telemetry_queue_is_bounded_and_flushes(
-    page: Page, e2e_server: str
+    telemetry_page: Page, e2e_server: str
 ) -> None:
+    page = telemetry_page
     page.goto(f"{e2e_server}/")
     page.wait_for_function(
         "navigator.serviceWorker.ready.then(r => !!r.active)", timeout=20_000
@@ -574,6 +576,7 @@ def test_client_telemetry_queue_is_bounded_and_flushes(
     queue = page.evaluate(
         """() => {
           const realFetch = window.fetch;
+          window.__realFetch = realFetch;
           window.fetch = (resource, options) => {
             const url = typeof resource === "string" ? resource : resource.url;
             if (url.endsWith("/api/telemetry/client")) return new Promise(() => {});
@@ -590,13 +593,32 @@ def test_client_telemetry_queue_is_bounded_and_flushes(
     )
     assert queue == {"exists": True, "size": 50}
 
+    page.evaluate("() => { window.fetch = window.__realFetch || window.fetch; }")
     page.reload()
+    requests: list[Request] = []
     with page.expect_response(
         lambda response: response.url.endswith("/api/telemetry/client")
         and response.request.method == "POST"
-    ) as response_info:
+    ) as first_response:
         status = page.evaluate(
             """async () => {
+              const report = new Map([
+                ["pair", {
+                  type: "candidate-pair", selected: true,
+                  currentRoundTripTime: 0.0125,
+                  localCandidateId: "local", remoteCandidateId: "remote-secret",
+                }],
+                ["local", {
+                  type: "local-candidate", candidateType: "relay",
+                  address: "10.0.0.1", port: 4242,
+                }],
+                ["inbound", {
+                  type: "inbound-rtp", kind: "audio", jitter: 0.003,
+                  bytesReceived: 1000, packetsLost: 1, packetsReceived: 9,
+                  concealedSamples: 2, ssrc: 123456, codecId: "codec-secret",
+                }],
+              ]);
+              await sampleWebRtcStats({getStats: async () => report});
               window.telemetry.enqueue({
                 name: "webrtc_sample", outcome: "success", rtt_ms: 12.5,
                 packet_loss_ratio: 2, candidate_type: "prflx",
@@ -606,14 +628,106 @@ def test_client_telemetry_queue_is_bounded_and_flushes(
             }"""
         )
     assert status == 200
-    assert response_info.value.status == 200
+    assert first_response.value.status == 200
+    requests.append(first_response.value.request)
+
+    with page.expect_response(
+        lambda response: response.url.endswith("/api/telemetry/client")
+        and response.request.method == "POST"
+    ) as second_response:
+        status = page.evaluate(
+            """async () => {
+              window.telemetry.enqueue({name: "shell_fetch", outcome: "fallback"});
+              return await window.telemetry.flush();
+            }"""
+        )
+    assert status == 200
+    assert second_response.value.status == 200
+    requests.append(second_response.value.request)
+
+    first_events = requests[0].post_data_json["events"]
+    assert {
+        "name": "webrtc_sample",
+        "outcome": "success",
+        "rtt_ms": 12.5,
+    } in first_events
+    assert {
+        "name": "webrtc_sample",
+        "outcome": "success",
+        "rtt_ms": 12.5,
+        "jitter_ms": 3,
+        "packet_loss_ratio": 0.1,
+        "concealed_samples": 2,
+        "candidate_type": "relay",
+    } in first_events
+    assert all(
+        forbidden not in (requests[0].post_data or "")
+        for forbidden in (
+            "10.0.0.1",
+            "remote-secret",
+            "codec-secret",
+            "must not leave the page",
+            "/private",
+        )
+    )
+    traceparents = [request.headers["traceparent"] for request in requests]
+    assert all(
+        re.fullmatch(r"00-[0-9a-f]{32}-[0-9a-f]{16}-01", value)
+        for value in traceparents
+    )
+    assert len(set(traceparents)) == 1
+
+
+def test_client_telemetry_records_service_worker_registration(
+    telemetry_page: Page, e2e_server: str
+) -> None:
+    page = telemetry_page
+    page.goto(f"{e2e_server}/")
+    page.wait_for_function(
+        "navigator.serviceWorker.ready.then(r => !!r.active)", timeout=20_000
+    )
+    page.wait_for_function("window.telemetry.size >= 1", timeout=10_000)
+
+    with page.expect_response(
+        lambda response: response.url.endswith("/api/telemetry/client")
+        and response.request.method == "POST"
+    ) as response_info:
+        status = page.evaluate("() => window.telemetry.flush()")
+    assert status == 200
     events = response_info.value.request.post_data_json["events"]
-    assert {"name": "webrtc_sample", "outcome": "success", "rtt_ms": 12.5} in events
+    assert {"name": "sw_lifecycle", "outcome": "success"} in events
+
+
+def test_traceparent_correlates_page_telemetry_with_offer(
+    page: Page, e2e_server: str
+) -> None:
+    page.goto(f"{e2e_server}/")
+    with page.expect_response(
+        lambda response: response.url.endswith("/api/telemetry/client")
+        and response.request.method == "POST"
+    ) as telemetry_info:
+        status = page.evaluate(
+            """async () => {
+              window.telemetry.enqueue({name: "shell_fetch", outcome: "success"});
+              return await window.telemetry.flush();
+            }"""
+        )
+    assert status == 200
+    traceparent = telemetry_info.value.request.headers["traceparent"]
+
+    with page.expect_request(
+        lambda request: "/api/offer" in request.url and request.method == "POST"
+    ) as offer_info:
+        page.locator("#connect").click()
+    assert offer_info.value.headers["traceparent"] == traceparent
+    expect(page.locator("#status")).to_have_text("listening", timeout=60_000)
+    page.evaluate("() => disconnectVoice()")
 
 
 def test_registered_service_worker_telemetry_handles_push_and_notification_click(
     page: Page, e2e_server: str
 ) -> None:
+    # Playwright exposes BrowserContext.service_workers only on Chromium.
     page.goto(f"{e2e_server}/")
     page.wait_for_function(
         "navigator.serviceWorker.ready.then(r => !!r.active)", timeout=20_000

@@ -1297,15 +1297,37 @@ def _client_origin_allowed(origin: str | None, request: Request) -> bool:
     )
 
 
-@app.post("/api/telemetry/client")
-async def client_telemetry(request: Request) -> dict[str, str]:
-    """Strict first-party browser telemetry (obs plan O4.1).
+@contextmanager
+def _client_trace_parent(traceparent: str | None) -> Iterator[None]:
+    """Adopt only a valid remote W3C traceparent; ignore all other context."""
+    if not traceparent:
+        yield
+        return
 
-    Same-origin only; bounded size + token bucket BEFORE parsing; events
-    aggregate to metrics and are never persisted; only fixed-schema
-    rejection evidence is logged."""
-    if os.environ.get("THERAPY_CLIENT_TELEMETRY", "0") != "1":
-        raise HTTPException(status_code=404, detail="Not found")
+    from opentelemetry import context as otel_context
+    from opentelemetry import trace
+    from opentelemetry.trace.propagation.tracecontext import (
+        TraceContextTextMapPropagator,
+    )
+
+    extracted = TraceContextTextMapPropagator().extract(
+        carrier={"traceparent": traceparent},
+        context=otel_context.Context(),
+    )
+    span_context = trace.get_current_span(extracted).get_span_context()
+    if not span_context.is_valid or not span_context.is_remote:
+        yield
+        return
+
+    token = otel_context.attach(extracted)
+    try:
+        yield
+    finally:
+        otel_context.detach(token)
+
+
+async def _ingest_client_telemetry(request: Request) -> dict[str, str]:
+    """Validate and aggregate one strict, same-origin client batch."""
     length = request.headers.get("content-length")
     if length is not None:
         try:
@@ -1405,6 +1427,27 @@ async def client_telemetry(request: Request) -> dict[str, str]:
             {"name": event.name, "outcome": event.outcome},
         )
     return {"status": "accepted"}
+
+
+@app.post("/api/telemetry/client")
+async def client_telemetry(request: Request) -> dict[str, str]:
+    """Strict first-party browser telemetry (obs plan O4.1).
+
+    Same-origin only; bounded size + token bucket BEFORE parsing; events
+    aggregate to metrics and are never persisted; only fixed-schema
+    rejection evidence is logged. A controlled W3C parent correlates this
+    content-free span with the page's offer without entering the event body.
+    """
+    if os.environ.get("THERAPY_CLIENT_TELEMETRY", "0") != "1":
+        raise HTTPException(status_code=404, detail="Not found")
+
+    from therapy.observability.telemetry import broad_span
+
+    with _client_trace_parent(request.headers.get("traceparent")):
+        with broad_span(
+            "client_telemetry", component="server", operation="client_telemetry"
+        ):
+            return await _ingest_client_telemetry(request)
 
 
 @app.get("/api/crisis-resources")

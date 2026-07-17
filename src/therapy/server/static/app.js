@@ -46,6 +46,12 @@ const telemetry = (() => {
     dropped_events: [0, 10000, true],
   };
   const CANDIDATE_TYPES = new Set(["relay", "host", "srflx"]);
+  const randomHex = (byteLength) => {
+    const bytes = new Uint8Array(byteLength);
+    do crypto.getRandomValues(bytes); while (bytes.every((byte) => byte === 0));
+    return Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
+  };
+  const traceparent = `00-${randomHex(16)}-${randomHex(8)}-01`;
   let queue = [];
   let droppedEvents = 0;
   let enabled = null;
@@ -113,7 +119,7 @@ const telemetry = (() => {
       try {
         const response = await fetch(ENDPOINT, {
           method: "POST",
-          headers: { "Content-Type": "application/json" },
+          headers: { "Content-Type": "application/json", traceparent },
           body: JSON.stringify({
             schema_version: 1,
             events: entries.map((entry) => entry.event),
@@ -148,6 +154,7 @@ const telemetry = (() => {
     enqueue,
     flush,
     get size() { return queue.length; },
+    get traceparent() { return traceparent; },
   });
 })();
 
@@ -737,7 +744,7 @@ async function connect(opts = {}) {
   offerPostedAt = performance.now();
   const response = await fetch(offerUrl, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: { "Content-Type": "application/json", traceparent: telemetry.traceparent },
     body: JSON.stringify({
       sdp: pc.localDescription.sdp,
       type: pc.localDescription.type,
