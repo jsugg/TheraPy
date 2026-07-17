@@ -20,6 +20,7 @@ from __future__ import annotations
 import logging
 import time
 from dataclasses import dataclass
+from pathlib import Path
 
 from therapy.observability.context import (
     current_trace_context,
@@ -408,6 +409,132 @@ def capture_service() -> CaptureService | None:
     return _service
 
 
+_MAX_STORAGE_WALK_ENTRIES = 10_000
+
+
+def _bounded_directory_size(path: Path) -> tuple[int, bool]:
+    """Return a symlink-free directory size and whether the bounded walk completed."""
+    import os
+    import stat
+
+    try:
+        details = os.lstat(path)
+    except FileNotFoundError:
+        return 0, True
+    except OSError:
+        return 0, False
+    if not stat.S_ISDIR(details.st_mode):
+        return 0, False
+
+    total = 0
+    visited = 0
+    pending = [path]
+    complete = True
+    while pending:
+        current = pending.pop()
+        try:
+            with os.scandir(current) as entries:
+                for entry in entries:
+                    visited += 1
+                    if visited > _MAX_STORAGE_WALK_ENTRIES:
+                        return total, False
+                    try:
+                        if entry.is_symlink():
+                            continue
+                        if entry.is_dir(follow_symlinks=False):
+                            pending.append(current / entry.name)
+                        elif entry.is_file(follow_symlinks=False):
+                            total += entry.stat(follow_symlinks=False).st_size
+                    except OSError:
+                        complete = False
+        except OSError:
+            complete = False
+    return total, complete
+
+
+def _bounded_file_size(path: Path) -> tuple[int, bool]:
+    """Return a regular-file size without following symlinks."""
+    import os
+    import stat
+
+    try:
+        details = os.lstat(path)
+    except FileNotFoundError:
+        return 0, True
+    except OSError:
+        return 0, False
+    if not stat.S_ISREG(details.st_mode):
+        return 0, False
+    return details.st_size, True
+
+
+def _bounded_backup_size(data_dir: Path) -> tuple[int, bool]:
+    """Aggregate only migration backup files from the product-data root."""
+    import os
+
+    total = 0
+    try:
+        with os.scandir(data_dir) as entries:
+            for index, entry in enumerate(entries, start=1):
+                if index > _MAX_STORAGE_WALK_ENTRIES:
+                    return total, False
+                if not (
+                    entry.name.startswith("therapy.db")
+                    and entry.name.endswith(".bak")
+                ):
+                    continue
+                try:
+                    if entry.is_file(follow_symlinks=False):
+                        total += entry.stat(follow_symlinks=False).st_size
+                except OSError:
+                    return total, False
+    except OSError:
+        return total, False
+    return total, True
+
+
+def _inspect_product_storage() -> None:
+    """Collect bounded product-storage gauges without escaping maintenance."""
+    import os
+    import shutil
+
+    from therapy.observability.telemetry import record_metric
+
+    data_dir = Path(os.environ.get("THERAPY_DATA_DIR", "data"))
+    outcome = "success"
+    try:
+        collectors = (
+            ("db", lambda: _bounded_file_size(data_dir / "therapy.db")),
+            ("wal", lambda: _bounded_file_size(data_dir / "therapy.db-wal")),
+            ("audio", lambda: _bounded_directory_size(data_dir / "audio")),
+            ("research", lambda: _bounded_directory_size(data_dir / "research")),
+            ("model_cache", lambda: _bounded_directory_size(data_dir / "models")),
+            ("backups", lambda: _bounded_backup_size(data_dir)),
+        )
+        for kind, collect in collectors:
+            size, complete = collect()
+            if complete:
+                record_metric("therapy_data_bytes", size, {"kind": kind})
+            else:
+                outcome = "error"
+        try:
+            free = shutil.disk_usage(data_dir).free
+        except OSError:
+            outcome = "error"
+        else:
+            record_metric("therapy_disk_free_bytes", free)
+        record_metric(
+            "therapy_storage_inspections_total", 1, {"outcome": outcome}
+        )
+    except Exception:
+        try:
+            record_metric(
+                "therapy_storage_inspections_total", 1, {"outcome": "error"}
+            )
+        except Exception:
+            pass
+
+
 async def _health_monitor(
     store,
     interval_s: float = 15.0,
@@ -426,6 +553,7 @@ async def _health_monitor(
     from therapy.observability.telemetry import record_metric
 
     tick = 0
+    storage_interval_ticks = max(1, int(600 / max(interval_s, 0.001)))
     while True:
         started = time.monotonic()
         try:
@@ -435,6 +563,8 @@ async def _health_monitor(
         tick += 1
         lag = max(0.0, (time.monotonic() - started) - interval_s)
         record_metric("therapy_event_loop_lag_seconds", lag)
+        if tick == 1 or tick % storage_interval_ticks == 0:
+            await _asyncio.to_thread(_inspect_product_storage)
         if store is None:
             continue
         try:

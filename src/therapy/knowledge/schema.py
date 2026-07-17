@@ -10,10 +10,12 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import logging
 import os
 import secrets
 import shutil
 import sqlite3
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -939,25 +941,60 @@ MIGRATIONS: tuple[Migration, ...] = (
 
 
 def _backup_if_needed(db_path: Path, connection: sqlite3.Connection) -> Path | None:
-    if not _table_exists(connection, "nodes"):
-        return None
-    current = connection.execute(
-        "SELECT version FROM schema_migrations WHERE component = ?",
-        (SCHEMA_COMPONENT,),
-    ).fetchone()
-    if current is not None and int(current[0]) >= SCHEMA_VERSION:
-        return None
-    timestamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
-    destination = db_path.with_name(f"{db_path.name}.pre-phase4-{timestamp}.bak")
-    shutil.copy2(db_path, destination)
-    return destination
+    from therapy.observability.logging import emit_event
+    from therapy.observability.telemetry import broad_span, record_metric
+
+    with broad_span("schema.backup", component="schema", operation="backup"):
+        try:
+            if not _table_exists(connection, "nodes"):
+                record_metric(
+                    "therapy_backups_total", 1, {"outcome": "skipped"}
+                )
+                return None
+            current = connection.execute(
+                "SELECT version FROM schema_migrations WHERE component = ?",
+                (SCHEMA_COMPONENT,),
+            ).fetchone()
+            if current is not None and int(current[0]) >= SCHEMA_VERSION:
+                record_metric(
+                    "therapy_backups_total", 1, {"outcome": "skipped"}
+                )
+                return None
+            timestamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+            destination = db_path.with_name(
+                f"{db_path.name}.pre-phase4-{timestamp}.bak"
+            )
+            shutil.copy2(db_path, destination)
+        except Exception as exc:
+            record_metric("therapy_backups_total", 1, {"outcome": "error"})
+            emit_event(
+                "schema.backup_failed",
+                severity=logging.CRITICAL,
+                component="schema",
+                operation="backup",
+                outcome="error",
+                error_type=type(exc).__name__,
+            )
+            raise
+        record_metric("therapy_backups_total", 1, {"outcome": "created"})
+        return destination
+
+
+def _bounded_schema_version(version: int) -> int:
+    """Clamp externally stored versions to the finite broad-telemetry range."""
+    return min(max(version, 0), SCHEMA_VERSION + 1)
 
 
 def migrate_database(db_path: Path) -> Path | None:
     """Apply ordered knowledge migrations and return backup path when created."""
-    connection = sqlite3.connect(db_path, timeout=30.0)
-    connection.row_factory = sqlite3.Row
+    from therapy.observability.logging import emit_event
+    from therapy.observability.telemetry import broad_span, record_metric
+
+    connection: sqlite3.Connection | None = None
+    backup_failed = False
     try:
+        connection = sqlite3.connect(db_path, timeout=30.0)
+        connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA foreign_keys=ON")
         connection.execute(
             """
@@ -968,28 +1005,101 @@ def migrate_database(db_path: Path) -> Path | None:
             )
             """
         )
-        backup = _backup_if_needed(db_path, connection)
         row = connection.execute(
             "SELECT version FROM schema_migrations WHERE component = ?",
             (SCHEMA_COMPONENT,),
         ).fetchone()
         current = int(row["version"]) if row is not None else 0
-        for migration in MIGRATIONS:
-            if migration.version <= current:
-                continue
-            with connection:
-                migration.apply(connection)
-                connection.execute(
-                    """
-                    INSERT INTO schema_migrations (component, version, applied_at)
-                    VALUES (?, ?, ?)
-                    ON CONFLICT(component) DO UPDATE SET
-                        version = excluded.version,
-                        applied_at = excluded.applied_at
-                    """,
-                    (SCHEMA_COMPONENT, migration.version, _utc_now()),
+        with broad_span(
+            "schema.migrate", component="schema", operation="migrate"
+        ) as span:
+            if span is not None:
+                span.set_attribute(
+                    "schema.from_version", _bounded_schema_version(current)
                 )
-            current = migration.version
-        return backup
+                span.set_attribute(
+                    "schema.to_version", _bounded_schema_version(SCHEMA_VERSION)
+                )
+            try:
+                backup = _backup_if_needed(db_path, connection)
+            except Exception:
+                backup_failed = True
+                raise
+            for migration in MIGRATIONS:
+                if migration.version <= current:
+                    continue
+                started = time.monotonic()
+                previous = current
+                try:
+                    with broad_span(
+                        "schema.migrate.step",
+                        component="schema",
+                        operation="migrate",
+                    ) as step_span:
+                        if step_span is not None:
+                            step_span.set_attribute(
+                                "schema.from_version",
+                                _bounded_schema_version(previous),
+                            )
+                            step_span.set_attribute(
+                                "schema.to_version",
+                                _bounded_schema_version(migration.version),
+                            )
+                        with connection:
+                            migration.apply(connection)
+                            connection.execute(
+                                """
+                                INSERT INTO schema_migrations (
+                                    component, version, applied_at
+                                )
+                                VALUES (?, ?, ?)
+                                ON CONFLICT(component) DO UPDATE SET
+                                    version = excluded.version,
+                                    applied_at = excluded.applied_at
+                                """,
+                                (SCHEMA_COMPONENT, migration.version, _utc_now()),
+                            )
+                except Exception:
+                    elapsed = time.monotonic() - started
+                    record_metric(
+                        "therapy_schema_migration_seconds",
+                        elapsed,
+                        {"outcome": "error"},
+                    )
+                    record_metric(
+                        "therapy_schema_migrations_total",
+                        1,
+                        {"outcome": "error"},
+                    )
+                    record_metric(
+                        "therapy_schema_migrations_total",
+                        1,
+                        {"outcome": "rolled_back"},
+                    )
+                    raise
+                record_metric(
+                    "therapy_schema_migration_seconds",
+                    time.monotonic() - started,
+                    {"outcome": "success"},
+                )
+                record_metric(
+                    "therapy_schema_migrations_total",
+                    1,
+                    {"outcome": "success"},
+                )
+                current = migration.version
+            return backup
+    except Exception as exc:
+        if not backup_failed:
+            emit_event(
+                "schema.migration_failed",
+                severity=logging.CRITICAL,
+                component="schema",
+                operation="migrate",
+                outcome="error",
+                error_type=type(exc).__name__,
+            )
+        raise
     finally:
-        connection.close()
+        if connection is not None:
+            connection.close()
