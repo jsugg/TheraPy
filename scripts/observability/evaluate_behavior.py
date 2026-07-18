@@ -39,7 +39,7 @@ REVIEW_VERDICT = "requires_llm_judge_or_owner_review"
 EVALUATOR_VERSION = "2.0.0"
 
 # The frozen dimension set from the evaluation protocol
-# (docs/evidence/observability-evaluation.md). The corpus must cover every
+# (.local/working-notes/evidence/observability-evaluation.md). The corpus must cover every
 # required dimension and may not invent new ones.
 REQUIRED_DIMENSIONS = frozenset(
     {
@@ -381,15 +381,21 @@ def behavior_case_verdicts(
 
 
 def _json_object(value: object, label: str) -> dict[str, object]:
-    if not isinstance(value, dict) or not all(isinstance(key, str) for key in value):
+    if not isinstance(value, dict):
         raise ValueError(f"{label} must be a JSON object")
-    return cast(dict[str, object], value)
+    mapping = cast(dict[object, object], value)
+    if not all(isinstance(key, str) for key in mapping):
+        raise ValueError(f"{label} must be a JSON object")
+    return cast(dict[str, object], mapping)
 
 
 def _string_list(value: object, label: str) -> list[str]:
-    if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+    if not isinstance(value, list):
         raise ValueError(f"{label} must be a JSON list of strings")
-    return cast(list[str], value)
+    items = cast(list[object], value)
+    if not all(isinstance(item, str) for item in items):
+        raise ValueError(f"{label} must be a JSON list of strings")
+    return cast(list[str], items)
 
 
 def _response_schema(value: object, label: str) -> ResponseSchema | None:
@@ -424,10 +430,11 @@ def load_behavior_cases(path: Path = BEHAVIOR_FIXTURE_PATH) -> list[BehaviorCase
     raw_cases = payload.get("cases")
     if not isinstance(raw_cases, list):
         raise ValueError(f"{path}: cases must be a JSON list")
+    typed_raw_cases = cast(list[object], raw_cases)
 
     cases: list[BehaviorCase] = []
     seen_ids: set[str] = set()
-    for index, raw_case in enumerate(raw_cases):
+    for index, raw_case in enumerate(typed_raw_cases):
         case = _json_object(raw_case, f"{path}: cases[{index}]")
         case_id = case.get("id")
         dimension = case.get("dimension")
@@ -498,13 +505,14 @@ def _crisis_markers(value: str) -> tuple[str, ...]:
         raise argparse.ArgumentTypeError(
             "must be a JSON list of non-empty strings"
         ) from error
-    if (
-        not isinstance(raw, list)
-        or not raw
-        or not all(isinstance(item, str) and item for item in raw)
+    if not isinstance(raw, list):
+        raise argparse.ArgumentTypeError("must be a JSON list of non-empty strings")
+    marker_values = cast(list[object], raw)
+    if not marker_values or not all(
+        isinstance(item, str) and item for item in marker_values
     ):
         raise argparse.ArgumentTypeError("must be a JSON list of non-empty strings")
-    return tuple(cast(list[str], raw))
+    return tuple(cast(list[str], marker_values))
 
 
 def write_report(

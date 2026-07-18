@@ -20,6 +20,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import cast
 from uuid import uuid4
 
 SCHEMA_COMPONENT = "knowledge"
@@ -416,7 +417,17 @@ def _decode_json_list(value: object) -> list[object]:
         decoded = json.loads(value)
     except json.JSONDecodeError:
         return []
-    return decoded if isinstance(decoded, list) else []
+    return cast(list[object], decoded) if isinstance(decoded, list) else []
+
+
+def _json_object(value: object) -> dict[str, object] | None:
+    """Narrow one decoded JSON object after validating all key types."""
+    if not isinstance(value, dict):
+        return None
+    raw = cast(dict[object, object], value)
+    if not all(isinstance(key, str) for key in raw):
+        return None
+    return cast(dict[str, object], raw)
 
 
 def _never_store_values(connection: sqlite3.Connection) -> tuple[str, ...]:
@@ -437,8 +448,11 @@ def _legacy_row_contains(
     content = [str(row[field]) for field in fields if field in row.keys()]
     if "quotes" in row.keys():
         for quote in _decode_json_list(row["quotes"]):
-            if isinstance(quote, dict) and isinstance(quote.get("text"), str):
-                content.append(quote["text"])
+            quote_object = _json_object(quote)
+            if quote_object is not None and isinstance(
+                quote_object.get("text"), str
+            ):
+                content.append(cast(str, quote_object["text"]))
             elif isinstance(quote, str):
                 content.append(quote)
     combined = "\n".join(content).casefold()
@@ -510,7 +524,9 @@ def _legacy_evidence(
 ) -> None:
     sessions = [str(item) for item in _decode_json_list(row["sessions"]) if item]
     quotes = [
-        item for item in _decode_json_list(row["quotes"]) if isinstance(item, dict)
+        quote
+        for item in _decode_json_list(row["quotes"])
+        if (quote := _json_object(item)) is not None
     ]
     count = max(int(row["n_occurrences"]), 1)
     for index in range(count):
@@ -940,7 +956,7 @@ MIGRATIONS: tuple[Migration, ...] = (
 )
 
 
-def _backup_if_needed(db_path: Path, connection: sqlite3.Connection) -> Path | None:
+def backup_if_needed(db_path: Path, connection: sqlite3.Connection) -> Path | None:
     from therapy.observability.logging import emit_event
     from therapy.observability.telemetry import broad_span, record_metric
 
@@ -1021,7 +1037,7 @@ def migrate_database(db_path: Path) -> Path | None:
                     "schema.to_version", _bounded_schema_version(SCHEMA_VERSION)
                 )
             try:
-                backup = _backup_if_needed(db_path, connection)
+                backup = backup_if_needed(db_path, connection)
             except Exception:
                 backup_failed = True
                 raise
@@ -1088,6 +1104,9 @@ def migrate_database(db_path: Path) -> Path | None:
                     {"outcome": "success"},
                 )
                 current = migration.version
+            record_metric(
+                "therapy_schema_version", current, {"component": "knowledge"}
+            )
             return backup
     except Exception as exc:
         if not backup_failed:

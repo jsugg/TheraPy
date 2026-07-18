@@ -92,13 +92,19 @@ def _parse_sample(raw: str) -> tuple[JudgeVerdict, JudgeRationaleCategory] | Non
         parsed: object = json.loads(raw)
     except (json.JSONDecodeError, TypeError):
         return None
-    if not isinstance(parsed, dict) or set(parsed) != {
+    if not isinstance(parsed, dict):
+        return None
+    mapping = cast(dict[object, object], parsed)
+    if not all(isinstance(key, str) for key in mapping):
+        return None
+    typed = cast(dict[str, object], mapping)
+    if set(typed) != {
         "verdict",
         "rationale_category",
     }:
         return None
-    verdict = parsed.get("verdict")
-    category = parsed.get("rationale_category")
+    verdict = typed.get("verdict")
+    category = typed.get("rationale_category")
     if verdict not in {"pass", "fail", "uncertain"}:
         return None
     if category not in MODEL_RATIONALE_CATEGORIES:
@@ -145,7 +151,7 @@ def judge_case(
     Raises:
         ValueError: If ``samples`` is not a positive integer.
     """
-    if isinstance(samples, bool) or not isinstance(samples, int) or samples < 1:
+    if isinstance(samples, bool) or samples < 1:
         raise ValueError("samples must be a positive integer")
 
     deterministic = evaluate_behavior_case(case, response)
@@ -182,7 +188,7 @@ def judge_case(
     votes: list[JudgeVerdict] = [item[0] for item in parsed_samples]
     counts = Counter(votes)
     raw_majority, agreeing_samples = counts.most_common(1)[0]
-    majority = cast(JudgeVerdict, raw_majority)
+    majority = raw_majority
     agreement_ratio = agreeing_samples / samples
     if agreeing_samples <= samples / 2:
         majority = "uncertain"

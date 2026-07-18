@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 import base64
 import hashlib
+import importlib
 import importlib.metadata
 import json
 import math
@@ -27,18 +28,9 @@ from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TypedDict, cast
+from typing import Protocol, TypedDict, cast
 from unittest.mock import patch
 
-from openinference.semconv.resource import ResourceAttributes
-from openinference.semconv.trace import (
-    MessageAttributes,
-    OpenInferenceMimeTypeValues,
-    OpenInferenceSpanKindValues,
-    SpanAttributes,
-    ToolAttributes,
-    ToolCallAttributes,
-)
 from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
 from opentelemetry.sdk.resources import Resource
 from opentelemetry.sdk.trace import ReadableSpan, SpanLimits, TracerProvider
@@ -63,6 +55,214 @@ type JsonValue = JsonScalar | list[JsonValue] | dict[str, JsonValue]
 type AttributeValue = str | bool | int | float
 type Attributes = dict[str, AttributeValue]
 type Query = Callable[[], list["ActualSpan"]]
+
+
+class _EnumValue(Protocol):
+    value: str
+
+
+class _ResourceAttributeConstants(Protocol):
+    PROJECT_NAME: str
+
+
+class _MessageAttributeConstants(Protocol):
+    MESSAGE_CONTENT: str
+    MESSAGE_ROLE: str
+    MESSAGE_TOOL_CALLS: str
+
+
+class _MimeTypeValues(Protocol):
+    JSON: _EnumValue
+
+
+class _SpanKindValues(Protocol):
+    LLM: _EnumValue
+
+
+class _SpanAttributeConstants(Protocol):
+    INPUT_MIME_TYPE: str
+    INPUT_VALUE: str
+    LLM_FINISH_REASON: str
+    LLM_INPUT_MESSAGES: str
+    LLM_INVOCATION_PARAMETERS: str
+    LLM_MODEL_NAME: str
+    LLM_OUTPUT_MESSAGES: str
+    LLM_PROMPT_TEMPLATE_VERSION: str
+    LLM_PROVIDER: str
+    LLM_SYSTEM: str
+    LLM_TOKEN_COUNT_COMPLETION: str
+    LLM_TOKEN_COUNT_PROMPT: str
+    LLM_TOKEN_COUNT_TOTAL: str
+    LLM_TOOLS: str
+    OPENINFERENCE_SPAN_KIND: str
+    OUTPUT_MIME_TYPE: str
+    OUTPUT_VALUE: str
+    SESSION_ID: str
+
+
+class _ToolAttributeConstants(Protocol):
+    TOOL_JSON_SCHEMA: str
+
+
+class _ToolCallAttributeConstants(Protocol):
+    TOOL_CALL_FUNCTION_ARGUMENTS_JSON: str
+    TOOL_CALL_FUNCTION_NAME: str
+    TOOL_CALL_ID: str
+
+
+class _PhoenixSpanAPI(Protocol):
+    def get_spans(
+        self, *, project_identifier: str, limit: int
+    ) -> Iterable[Mapping[str, object]]: ...
+
+
+class _PhoenixClient(Protocol):
+    spans: _PhoenixSpanAPI
+
+
+class _PhoenixClientFactory(Protocol):
+    def __call__(self, *, base_url: str) -> _PhoenixClient: ...
+
+
+class _MlflowExperiment(Protocol):
+    experiment_id: str
+
+
+class _MlflowSpan(Protocol):
+    span_id: str
+    attributes: object
+
+    def to_dict(self) -> object: ...
+
+
+class _MlflowTraceData(Protocol):
+    spans: Iterable[_MlflowSpan]
+
+
+class _MlflowTrace(Protocol):
+    data: _MlflowTraceData
+
+
+class _MlflowClient(Protocol):
+    def get_experiment_by_name(self, name: str) -> _MlflowExperiment | None: ...
+
+    def create_experiment(self, name: str, *, artifact_location: str) -> str: ...
+
+    def search_traces(
+        self,
+        *,
+        locations: list[str],
+        max_results: int,
+        include_spans: bool,
+    ) -> Iterable[_MlflowTrace]: ...
+
+
+class _MlflowClientFactory(Protocol):
+    def __call__(self, *, tracking_uri: str) -> _MlflowClient: ...
+
+
+def _load_attribute(module_name: str, attribute: str) -> object:
+    """Load one required attribute from an optional spike dependency."""
+    module = importlib.import_module(module_name)
+    if not hasattr(module, attribute):
+        raise RuntimeError(f"{module_name} does not expose {attribute}")
+    return getattr(module, attribute)
+
+
+def _load_constant_group(
+    module_name: str, attribute: str, names: Sequence[str]
+) -> object:
+    """Load and validate a semantic-convention string constant group."""
+    group = _load_attribute(module_name, attribute)
+    if not all(isinstance(getattr(group, name, None), str) for name in names):
+        raise RuntimeError(f"{module_name}.{attribute} constants are incompatible")
+    return group
+
+
+def _load_enum_group(
+    module_name: str, attribute: str, names: Sequence[str]
+) -> object:
+    """Load and validate a semantic-convention enum group."""
+    group = _load_attribute(module_name, attribute)
+    if not all(
+        isinstance(getattr(getattr(group, name, None), "value", None), str)
+        for name in names
+    ):
+        raise RuntimeError(f"{module_name}.{attribute} enum is incompatible")
+    return group
+
+
+ResourceAttributes = cast(
+    _ResourceAttributeConstants,
+    _load_constant_group(
+        "openinference.semconv.resource", "ResourceAttributes", ("PROJECT_NAME",)
+    ),
+)
+MessageAttributes = cast(
+    _MessageAttributeConstants,
+    _load_constant_group(
+        "openinference.semconv.trace",
+        "MessageAttributes",
+        ("MESSAGE_CONTENT", "MESSAGE_ROLE", "MESSAGE_TOOL_CALLS"),
+    ),
+)
+OpenInferenceMimeTypeValues = cast(
+    _MimeTypeValues,
+    _load_enum_group(
+        "openinference.semconv.trace", "OpenInferenceMimeTypeValues", ("JSON",)
+    ),
+)
+OpenInferenceSpanKindValues = cast(
+    _SpanKindValues,
+    _load_enum_group(
+        "openinference.semconv.trace", "OpenInferenceSpanKindValues", ("LLM",)
+    ),
+)
+SpanAttributes = cast(
+    _SpanAttributeConstants,
+    _load_constant_group(
+        "openinference.semconv.trace",
+        "SpanAttributes",
+        (
+            "INPUT_MIME_TYPE",
+            "INPUT_VALUE",
+            "LLM_FINISH_REASON",
+            "LLM_INPUT_MESSAGES",
+            "LLM_INVOCATION_PARAMETERS",
+            "LLM_MODEL_NAME",
+            "LLM_OUTPUT_MESSAGES",
+            "LLM_PROMPT_TEMPLATE_VERSION",
+            "LLM_PROVIDER",
+            "LLM_SYSTEM",
+            "LLM_TOKEN_COUNT_COMPLETION",
+            "LLM_TOKEN_COUNT_PROMPT",
+            "LLM_TOKEN_COUNT_TOTAL",
+            "LLM_TOOLS",
+            "OPENINFERENCE_SPAN_KIND",
+            "OUTPUT_MIME_TYPE",
+            "OUTPUT_VALUE",
+            "SESSION_ID",
+        ),
+    ),
+)
+ToolAttributes = cast(
+    _ToolAttributeConstants,
+    _load_constant_group(
+        "openinference.semconv.trace", "ToolAttributes", ("TOOL_JSON_SCHEMA",)
+    ),
+)
+ToolCallAttributes = cast(
+    _ToolCallAttributeConstants,
+    _load_constant_group(
+        "openinference.semconv.trace",
+        "ToolCallAttributes",
+        (
+            "TOOL_CALL_FUNCTION_ARGUMENTS_JSON",
+            "TOOL_CALL_FUNCTION_NAME",
+            "TOOL_CALL_ID",
+        ),
+    ),
+)
 
 
 @dataclass(frozen=True)
@@ -181,7 +381,7 @@ def _optional_list(value: Mapping[str, JsonValue], key: str) -> list[JsonValue]:
     return item
 
 
-def _canonical_json(value: JsonValue) -> str:
+def canonical_json(value: JsonValue) -> str:
     return json.dumps(
         value,
         ensure_ascii=False,
@@ -226,7 +426,7 @@ def _string_mapping(value: Mapping[str, JsonValue], path: str) -> dict[str, str]
     return result
 
 
-def _fixture_hash(root: Path = FIXTURE_ROOT) -> str:
+def fixture_hash(root: Path = FIXTURE_ROOT) -> str:
     digest = hashlib.sha256()
     for path in sorted(root.rglob("*")):
         if not path.is_file():
@@ -274,7 +474,7 @@ def _set_message_attributes(
         if isinstance(content, str):
             attributes[f"{base}.{MessageAttributes.MESSAGE_CONTENT}"] = content
         elif content is not None:
-            attributes[f"{base}.{MessageAttributes.MESSAGE_CONTENT}"] = _canonical_json(
+            attributes[f"{base}.{MessageAttributes.MESSAGE_CONTENT}"] = canonical_json(
                 content
             )
 
@@ -287,8 +487,8 @@ def build_attributes(record: dict[str, JsonValue]) -> Attributes:
         SpanAttributes.OPENINFERENCE_SPAN_KIND: OpenInferenceSpanKindValues.LLM.value,
         SpanAttributes.INPUT_MIME_TYPE: OpenInferenceMimeTypeValues.JSON.value,
         SpanAttributes.OUTPUT_MIME_TYPE: OpenInferenceMimeTypeValues.JSON.value,
-        SpanAttributes.INPUT_VALUE: _canonical_json(request),
-        SpanAttributes.OUTPUT_VALUE: _canonical_json(response),
+        SpanAttributes.INPUT_VALUE: canonical_json(request),
+        SpanAttributes.OUTPUT_VALUE: canonical_json(response),
         SpanAttributes.SESSION_ID: _required_str(record, "session_id"),
         SpanAttributes.LLM_PROVIDER: _required_str(record, "provider"),
         SpanAttributes.LLM_SYSTEM: _required_str(record, "provider"),
@@ -296,7 +496,7 @@ def build_attributes(record: dict[str, JsonValue]) -> Attributes:
         SpanAttributes.LLM_PROMPT_TEMPLATE_VERSION: _required_str(
             record, "prompt_template_version"
         ),
-        CANONICAL_RECORD_ATTRIBUTE: _canonical_json(record),
+        CANONICAL_RECORD_ATTRIBUTE: canonical_json(record),
         INTERACTION_ID_ATTRIBUTE: _required_str(record, "interaction_id"),
         "therapy.turn_id": _required_turn_id(record),
         "therapy.operation": _required_str(record, "operation"),
@@ -319,7 +519,7 @@ def build_attributes(record: dict[str, JsonValue]) -> Attributes:
 
     parameters = request.get("parameters")
     if parameters is not None:
-        attributes[SpanAttributes.LLM_INVOCATION_PARAMETERS] = _canonical_json(
+        attributes[SpanAttributes.LLM_INVOCATION_PARAMETERS] = canonical_json(
             parameters
         )
     finish_reason = response.get("finish_reason")
@@ -329,7 +529,7 @@ def build_attributes(record: dict[str, JsonValue]) -> Attributes:
     for index, tool in enumerate(_optional_list(request, "tools")):
         attributes[
             f"{SpanAttributes.LLM_TOOLS}.{index}.{ToolAttributes.TOOL_JSON_SCHEMA}"
-        ] = _canonical_json(tool)
+        ] = canonical_json(tool)
 
     output_messages = _optional_list(response, "messages")
     tool_message_index = max(len(output_messages) - 1, 0)
@@ -356,7 +556,7 @@ def build_attributes(record: dict[str, JsonValue]) -> Attributes:
         if arguments is not None:
             attributes[
                 f"{base}.{ToolCallAttributes.TOOL_CALL_FUNCTION_ARGUMENTS_JSON}"
-            ] = _canonical_json(arguments)
+            ] = canonical_json(arguments)
 
     usage = response.get("usage")
     if isinstance(usage, dict):
@@ -373,7 +573,7 @@ def build_attributes(record: dict[str, JsonValue]) -> Attributes:
     error = record.get("error")
     if isinstance(error, dict):
         attributes["error.type"] = str(error.get("provider_type") or "provider_error")
-        attributes["therapy.error"] = _canonical_json(error)
+        attributes["therapy.error"] = canonical_json(error)
         message = error.get("provider_error_body")
         if isinstance(message, str):
             attributes["error.message"] = message
@@ -426,7 +626,7 @@ def build_spans(fixtures: Sequence[Fixture]) -> list[ReadableSpan]:
             exception_type = str(error.get("provider_type") or "provider_error")
             event_attributes: Attributes = {
                 "exception.type": exception_type,
-                "exception.message": _canonical_json(error),
+                "exception.message": canonical_json(error),
             }
             span.add_event("exception", event_attributes)
             span.set_status(Status(StatusCode.ERROR, exception_type))
@@ -453,21 +653,25 @@ def _base_url(endpoint: str) -> str:
 
 
 def _phoenix_query(endpoint: str) -> tuple[Query, dict[str, object]]:
-    from phoenix.client import Client
-
-    client = Client(base_url=_base_url(endpoint))
+    client_factory_value = _load_attribute("phoenix.client", "Client")
+    if not callable(client_factory_value):
+        raise RuntimeError("phoenix.client.Client is not callable")
+    client_factory = cast(_PhoenixClientFactory, client_factory_value)
+    client = client_factory(base_url=_base_url(endpoint))
 
     def query() -> list[ActualSpan]:
         spans = client.spans.get_spans(project_identifier=PROJECT_NAME, limit=1_000)
         actual: list[ActualSpan] = []
         for span in spans:
-            context = span["context"]
-            raw_attributes = span.get("attributes", {})
+            context = _json_object(span["context"], "Phoenix span context")
+            attributes = _json_object(
+                span.get("attributes", {}), "Phoenix span attributes"
+            )
             actual.append(
                 ActualSpan(
                     trace_id=str(context.get("trace_id", "")),
                     span_id=str(context.get("span_id", "")),
-                    attributes=_json_object(dict(raw_attributes), "Phoenix attributes"),
+                    attributes=attributes,
                 )
             )
         return actual
@@ -476,9 +680,11 @@ def _phoenix_query(endpoint: str) -> tuple[Query, dict[str, object]]:
 
 
 def _mlflow_query(endpoint: str, storage_dir: Path) -> tuple[Query, dict[str, object]]:
-    from mlflow import MlflowClient
-
-    client = MlflowClient(tracking_uri=_base_url(endpoint))
+    client_factory_value = _load_attribute("mlflow", "MlflowClient")
+    if not callable(client_factory_value):
+        raise RuntimeError("mlflow.MlflowClient is not callable")
+    client_factory = cast(_MlflowClientFactory, client_factory_value)
+    client = client_factory(tracking_uri=_base_url(endpoint))
     experiment = client.get_experiment_by_name(PROJECT_NAME)
     if experiment is None:
         artifact_dir = storage_dir / "artifacts" / PROJECT_NAME
@@ -522,7 +728,7 @@ def _mlflow_query(endpoint: str, storage_dir: Path) -> tuple[Query, dict[str, ob
     }
 
 
-def _export(
+def export_spans(
     spans: Sequence[ReadableSpan],
     endpoint: str,
     headers: Mapping[str, str],
@@ -618,8 +824,8 @@ def _record_diffs(
         return issues
     if isinstance(expected, list) and isinstance(actual, list):
         if len(expected) == len(actual) and expected != actual:
-            expected_items = Counter(_canonical_json(item) for item in expected)
-            actual_items = Counter(_canonical_json(item) for item in actual)
+            expected_items = Counter(canonical_json(item) for item in expected)
+            actual_items = Counter(canonical_json(item) for item in actual)
             if expected_items == actual_items:
                 return [{"path": path, "kind": "reordered"}]
         issues = []
@@ -675,7 +881,7 @@ def _round_trip_report(
             received = actual.attributes.get(key)
             if received != expected or type(received) is not type(expected):
                 if isinstance(expected, str) and isinstance(received, (dict, list)):
-                    if _canonical_json(received) == expected:
+                    if canonical_json(received) == expected:
                         attribute_transformations.append(
                             {"case": fixture.case, "path": key, "kind": "json_decoded"}
                         )
@@ -955,7 +1161,7 @@ def measure(args: argparse.Namespace) -> int:
     fixtures = load_fixtures()
     spans = build_spans(fixtures)
     canonical_bytes = sum(
-        len(_canonical_json(fixture.record).encode()) for fixture in fixtures
+        len(canonical_json(fixture.record).encode()) for fixture in fixtures
     )
     raw_canary_payload: object = json.loads(
         (FIXTURE_ROOT / "canaries.json").read_text()
@@ -975,13 +1181,13 @@ def measure(args: argparse.Namespace) -> int:
         query, query_metadata = _mlflow_query(endpoint, storage_dir)
         headers = {"x-mlflow-experiment-id": str(query_metadata["experiment_id"])}
 
-    first_export_result, first_export_ms = _export(spans, endpoint, headers)
+    first_export_result, first_export_ms = export_spans(spans, endpoint, headers)
     _await_ingest(query)
     disk_after_first = _disk_bytes(storage_dir)
     queried_before_duplicate, query_latencies = _measure_queries(query)
     round_trip = _round_trip_report(fixtures, queried_before_duplicate)
 
-    duplicate_result, duplicate_export_ms = _export(spans, endpoint, headers)
+    duplicate_result, duplicate_export_ms = export_spans(spans, endpoint, headers)
     queried_after_duplicate = _await_ingest(query)
     disk_after_duplicate = _disk_bytes(storage_dir)
     collision_outcomes = _collision_outcomes(fixtures, queried_before_duplicate)
@@ -1008,6 +1214,17 @@ def measure(args: argparse.Namespace) -> int:
     content_counts = content_scan["counts"]
     forbidden_counts = forbidden_scan["counts"]
 
+    attribute_losses_value = round_trip["attribute_losses"]
+    if not isinstance(attribute_losses_value, list):
+        raise TypeError("round-trip attribute losses must be a list of objects")
+    loss_values = cast(list[object], attribute_losses_value)
+    if not all(isinstance(loss, Mapping) for loss in loss_values):
+        raise TypeError("round-trip attribute losses must be a list of objects")
+    attribute_losses = [
+        _json_object(loss, f"attribute_losses[{index}]")
+        for index, loss in enumerate(loss_values)
+    ]
+
     checks: dict[str, dict[str, object]] = {
         "fixture_count": {"passed": len(fixtures) == 15, "actual": len(fixtures)},
         "first_export": {
@@ -1018,7 +1235,7 @@ def measure(args: argparse.Namespace) -> int:
             "passed": not round_trip["missing_cases"],
             "missing_cases": round_trip["missing_cases"],
         },
-        # Documented acceptance criterion (ADR, docs/evidence/
+        # Documented acceptance criterion (ADR, .local/working-notes/evidence/
         # observability-backend-spike.md): a backend consuming
         # `openinference.span.kind` into its own top-level span-kind column
         # is a STRUCTURAL promotion — the value is preserved and recoverable
@@ -1027,12 +1244,12 @@ def measure(args: argparse.Namespace) -> int:
             "passed": all(
                 loss.get("kind") == "lost"
                 and loss.get("path") == "openinference.span.kind"
-                for loss in round_trip["attribute_losses"]
+                for loss in attribute_losses
             ),
             "loss_count": round_trip["attribute_loss_count"],
             "structural_promotions": sum(
                 1
-                for loss in round_trip["attribute_losses"]
+                for loss in attribute_losses
                 if loss.get("path") == "openinference.span.kind"
             ),
         },
@@ -1073,7 +1290,7 @@ def measure(args: argparse.Namespace) -> int:
         "schema_version": 1,
         "backend": backend,
         "captured_at": datetime.now(UTC).isoformat(),
-        "fixture_sha256": _fixture_hash(),
+        "fixture_sha256": fixture_hash(),
         "fixture_count": len(fixtures),
         "fixture_duplicate_transport_ids": _duplicate_fixture_ids(fixtures),
         "canonical_json_bytes": canonical_bytes,
@@ -1122,7 +1339,7 @@ def measure(args: argparse.Namespace) -> int:
 
     if args.outage_probe:
         termination = _terminate_process_tree(server_pid)
-        outage_result, outage_ms = _export(
+        outage_result, outage_ms = export_spans(
             spans[:1], endpoint, headers, timeout_seconds=1.0
         )
         result["outage_probe"] = {
@@ -1156,10 +1373,18 @@ def serve_phoenix(args: argparse.Namespace) -> int:
     """Run Phoenix HTTP on loopback with its unused any-address gRPC server disabled."""
     if args.host != "127.0.0.1":
         raise ValueError("Phoenix spike server must bind to 127.0.0.1")
-    from phoenix.server.grpc_server import GrpcServer
-    from phoenix.server.main import main as phoenix_main
+    grpc_server_value = _load_attribute(
+        "phoenix.server.grpc_server", "GrpcServer"
+    )
+    if not isinstance(grpc_server_value, type):
+        raise RuntimeError("phoenix.server.grpc_server.GrpcServer is not a class")
+    grpc_server = cast(type[object], grpc_server_value)
+    phoenix_main_value = _load_attribute("phoenix.server.main", "main")
+    if not callable(phoenix_main_value):
+        raise RuntimeError("phoenix.server.main.main is not callable")
+    phoenix_main = cast(Callable[[], object], phoenix_main_value)
 
-    class HttpOnlyGrpcServer(GrpcServer):
+    class HttpOnlyGrpcServer(grpc_server):
         async def __aenter__(self) -> None:
             return None
 

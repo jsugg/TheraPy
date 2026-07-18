@@ -30,7 +30,7 @@ SERVICE_INSTANCE_ID: Final = uuid.uuid4().hex
 
 #: Explicit policy per third-party logger (plan §4): `disabled` drops all
 #: records; an int is a fixed minimum level that DEBUG cannot lower.
-#: Pipecat's Loguru output is disabled separately at `_load_pipecat()`.
+#: Pipecat's Loguru output is disabled separately at `load_pipecat()`.
 THIRD_PARTY_LOGGER_POLICY: Final[dict[str, str | int]] = {
     "uvicorn.access": "disabled",  # concrete paths/queries; replaced in O2
     "uvicorn": logging.WARNING,
@@ -110,7 +110,7 @@ def _relative_path(path: str) -> str:
 
 def _filtered_stack(exc: BaseException) -> list[str]:
     """Frames only — no exception message, no locals, no arguments."""
-    frames = []
+    frames: list[str] = []
     for frame in traceback.extract_tb(exc.__traceback__):
         frames.append(f"{_relative_path(frame.filename)}:{frame.lineno}:{frame.name}")
     return frames
@@ -206,7 +206,7 @@ def emit_event(
     owned_failure: bool = False,
 ) -> None:
     """The only owned broad-log entry point: fixed name, bounded fields."""
-    from therapy.observability.context import _current
+    from therapy.observability.context import active_trace_context
 
     extra: dict[str, object] = {
         "event_name": event_name,
@@ -224,7 +224,7 @@ def emit_event(
         extra["retry_count"] = retry_count
     if count is not None:
         extra["count"] = count
-    context = _current.get()
+    context = active_trace_context()
     if context is not None:
         extra["trace_id"] = context.trace_id
         extra["span_id"] = context.span_id
@@ -271,8 +271,9 @@ class RootPolicyFilter(logging.Filter):
             return False
         # classified, content-free replacement: package + exception class only
         top = name.split(".", 1)[0]
-        record.event_name = f"third_party.{top}"
-        record.msg = record.event_name
+        event_name = f"third_party.{top}"
+        record.__dict__["event_name"] = event_name
+        record.msg = event_name
         record.args = ()
         if record.exc_info and record.exc_info[1] is not None:
             record.error_type = type(record.exc_info[1]).__name__

@@ -20,9 +20,14 @@ from __future__ import annotations
 
 import hashlib
 import json
+from collections.abc import Mapping, Sequence
 from pathlib import Path
+from typing import cast
 
 FIXTURE_ROOT = Path(__file__).resolve().parents[2] / "tests/fixtures/observability"
+
+type JsonScalar = str | int | float | bool | None
+type JsonValue = JsonScalar | Sequence["JsonValue"] | Mapping[str, "JsonValue"]
 
 # ---------------------------------------------------------------------------
 # Canaries. Unique, grep-able, deliberately NOT shaped like real secrets.
@@ -51,6 +56,19 @@ FORBIDDEN_CANARIES: dict[str, str] = {
     "turn_key": "OBS-CANARY-TURN-KEY-822fe5",
     "push_key": "OBS-CANARY-PUSH-KEY-9310f6",
 }
+
+
+def _object_field(
+    mapping: Mapping[str, object], key: str, where: str
+) -> dict[str, object]:
+    """Return one validated object field from a fixture under construction."""
+    value = mapping.get(key)
+    if not isinstance(value, dict):
+        raise TypeError(f"{where}.{key} must be an object")
+    raw_mapping = cast(dict[object, object], value)
+    if not all(isinstance(item_key, str) for item_key in raw_mapping):
+        raise TypeError(f"{where}.{key} must be an object")
+    return cast(dict[str, object], raw_mapping)
 
 # ---------------------------------------------------------------------------
 # Destination matrix (§5.2 canonical record + §5.4 broad event fields).
@@ -237,9 +255,11 @@ def _broad_twin(
     }
 
 
-def _anthropic_events(*, with_tools: bool, error_event: dict | None) -> list[dict]:
+def _anthropic_events(
+    *, with_tools: bool, error_event: Mapping[str, JsonValue] | None
+) -> list[dict[str, JsonValue]]:
     completion = CONTENT_CANARIES["completion"]
-    events: list[dict] = [
+    events: list[dict[str, JsonValue]] = [
         {"type": "message_start", "message": {"id": "msg_fixture_01", "usage": {"input_tokens": 412, "output_tokens": 0}}},
         {"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}},
         {"type": "ping"},
@@ -248,19 +268,21 @@ def _anthropic_events(*, with_tools: bool, error_event: dict | None) -> list[dic
         {"type": "content_block_stop", "index": 0},
     ]
     if with_tools:
-        events += [
+        tool_events: list[dict[str, JsonValue]] = [
             {"type": "content_block_start", "index": 1, "content_block": {"type": "tool_use", "id": "toolu_fixture", "name": "lookup_research"}},
             {"type": "content_block_delta", "index": 1, "delta": {"type": "input_json_delta", "partial_json": '{"query": "'}},
             {"type": "content_block_delta", "index": 1, "delta": {"type": "input_json_delta", "partial_json": CONTENT_CANARIES["tool_arguments"] + '"}'}},
             {"type": "content_block_stop", "index": 1},
         ]
+        events.extend(tool_events)
     if error_event is not None:
-        events.append(error_event)
+        events.append(dict(error_event))
     else:
-        events += [
+        terminal_events: list[dict[str, JsonValue]] = [
             {"type": "message_delta", "delta": {"stop_reason": "end_turn"}, "usage": {"output_tokens": 96}},
             {"type": "message_stop"},
         ]
+        events.extend(terminal_events)
     return events
 
 
@@ -317,7 +339,8 @@ def case_anthropic_tools() -> dict[str, object]:
         actual_model="claude-opus-4-8",
         status="succeeded",
     )
-    record["request"]["tools"] = [  # type: ignore[index]
+    request = _object_field(record, "request", "record")
+    request["tools"] = [
         {
             "definition": {
                 "name": "lookup_research",
@@ -367,15 +390,17 @@ def _rekey(record: dict[str, object], case: str) -> None:
 
 
 def case_anthropic_retry_then_success() -> dict[str, object]:
-    record = case_anthropic_success()["record"]
-    _rekey(record, "anthropic_retry_then_success")  # type: ignore[arg-type]
-    native = record["provider_native"]  # type: ignore[index]
+    record = _object_field(case_anthropic_success(), "record", "fixture")
+    _rekey(record, "anthropic_retry_then_success")
+    native = _object_field(record, "provider_native", "record")
     native["sdk_retry"] = {"attempt": 2, "parsed_delay_seconds": 1.5}
     return {
         "case": "anthropic_retry_then_success",
         "scenario": "retry_fallback",
         "record": record,
-        "broad_twin": _broad_twin(record, outcome="success", finish_class="stop", retry_count=2),  # type: ignore[arg-type]
+        "broad_twin": _broad_twin(
+            record, outcome="success", finish_class="stop", retry_count=2
+        ),
     }
 
 
@@ -393,7 +418,8 @@ def case_anthropic_instream_error_after_200() -> dict[str, object]:
     record["stream"] = [
         {"sequence": 0, "observed_at": "2026-07-15T12:00:01.000001+00:00", "delta": partial, "tool_delta": None}
     ]
-    record["response"]["completion"] = partial  # type: ignore[index]
+    response = _object_field(record, "response", "record")
+    response["completion"] = partial
     record["error"] = {
         "http_status": 200,
         "provider_type": "overloaded_error",
@@ -466,7 +492,8 @@ def case_anthropic_structured_output() -> dict[str, object]:
     )
     schema = {"type": "object", "properties": {"facts": {"type": "array", "items": {"type": "string"}}}, "required": ["facts"]}
     structured = json.dumps({"facts": [CONTENT_CANARIES["completion"]]})
-    record["request"]["response_schema"] = schema  # type: ignore[index]
+    request = _object_field(record, "request", "record")
+    request["response_schema"] = schema
     record["response"] = {
         "messages": [{"role": "assistant", "content": structured}],
         "completion": structured,
@@ -537,17 +564,21 @@ def case_openrouter_success() -> dict[str, object]:
 
 def case_openrouter_truncation() -> dict[str, object]:
     fixture = case_openrouter_success()
-    record = fixture["record"]
-    _rekey(record, "openrouter_truncation")  # type: ignore[arg-type]
-    record["response"]["finish_reason"] = "length"  # type: ignore[index]
-    record["request"]["truncation"] = {"applied": True, "dropped_messages": 2}  # type: ignore[index]
-    native = record["provider_native"]  # type: ignore[index]
+    record = _object_field(fixture, "record", "fixture")
+    _rekey(record, "openrouter_truncation")
+    response = _object_field(record, "response", "record")
+    response["finish_reason"] = "length"
+    request = _object_field(record, "request", "record")
+    request["truncation"] = {"applied": True, "dropped_messages": 2}
+    native = _object_field(record, "provider_native", "record")
     native["terminal_response"] = {"finish_reason": "length", "native_finish_reason": "MAX_TOKENS", "actual_model": "meta-llama/llama-3.3-70b-instruct"}
     return {
         "case": "openrouter_truncation",
         "scenario": "truncation",
         "record": record,
-        "broad_twin": _broad_twin(record, outcome="success", finish_class="length"),  # type: ignore[arg-type]
+        "broad_twin": _broad_twin(
+            record, outcome="success", finish_class="length"
+        ),
     }
 
 
@@ -564,7 +595,8 @@ def case_openrouter_fallback_midstream_error() -> dict[str, object]:
     record["stream"] = [
         {"sequence": 0, "observed_at": "2026-07-15T12:00:01.000001+00:00", "delta": partial, "tool_delta": None}
     ]
-    record["response"]["completion"] = partial  # type: ignore[index]
+    response = _object_field(record, "response", "record")
+    response["completion"] = partial
     record["error"] = {
         "http_status": 200,
         "provider_type": "provider_error",
@@ -761,7 +793,8 @@ def case_cancellation() -> dict[str, object]:
     record["stream"] = [
         {"sequence": 0, "observed_at": "2026-07-15T12:00:01.000001+00:00", "delta": partial, "tool_delta": None}
     ]
-    record["response"]["completion"] = partial  # type: ignore[index]
+    response = _object_field(record, "response", "record")
+    response["completion"] = partial
     record["completed_at"] = None
     record["provider_native"] = {
         "request": {"body_request_id": "req_body_fixture_06", "model": "claude-opus-4-8"},
@@ -795,7 +828,8 @@ def case_partial_stream_disconnect() -> dict[str, object]:
     record["stream"] = [
         {"sequence": 0, "observed_at": "2026-07-15T12:00:01.000001+00:00", "delta": partial, "tool_delta": None}
     ]
-    record["response"]["completion"] = partial  # type: ignore[index]
+    response = _object_field(record, "response", "record")
+    response["completion"] = partial
     record["completed_at"] = None
     record["provider_native"] = {
         "request": {"model": "openrouter/free", "routing_summary": {"route": "default"}},

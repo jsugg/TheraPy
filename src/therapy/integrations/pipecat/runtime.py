@@ -27,14 +27,14 @@ class _NoAnswer(Exception):
     """Signaling completed without an SDP answer (finite negotiate outcome)."""
 
 
-class _Connection(Protocol):
+class Connection(Protocol):
     @property
     def pc_id(self) -> str: ...
 
     async def disconnect(self) -> None: ...
 
 
-class _VendorRequest(Protocol):
+class VendorRequest(Protocol):
     @property
     def sdp(self) -> str: ...
 
@@ -54,21 +54,21 @@ class _VendorRequest(Protocol):
 class _RequestHandler(Protocol):
     async def handle_web_request(
         self,
-        request: _VendorRequest,
+        request: VendorRequest,
         webrtc_connection_callback: Callable[[object], Awaitable[None]],
     ) -> dict[str, object] | None: ...
 
     async def close(self) -> None: ...
 
 
-type RequestFactory = Callable[[WebRTCOffer], _VendorRequest]
+type RequestFactory = Callable[[WebRTCOffer], VendorRequest]
 type PipelineRunner = Callable[
-    [_Connection, SessionTarget], Coroutine[object, object, None]
+    [Connection, SessionTarget], Coroutine[object, object, None]
 ]
 type FinalizerDrainer = Callable[[float], Awaitable[None]]
 
 
-def _load_pipecat() -> tuple[_RequestHandler, RequestFactory]:
+def load_pipecat() -> tuple[_RequestHandler, RequestFactory]:
     """Load the optional realtime stack only when the first offer needs it."""
     from loguru import logger as vendor_logger
 
@@ -94,7 +94,7 @@ def _load_pipecat() -> tuple[_RequestHandler, RequestFactory]:
 
         __str__ = __repr__
 
-    def request_factory(offer: WebRTCOffer) -> _VendorRequest:
+    def request_factory(offer: WebRTCOffer) -> VendorRequest:
         return RedactedSmallWebRTCRequest(
             sdp=offer.sdp,
             type=offer.type,
@@ -107,7 +107,7 @@ def _load_pipecat() -> tuple[_RequestHandler, RequestFactory]:
 
 
 async def _default_pipeline_runner(
-    connection: _Connection, target: SessionTarget
+    connection: Connection, target: SessionTarget
 ) -> None:
     """Load and run the Pipecat pipeline only when a voice offer arrives."""
     from therapy.integrations.pipecat.pipeline import run_bot
@@ -147,7 +147,7 @@ class PipecatVoiceGateway:
         if (handler is None) != (request_factory is None):
             raise ValueError("handler and request_factory must be provided together")
         if handler is None or request_factory is None:
-            handler, request_factory = _load_pipecat()
+            handler, request_factory = load_pipecat()
         self._handler = handler
         self._request_factory = request_factory
         using_default_pipeline = pipeline_runner is None
@@ -160,7 +160,7 @@ class PipecatVoiceGateway:
         self._cancel_timeout = cancel_timeout
         self._lock = asyncio.Lock()
         self._pipeline_task: asyncio.Task[None] | None = None
-        self._pipeline_connection: _Connection | None = None
+        self._pipeline_connection: Connection | None = None
         self._closed = False
 
     async def negotiate(
@@ -213,11 +213,11 @@ class PipecatVoiceGateway:
                 raise VoiceUnavailable("Voice runtime is shutting down")
 
             callback_failure: BaseException | None = None
-            callback_connection: _Connection | None = None
+            callback_connection: Connection | None = None
 
             async def start_pipeline(connection: object) -> None:
                 nonlocal callback_failure, callback_connection
-                callback_connection = cast(_Connection, connection)
+                callback_connection = cast(Connection, connection)
                 try:
                     await self._replace_pipeline(callback_connection, target)
                 except asyncio.CancelledError:
@@ -362,7 +362,7 @@ class PipecatVoiceGateway:
         )
 
     async def _replace_pipeline(
-        self, connection: _Connection, target: SessionTarget
+        self, connection: Connection, target: SessionTarget
     ) -> None:
         """Drain the prior pipeline before allowing a replacement to start."""
         from therapy.observability.telemetry import broad_span
@@ -442,7 +442,7 @@ class PipecatVoiceGateway:
             )
             self._record_pipeline_active()
 
-    async def _disconnect_safely(self, connection: _Connection) -> None:
+    async def _disconnect_safely(self, connection: Connection) -> None:
         """Best-effort cleanup for a connection whose pipeline could not start."""
         try:
             await asyncio.wait_for(
@@ -464,7 +464,7 @@ class PipecatVoiceGateway:
                 type(exc).__name__,
             )
 
-    async def _abort_started_connection(self, connection: _Connection | None) -> None:
+    async def _abort_started_connection(self, connection: Connection | None) -> None:
         """Drain any pipeline started before signaling ultimately failed."""
         if connection is None:
             return

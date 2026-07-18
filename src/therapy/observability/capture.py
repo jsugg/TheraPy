@@ -17,11 +17,15 @@ never prompts, bodies, or exception messages.
 
 from __future__ import annotations
 
+import asyncio
 import logging
+import sqlite3
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Protocol
 
+from therapy.observability.config import ObservabilityConfig
 from therapy.observability.context import (
     current_trace_context,
     new_interaction_id,
@@ -35,7 +39,12 @@ from therapy.observability.interactions import (
     ProviderNative,
     StreamEvent,
 )
-from therapy.observability.journal import AsyncJournalWriter, JournalError
+from therapy.observability.journal import (
+    AsyncJournalWriter,
+    JournalError,
+    JournalHealth,
+    JournalStore,
+)
 from therapy.observability.logging import emit_event
 from therapy.observability.model import (
     CaptureMode,
@@ -49,6 +58,12 @@ from therapy.observability.model import (
 
 class CaptureUnavailable(RuntimeError):
     """Pre-dispatch capture failed; the boundary decides how to surface it."""
+
+
+class _ClosableWorker(Protocol):
+    """Lifecycle contract for the optional selected-backend worker."""
+
+    async def close(self, timeout: float = 5.0) -> None: ...
 
 
 def _utcnow_iso() -> str:
@@ -384,6 +399,21 @@ class CaptureService:
                 1,
                 {"provider": dims["provider"], "operation": dims["operation"]},
             )
+        if retry_count:
+            retry_reason = (
+                "rate_limit"
+                if status_class == "4xx" and finish_class == "rate_limit"
+                else "transient"
+            )
+            record_metric(
+                "therapy_llm_retries_total",
+                retry_count,
+                {
+                    "provider": dims["provider"],
+                    "operation": dims["operation"],
+                    "reason": retry_reason,
+                },
+            )
         result = "ok" if output_chars else "empty"
         if outcome is Outcome.SUCCESS:
             record_metric(
@@ -493,7 +523,7 @@ def _bounded_backup_size(data_dir: Path) -> tuple[int, bool]:
     return total, True
 
 
-def _inspect_product_storage() -> None:
+def inspect_product_storage() -> None:
     """Collect bounded product-storage gauges without escaping maintenance."""
     import os
     import shutil
@@ -523,6 +553,14 @@ def _inspect_product_storage() -> None:
             outcome = "error"
         else:
             record_metric("therapy_disk_free_bytes", free)
+        try:
+            filesystem = os.statvfs(data_dir)
+        except OSError:
+            outcome = "error"
+        else:
+            record_metric("therapy_disk_free_inodes", filesystem.f_favail)
+        if not _inspect_product_backlogs(data_dir / "therapy.db"):
+            outcome = "error"
         record_metric(
             "therapy_storage_inspections_total", 1, {"outcome": outcome}
         )
@@ -535,8 +573,86 @@ def _inspect_product_storage() -> None:
             pass
 
 
+def _inspect_product_backlogs(db_path: Path) -> bool:
+    """Publish content-free pending-work gauges from the product database."""
+    if not db_path.is_file():
+        return False
+    from datetime import UTC, datetime
+
+    from therapy.observability.telemetry import record_metric
+
+    connection: sqlite3.Connection | None = None
+    try:
+        connection = sqlite3.connect(
+            f"file:{db_path}?mode=ro", uri=True, timeout=1.0
+        )
+        connection.row_factory = sqlite3.Row
+        tables = {
+            str(row["name"])
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            )
+        }
+        if "observation_inbox" in tables:
+            row = connection.execute(
+                """
+                SELECT COUNT(*) AS count, MIN(created_at) AS oldest
+                FROM observation_inbox WHERE processed_at IS NULL
+                """
+            ).fetchone()
+            record_metric("therapy_observation_backlog", int(row["count"]))
+            if row["oldest"] is not None:
+                oldest = datetime.fromisoformat(str(row["oldest"]))
+                record_metric(
+                    "therapy_observation_oldest_pending_unixtime",
+                    oldest.replace(tzinfo=oldest.tzinfo or UTC).timestamp(),
+                )
+        if "pending_insights" in tables:
+            rows = connection.execute(
+                """
+                SELECT state, COUNT(*) AS count, MIN(proposed_at) AS oldest
+                FROM pending_insights
+                WHERE state IN ('queued','delivered','snoozed')
+                GROUP BY state
+                """
+            ).fetchall()
+            by_state = {str(row["state"]): row for row in rows}
+            for state in ("queued", "delivered", "snoozed"):
+                row = by_state.get(state)
+                record_metric(
+                    "therapy_insight_backlog",
+                    int(row["count"]) if row is not None else 0,
+                    {"state": state},
+                )
+                if row is not None and row["oldest"] is not None:
+                    oldest = datetime.fromisoformat(str(row["oldest"]))
+                    record_metric(
+                        "therapy_insight_oldest_pending_unixtime",
+                        oldest.replace(tzinfo=oldest.tzinfo or UTC).timestamp(),
+                        {"state": state},
+                    )
+        for table, kind in (("nodes", "node"), ("edges", "edge")):
+            if table not in tables:
+                continue
+            row = connection.execute(
+                f"SELECT COUNT(*) AS count FROM {table} "
+                "WHERE status = 'needs_revalidation'"
+            ).fetchone()
+            record_metric(
+                "therapy_graph_revalidation_backlog",
+                int(row["count"]),
+                {"kind": kind},
+            )
+    except (OSError, sqlite3.Error, ValueError, TypeError):
+        return False
+    finally:
+        if connection is not None:
+            connection.close()
+    return True
+
+
 async def _health_monitor(
-    store,
+    store: JournalStore | None,
     interval_s: float = 15.0,
     *,
     retention_days: int = 30,
@@ -550,7 +666,8 @@ async def _health_monitor(
     import asyncio as _asyncio
     from datetime import datetime
 
-    from therapy.observability.telemetry import record_metric
+    from therapy.observability.model import WorkloadClass
+    from therapy.observability.telemetry import record_metric, run_in_thread
 
     tick = 0
     storage_interval_ticks = max(1, int(600 / max(interval_s, 0.001)))
@@ -563,16 +680,47 @@ async def _health_monitor(
         tick += 1
         lag = max(0.0, (time.monotonic() - started) - interval_s)
         record_metric("therapy_event_loop_lag_seconds", lag)
+        record_metric("therapy_event_loop_tasks", len(_asyncio.all_tasks()))
         if tick == 1 or tick % storage_interval_ticks == 0:
-            await _asyncio.to_thread(_inspect_product_storage)
+            await run_in_thread(WorkloadClass.MAINTENANCE, inspect_product_storage)
         if store is None:
             continue
         try:
-            health = await _asyncio.to_thread(store.health)
-        except Exception:
+            health = await run_in_thread(WorkloadClass.MAINTENANCE, store.health)
+        except Exception as exc:
+            emit_event(
+                "journal.health_failed",
+                severity=logging.ERROR,
+                component="journal",
+                operation="health",
+                outcome="error",
+                error_type=type(exc).__name__,
+                rate_limited=True,
+            )
             continue
         record_metric("therapy_sqlite_wal_bytes", health.wal_bytes,
                       {"component": "journal"})
+        try:
+            journal_bytes = store.path.stat().st_size
+        except OSError as exc:
+            emit_event(
+                "journal.size_inspection_failed",
+                severity=logging.WARNING,
+                component="journal",
+                operation="inspect_size",
+                outcome="error",
+                error_type=type(exc).__name__,
+                rate_limited=True,
+            )
+        else:
+            record_metric("therapy_llm_capture_journal_bytes", journal_bytes)
+        from therapy.observability.journal import JOURNAL_SCHEMA_VERSION
+
+        record_metric(
+            "therapy_schema_version",
+            JOURNAL_SCHEMA_VERSION,
+            {"component": "journal"},
+        )
         if health.oldest_unexported_at:
             try:
                 oldest = datetime.fromisoformat(health.oldest_unexported_at)
@@ -581,24 +729,33 @@ async def _health_monitor(
                     oldest.timestamp(),
                 )
             except ValueError:
-                pass
+                emit_event(
+                    "journal.health_invalid_timestamp",
+                    severity=logging.WARNING,
+                    component="journal",
+                    operation="health",
+                    outcome="error",
+                    error_type="ValueError",
+                    rate_limited=True,
+                )
         # periodic maintenance off the hot path (§5.3): passive checkpoint
         # roughly every 10 minutes, retention + integrity check hourly.
         try:
             if tick % max(1, int(600 / interval_s)) == 0:
-                await _asyncio.to_thread(store.checkpoint)
+                await run_in_thread(WorkloadClass.MAINTENANCE, store.checkpoint)
                 record_metric(
                     "therapy_sqlite_checkpoint_last_success_unixtime",
                     time.time(),
                     {"component": "journal"},
                 )
             if tick % max(1, int(3600 / interval_s)) == 0:
-                await _asyncio.to_thread(
+                await run_in_thread(
+                    WorkloadClass.MAINTENANCE,
                     store.apply_retention,
                     retention_days,
                     require_ack_backend=ack_backend,
                 )
-                if await _asyncio.to_thread(store.integrity_check):
+                if await run_in_thread(WorkloadClass.MAINTENANCE, store.integrity_check):
                     record_metric(
                         "therapy_sqlite_integrity_last_success_unixtime",
                         time.time(),
@@ -620,24 +777,23 @@ async def _health_monitor(
 class CaptureRuntime:
     """Everything the app lifespan owns: journal, writer, service, worker."""
 
-    store: object | None
+    store: JournalStore | None
     writer: AsyncJournalWriter | None
     service: CaptureService
-    worker: object | None = None  # ExportWorker when a backend is selected
-    monitor: object | None = None  # health/loop-lag task
+    worker: _ClosableWorker | None = None
+    monitor: asyncio.Task[None] | None = None
 
     async def close(self, timeout: float = 5.0) -> None:
         """Bounded flush + close; never blocks product shutdown (O1.1)."""
-        import asyncio as _asyncio
         import contextlib
 
         set_capture_service(None)
         if self.monitor is not None:
-            self.monitor.cancel()  # type: ignore[attr-defined]
+            self.monitor.cancel()
             with contextlib.suppress(Exception):
-                await _asyncio.wait_for(self.monitor, 2.0)  # type: ignore[arg-type]
+                await asyncio.wait_for(self.monitor, 2.0)
         if self.worker is not None:
-            await self.worker.close(timeout)  # type: ignore[attr-defined]
+            await self.worker.close(timeout)
         if self.writer is not None:
             try:
                 await self.writer.flush()
@@ -645,15 +801,14 @@ class CaptureRuntime:
                 pass
             await self.writer.close(timeout)
 
-    def health(self):
-        from therapy.observability.journal import JournalStore
-
-        if isinstance(self.store, JournalStore):
-            return self.store.health()
-        return None
+    def health(self) -> JournalHealth | None:
+        """Return a content-free journal snapshot when capture is available."""
+        return self.store.health() if self.store is not None else None
 
 
-async def start_capture(config, *, build_version: str = "0.1.0") -> CaptureRuntime:
+async def start_capture(
+    config: ObservabilityConfig, *, build_version: str = "0.1.0"
+) -> CaptureRuntime:
     """Open the journal, recover stale attempts, install the service.
 
     Journal failure degrades capture visibly (rate-limited `capture_degraded`
@@ -742,12 +897,20 @@ def stream_event_from_delta(delta: str) -> tuple[InteractionEventKind, dict[str,
 
 
 def build_stream_tuple(events: list[dict[str, JsonValue]]) -> tuple[StreamEvent, ...]:
-    return tuple(
-        StreamEvent(
-            sequence=index,
-            observed_at=str(event.get("observed_at", "")),
-            delta=event.get("delta"),  # type: ignore[arg-type]
-            tool_delta=event.get("tool_delta"),  # type: ignore[arg-type]
+    stream: list[StreamEvent] = []
+    for index, event in enumerate(events):
+        delta = event.get("delta")
+        tool_delta = event.get("tool_delta")
+        if delta is not None and not isinstance(delta, str):
+            raise TypeError("stream delta must be text or null")
+        if tool_delta is not None and not isinstance(tool_delta, str):
+            raise TypeError("stream tool delta must be text or null")
+        stream.append(
+            StreamEvent(
+                sequence=index,
+                observed_at=str(event.get("observed_at", "")),
+                delta=delta,
+                tool_delta=tool_delta,
+            )
         )
-        for index, event in enumerate(events)
-    )
+    return tuple(stream)

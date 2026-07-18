@@ -15,7 +15,11 @@ from pathlib import Path
 
 OUT = Path(__file__).resolve().parents[2] / "deploy/observability/dashboards"
 
-PROM = {"type": "prometheus", "uid": "prometheus"}
+type JsonScalar = str | int | float | bool | None
+type JsonValue = JsonScalar | list["JsonValue"] | dict[str, "JsonValue"]
+type JsonObject = dict[str, JsonValue]
+
+PROM: JsonObject = {"type": "prometheus", "uid": "prometheus"}
 
 
 def timeseries(
@@ -23,10 +27,10 @@ def timeseries(
     expr: str,
     *,
     unit: str = "s",
-    grid: dict,
+    grid: JsonObject,
     description: str | None = None,
-) -> dict:
-    panel = {
+) -> JsonObject:
+    panel: JsonObject = {
         "type": "timeseries",
         "title": title,
         "datasource": PROM,
@@ -44,10 +48,10 @@ def stat(
     expr: str,
     *,
     unit: str = "short",
-    grid: dict,
+    grid: JsonObject,
     description: str | None = None,
-) -> dict:
-    panel = {
+) -> JsonObject:
+    panel: JsonObject = {
         "type": "stat",
         "title": title,
         "datasource": PROM,
@@ -60,7 +64,7 @@ def stat(
     return panel
 
 
-def row(title: str, *, grid: dict) -> dict:
+def row(title: str, *, grid: JsonObject) -> JsonObject:
     return {
         "type": "row",
         "title": title,
@@ -70,7 +74,8 @@ def row(title: str, *, grid: dict) -> dict:
     }
 
 
-def dashboard(uid: str, title: str, panels: list[dict]) -> dict:
+def dashboard(uid: str, title: str, panels: list[JsonObject]) -> JsonObject:
+    json_panels: list[JsonValue] = [panel for panel in panels]
     return {
         "uid": uid,
         "title": title,
@@ -79,17 +84,17 @@ def dashboard(uid: str, title: str, panels: list[dict]) -> dict:
         "schemaVersion": 39,
         "refresh": "30s",
         "time": {"from": "now-6h", "to": "now"},
-        "panels": panels,
+        "panels": json_panels,
         "templating": {"list": []},  # no product-ID variables, ever (plan §1)
         "annotations": {"list": []},
     }
 
 
-def g(x: int, y: int, w: int = 12, h: int = 8) -> dict:
+def g(x: int, y: int, w: int = 12, h: int = 8) -> JsonObject:
     return {"x": x, "y": y, "w": w, "h": h}
 
 
-DASHBOARDS: dict[str, dict] = {
+DASHBOARDS: dict[str, JsonObject] = {
     "conversation-latency": dashboard(
         "therapy-conversation",
         "1 - Conversation path and latency waterfall",

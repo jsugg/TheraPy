@@ -8,11 +8,11 @@ import logging
 import os
 import shutil
 import sqlite3
-from collections.abc import Iterator, Mapping
+from collections.abc import Generator, Mapping
 from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Final, Literal
+from typing import Final, Literal, cast
 from uuid import uuid4
 
 from therapy.dialogue.outreach import ProactivityService
@@ -25,7 +25,7 @@ EXPORT_FORMAT: Final = "therapy-owner-data"
 EXPORT_VERSION: Final = 1
 MAX_RESTORE_BYTES: Final = 512 * 1024 * 1024
 
-_TABLES: Final[tuple[str, ...]] = (
+TABLES: Final[tuple[str, ...]] = (
     "sessions",
     "turns",
     "nodes",
@@ -57,8 +57,8 @@ type SovereigntyOperation = Literal["export", "restore", "delete"]
 type SovereigntyOutcome = Literal["success", "error", "timeout", "rejected"]
 type SnapshotRejectionCategory = Literal["format", "schema", "table", "file"]
 
-_EXPORT_STAGES: Final = frozenset({"tables", "files", "json"})
-_RESTORE_STAGES: Final = frozenset(
+EXPORT_STAGES: Final = frozenset({"tables", "files", "json"})
+RESTORE_STAGES: Final = frozenset(
     {
         "validate",
         "stage_files",
@@ -73,10 +73,10 @@ _RESTORE_STAGES: Final = frozenset(
         "cleanup_database_backup",
         "cleanup_files_backup",
         "cleanup_staged_files",
-        *(f"table_{table}" for table in _TABLES),
+        *(f"table_{table}" for table in TABLES),
     }
 )
-_DELETE_STAGES: Final = frozenset(
+DELETE_STAGES: Final = frozenset(
     {
         "proactivity",
         "research",
@@ -87,10 +87,10 @@ _DELETE_STAGES: Final = frozenset(
         "vacuum",
     }
 )
-_SOVEREIGNTY_STAGES: Final[dict[SovereigntyOperation, frozenset[str]]] = {
-    "export": _EXPORT_STAGES,
-    "restore": _RESTORE_STAGES,
-    "delete": _DELETE_STAGES,
+SOVEREIGNTY_STAGES: Final[dict[SovereigntyOperation, frozenset[str]]] = {
+    "export": EXPORT_STAGES,
+    "restore": RESTORE_STAGES,
+    "delete": DELETE_STAGES,
 }
 
 
@@ -105,9 +105,9 @@ class _SnapshotRejection(ValueError):
 @contextmanager
 def _sovereignty_stage(
     operation: SovereigntyOperation, stage: str
-) -> Iterator[object | None]:
+) -> Generator[object | None, None, None]:
     """Trace and count one registered sovereignty stage without content labels."""
-    if stage not in _SOVEREIGNTY_STAGES[operation]:
+    if stage not in SOVEREIGNTY_STAGES[operation]:
         raise ValueError("unregistered sovereignty stage")
 
     from therapy.observability.logging import emit_event
@@ -161,8 +161,11 @@ def _encode(value: object) -> object:
 
 
 def _decode(value: object) -> object:
-    if isinstance(value, dict) and set(value) == {"$base64"}:
-        payload = value["$base64"]
+    if isinstance(value, dict):
+        raw_value = cast(dict[object, object], value)
+        if set(raw_value) != {"$base64"}:
+            raise ValueError("snapshot row contains unsupported value")
+        payload = raw_value["$base64"]
         if not isinstance(payload, str):
             raise ValueError("invalid base64 database value")
         try:
@@ -180,6 +183,14 @@ def _decode(value: object) -> object:
 
 def _allowed_file(relative: str) -> bool:
     return relative in _PRIVATE_FILES or relative.startswith(_PRIVATE_PREFIXES)
+
+
+def _sqlite_row(row: sqlite3.Row) -> dict[str, object]:
+    """Convert one SQLite row after validating its runtime key contract."""
+    raw = cast(dict[object, object], dict(row))
+    if not all(isinstance(key, str) for key in raw):
+        raise TypeError("SQLite row contains a non-string column name")
+    return cast(dict[str, object], raw)
 
 
 class DataSovereignty:
@@ -208,7 +219,7 @@ class DataSovereignty:
         )
 
     @contextmanager
-    def _connect(self) -> Iterator[sqlite3.Connection]:
+    def _connect(self) -> Generator[sqlite3.Connection, None, None]:
         connection = sqlite3.connect(self.db_path, timeout=30.0)
         connection.row_factory = sqlite3.Row
         try:
@@ -224,10 +235,13 @@ class DataSovereignty:
             with self._connect() as connection:
                 tables = {
                     table: [
-                        {key: _encode(value) for key, value in dict(row).items()}
+                        {
+                            key: _encode(value)
+                            for key, value in _sqlite_row(row).items()
+                        }
                         for row in connection.execute(f"SELECT * FROM {table}")
                     ]
-                    for table in _TABLES
+                    for table in TABLES
                 }
         files: list[dict[str, object]] = []
         with _sovereignty_stage("export", "files"):
@@ -280,39 +294,51 @@ class DataSovereignty:
                     "schema", "unsupported knowledge schema version"
                 )
             raw_tables = snapshot.get("tables")
-            if not isinstance(raw_tables, dict) or set(raw_tables) != set(_TABLES):
+            if not isinstance(raw_tables, dict):
                 raise _SnapshotRejection(
                     "table", "snapshot does not contain the complete table set"
                 )
+            raw_table_mapping = cast(dict[object, object], raw_tables)
+            if set(raw_table_mapping) != set(TABLES):
+                raise _SnapshotRejection(
+                    "table", "snapshot does not contain the complete table set"
+                )
+            table_mapping = cast(dict[str, object], raw_table_mapping)
             with self._connect() as connection:
                 columns = {
                     table: {
-                        str(row["name"])
+                        str(_sqlite_row(row)["name"])
                         for row in connection.execute(f"PRAGMA table_info({table})")
                     }
-                    for table in _TABLES
+                    for table in TABLES
                 }
             tables: dict[str, list[dict[str, object]]] = {}
-            for table in _TABLES:
-                raw_rows = raw_tables[table]
+            for table in TABLES:
+                raw_rows = table_mapping[table]
                 if not isinstance(raw_rows, list):
                     raise _SnapshotRejection(
                         "table", f"snapshot table {table} must be a list"
                     )
                 rows: list[dict[str, object]] = []
-                for raw_row in raw_rows:
-                    if (
-                        not isinstance(raw_row, dict)
-                        or not set(raw_row) <= columns[table]
+                for raw_row in cast(list[object], raw_rows):
+                    if not isinstance(raw_row, dict):
+                        raise _SnapshotRejection(
+                            "table", f"snapshot table {table} has invalid columns"
+                        )
+                    raw_row_mapping = cast(dict[object, object], raw_row)
+                    if not all(
+                        isinstance(key, str) and key in columns[table]
+                        for key in raw_row_mapping
                     ):
                         raise _SnapshotRejection(
                             "table", f"snapshot table {table} has invalid columns"
                         )
+                    row_mapping = cast(dict[str, object], raw_row_mapping)
                     try:
                         rows.append(
                             {
-                                str(key): _decode(value)
-                                for key, value in raw_row.items()
+                                key: _decode(value)
+                                for key, value in row_mapping.items()
                             }
                         )
                     except ValueError as exc:
@@ -326,13 +352,19 @@ class DataSovereignty:
             files: list[tuple[str, bytes]] = []
             total = 0
             seen: set[str] = set()
-            for item in raw_files:
+            for item in cast(list[object], raw_files):
                 if not isinstance(item, dict):
                     raise _SnapshotRejection(
                         "file", "snapshot file entry must be an object"
                     )
-                relative = item.get("path")
-                encoded = item.get("content_base64")
+                raw_item = cast(dict[object, object], item)
+                if not all(isinstance(key, str) for key in raw_item):
+                    raise _SnapshotRejection(
+                        "file", "snapshot file entry has invalid fields"
+                    )
+                file_item = cast(dict[str, object], raw_item)
+                relative = file_item.get("path")
+                encoded = file_item.get("content_base64")
                 if (
                     not isinstance(relative, str)
                     or relative in seen
@@ -350,7 +382,7 @@ class DataSovereignty:
                     raise _SnapshotRejection(
                         "file", "snapshot file is not valid base64"
                     ) from exc
-                if item.get("size") != len(payload):
+                if file_item.get("size") != len(payload):
                     raise _SnapshotRejection(
                         "file", "snapshot file size does not match payload"
                     )
@@ -398,9 +430,9 @@ class DataSovereignty:
             with self._connect() as connection:
                 with connection:
                     with _sovereignty_stage("restore", "database_clear"):
-                        for table in reversed(_TABLES):
+                        for table in reversed(TABLES):
                             connection.execute(f"DELETE FROM {table}")
-                    for table in _TABLES:
+                    for table in TABLES:
                         with _sovereignty_stage("restore", f"table_{table}"):
                             try:
                                 for row in tables[table]:

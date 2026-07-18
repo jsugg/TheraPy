@@ -15,7 +15,7 @@ from __future__ import annotations
 import hashlib
 import json
 from dataclasses import asdict, dataclass, field
-from typing import Self
+from typing import Self, cast
 
 from therapy.observability.model import (
     PAYLOAD_ENCODING,
@@ -49,16 +49,30 @@ def _require_json_value(value: object, where: str) -> JsonValue:
         raise TypeError(f"{where}: non-finite float is not valid JSON")
     if value is None or isinstance(value, str | int | float | bool):
         return value
-    if isinstance(value, list | tuple):
-        return [_require_json_value(item, where) for item in value]
+    if isinstance(value, list):
+        items = cast(list[object], value)
+        return [_require_json_value(item, where) for item in items]
+    if isinstance(value, tuple):
+        tuple_items = cast(tuple[object, ...], value)
+        return [_require_json_value(item, where) for item in tuple_items]
     if isinstance(value, dict):
+        raw_mapping = cast(dict[object, object], value)
+        if not all(isinstance(key, str) for key in raw_mapping):
+            raise TypeError(f"{where}: non-string JSON object key")
+        raw_object = cast(dict[str, object], value)
         out: dict[str, JsonValue] = {}
-        for key, item in value.items():
-            if not isinstance(key, str):
-                raise TypeError(f"{where}: non-string key {key!r}")
+        for key, item in raw_object.items():
             out[key] = _require_json_value(item, f"{where}.{key}")
         return out
     raise TypeError(f"{where}: {type(value).__name__} is not JSON-serializable")
+
+
+def require_json_object(value: object, where: str) -> dict[str, JsonValue]:
+    """Validate an external value as one JSON object."""
+    validated = _require_json_value(value, where)
+    if not isinstance(validated, dict):
+        raise TypeError(f"{where}: expected a JSON object")
+    return validated
 
 
 @dataclass(frozen=True, slots=True)
@@ -120,7 +134,7 @@ class InteractionRequest:
     memory_notes: tuple[str, ...] = ()
     retrieved_documents: tuple[RetrievedDocument, ...] = ()
     tools: tuple[ToolUse, ...] = ()
-    parameters: dict[str, JsonValue] = field(default_factory=dict)
+    parameters: dict[str, JsonValue] = field(default_factory=lambda: {})
     response_schema: dict[str, JsonValue] | None = None
     context_order: tuple[str, ...] = ("system", "memory", "retrieval", "messages")
     truncation: Truncation = field(default_factory=lambda: Truncation(False, 0))
@@ -165,7 +179,7 @@ class ProviderNative:
     ordered_events: tuple[dict[str, JsonValue], ...] = ()
     terminal_response: dict[str, JsonValue] | None = None
     terminal_error: dict[str, JsonValue] | None = None
-    extra: dict[str, JsonValue] = field(default_factory=dict)
+    extra: dict[str, JsonValue] = field(default_factory=lambda: {})
 
 
 @dataclass(frozen=True, slots=True)
@@ -210,15 +224,33 @@ class InteractionRecord:
 
     def to_json_dict(self) -> dict[str, JsonValue]:
         """The validated `json-v1` shape (§5.2)."""
-        payload = asdict(self)
+        payload = cast(dict[str, object], asdict(self))
         payload["operation"] = self.operation.value
         payload["provider"] = self.provider.value
         payload["status"] = self.status.value
         # flatten the provider-native `extra` seam into its envelope
-        native = payload["provider_native"]
-        extra = native.pop("extra", {}) or {}
+        native_value = payload["provider_native"]
+        if not isinstance(native_value, dict):
+            raise TypeError("provider_native must be an object")
+        raw_native = cast(dict[object, object], native_value)
+        if not all(isinstance(key, str) for key in raw_native):
+            raise TypeError("provider_native field names must be strings")
+        native = cast(dict[str, object], native_value)
+        extra_value: object = native.pop("extra", None)
+        if extra_value is None:
+            extra: dict[str, object] = {}
+        elif not isinstance(extra_value, dict):
+            raise TypeError("provider_native.extra must be an object")
+        else:
+            raw_extra = cast(dict[object, object], extra_value)
+            if not all(isinstance(key, str) for key in raw_extra):
+                raise TypeError("provider_native.extra field names must be strings")
+            extra = cast(dict[str, object], extra_value)
         native.update(extra)
-        return _require_json_value(payload, "interaction")  # type: ignore[return-value]
+        validated = _require_json_value(payload, "interaction")
+        if not isinstance(validated, dict):
+            raise TypeError("interaction: expected a JSON object")
+        return validated
 
     def canonical(self) -> str:
         return canonical_json(self.to_json_dict())
@@ -237,4 +269,4 @@ class InteractionRecord:
     def with_status(self, status: InteractionStatus, **changes: object) -> Self:
         from dataclasses import replace
 
-        return replace(self, status=status, **changes)  # type: ignore[arg-type]
+        return replace(self, status=status, **changes)

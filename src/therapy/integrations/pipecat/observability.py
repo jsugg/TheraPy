@@ -9,7 +9,7 @@ no undocumented internals are patched (plan O1.4 item 2). Wire-level
 `provider_native.ordered_events` for the realtime path therefore contains
 frame-level evidence; the non-realtime path captures true native bodies.
 
-`build_task_telemetry()` wires `PipelineTask` per the pinned 1.5.0 snapshot:
+`build_task_telemetry()` wires `PipelineWorker` per the pinned 1.5.0 snapshot:
 `enable_tracing`/`enable_turn_tracking` only when the owned global provider
 is installed (Pipecat then obtains tracers from it; its `pipecat`/
 `pipecat.turn` scopes route restricted by default-deny), plus a telemetry
@@ -19,18 +19,25 @@ conversation ID that is never the product session ID.
 from __future__ import annotations
 
 import logging
+import time
 import uuid
-from typing import Any
+from collections.abc import Sequence
+from typing import Protocol, TypedDict, cast
 
 from pipecat.frames.frames import (
+    BotStoppedSpeakingFrame,
     CancelFrame,
     EndFrame,
+    ErrorFrame,
     InterruptionFrame,
     LLMContextFrame,
     LLMFullResponseEndFrame,
     LLMFullResponseStartFrame,
     LLMTextFrame,
     MetricsFrame,
+    TTSAudioRawFrame,
+    TTSStartedFrame,
+    TTSStoppedFrame,
 )
 from pipecat.metrics.metrics import (
     LLMUsageMetricsData,
@@ -41,11 +48,13 @@ from pipecat.metrics.metrics import (
 )
 from pipecat.observers.base_observer import BaseObserver, FramePushed
 
-from therapy.observability.capture import capture_service
+from therapy.observability.capture import AttemptHandle, capture_service
 from therapy.observability.interactions import (
     InteractionRequest,
     InteractionResponse,
+    JsonValue,
     Message,
+    require_json_object,
 )
 from therapy.observability.logging import emit_event
 from therapy.observability.model import (
@@ -58,20 +67,69 @@ from therapy.observability.model import (
 logger = logging.getLogger(__name__)
 
 
-def _context_messages(frame: LLMContextFrame) -> tuple[str, list[dict[str, Any]]]:
+class _ObserverInitializer(Protocol):
+    """Typed constructor seam for Pipecat's partially annotated observer."""
+
+    def __call__(self, observer: BaseObserver) -> None: ...
+
+
+class TaskTelemetry(TypedDict):
+    """Telemetry options passed to the pinned Pipecat worker surface."""
+
+    enable_tracing: bool
+    enable_turn_tracking: bool
+    conversation_id: str
+    observers: list[BaseObserver]
+
+
+def _runtime_value(value: object) -> object:
+    """Erase incomplete third-party hints before runtime boundary checks."""
+    return value
+
+
+def _initialize_observer(observer: BaseObserver) -> None:
+    """Invoke the validated no-argument BaseObserver constructor."""
+    initializer: object | None = None
+    for base in BaseObserver.__mro__:
+        candidate = _runtime_value(vars(base).get("__init__"))
+        if callable(candidate):
+            initializer = candidate
+            break
+    if not callable(initializer):
+        raise TypeError("Pipecat BaseObserver constructor is not callable")
+    cast(_ObserverInitializer, initializer)(observer)
+
+
+def _context_messages(
+    frame: LLMContextFrame,
+) -> tuple[str, list[dict[str, JsonValue]]]:
     """Exact system instructions + ordered messages from a context frame."""
     context = frame.context
-    messages: list[dict[str, Any]] = []
+    messages: list[dict[str, JsonValue]] = []
     getter = getattr(context, "get_messages", None)
-    raw = getter() if callable(getter) else getattr(context, "messages", [])
+    raw_value = _runtime_value(
+        getter() if callable(getter) else getattr(context, "messages", [])
+    )
     system = ""
-    for item in raw or []:
-        if isinstance(item, dict):
-            entry = dict(item)
+    raw = (
+        cast(Sequence[object], raw_value)
+        if isinstance(raw_value, list | tuple)
+        else ()
+    )
+    for item in raw:
+        item_value = _runtime_value(item)
+        entry: dict[str, JsonValue]
+        if isinstance(item_value, dict):
+            raw_item = cast(dict[object, object], item_value)
+            if not all(isinstance(key, str) for key in raw_item):
+                raise TypeError("Pipecat message field names must be strings")
+            entry = require_json_object(
+                cast(dict[str, object], raw_item), "pipecat.context.message"
+            )
         else:  # provider-specific message objects
             entry = {
-                "role": str(getattr(item, "role", "unknown")),
-                "content": str(getattr(item, "content", item)),
+                "role": str(getattr(item_value, "role", "unknown")),
+                "content": str(getattr(item_value, "content", item_value)),
             }
         if entry.get("role") == "system" and not system:
             content = entry.get("content", "")
@@ -81,6 +139,12 @@ def _context_messages(frame: LLMContextFrame) -> tuple[str, list[dict[str, Any]]
     if isinstance(explicit_system, str) and explicit_system:
         system = explicit_system
     return system, messages
+
+
+def _message_content(message: dict[str, JsonValue]) -> str:
+    """Render one canonical text field without weakening native capture."""
+    content = message.get("content")
+    return content if isinstance(content, str) else str(content)
 
 
 class InteractionCaptureObserver(BaseObserver):
@@ -100,14 +164,14 @@ class InteractionCaptureObserver(BaseObserver):
         requested_model: str,
         language: str = "unknown",
     ) -> None:
-        super().__init__()
+        _initialize_observer(self)
         self._llm = llm_service
         self._session_id = session_id
         self._provider = normalize_enum(provider, Provider, Provider.UNKNOWN)
         self._requested_model = requested_model
         self._language = language
-        self._pending_request: tuple[str, list[dict[str, Any]]] | None = None
-        self._handle = None
+        self._pending_request: tuple[str, list[dict[str, JsonValue]]] | None = None
+        self._handle: AttemptHandle | None = None
         self._completion_parts: list[str] = []
 
     async def on_push_frame(self, data: FramePushed) -> None:
@@ -168,16 +232,15 @@ class InteractionCaptureObserver(BaseObserver):
         if service is None or self._handle is not None:
             return
         system, raw_messages = self._pending_request or ("", [])
+        provider_messages: list[JsonValue] = [
+            message for message in raw_messages
+        ]
         request = InteractionRequest(
             system_instructions=system,
             messages=tuple(
                 Message(
                     role=str(m.get("role", "unknown")),
-                    content=(
-                        m.get("content")
-                        if isinstance(m.get("content"), str)
-                        else str(m.get("content"))
-                    ),
+                    content=_message_content(m),
                 )
                 for m in raw_messages
             ),
@@ -190,7 +253,7 @@ class InteractionCaptureObserver(BaseObserver):
             request=request,
             provider_request={
                 "model": self._requested_model,
-                "messages": raw_messages,  # exact context as supplied
+                "messages": provider_messages,  # exact context as supplied
                 "stream": True,
                 "capture_seam": "pipecat-frame-boundary",
             },
@@ -241,6 +304,12 @@ class MetricsFrameAdapter(BaseObserver):
         ("kokoro", "tts"),
     )
 
+    def __init__(self) -> None:
+        _initialize_observer(self)
+        self._tts_audio_seconds = 0.0
+        self._tts_processing_seconds = 0.0
+        self._tts_started_at: float | None = None
+
     def _component(self, processor: str) -> str:
         lowered = processor.lower()
         for hint, component in self._COMPONENT_HINTS:
@@ -250,6 +319,49 @@ class MetricsFrameAdapter(BaseObserver):
 
     async def on_push_frame(self, data: FramePushed) -> None:
         frame = data.frame
+        source_component = self._component(type(data.source).__name__)
+        if isinstance(frame, TTSStartedFrame) and source_component == "tts":
+            self._tts_started_at = time.monotonic()
+        elif isinstance(frame, TTSStoppedFrame) and source_component == "tts":
+            self._tts_started_at = None
+        elif isinstance(frame, ErrorFrame):
+            processor = getattr(frame, "processor", None)
+            error_component = self._component(type(processor).__name__)
+            if error_component == "unknown":
+                error_component = source_component
+            if error_component == "tts":
+                from therapy.observability.telemetry import record_metric
+
+                elapsed = (
+                    time.monotonic() - self._tts_started_at
+                    if self._tts_started_at is not None
+                    else 0.0
+                )
+                record_metric(
+                    "therapy_tts_requests_total",
+                    1,
+                    {"language_group": "unknown", "outcome": "error"},
+                )
+                record_metric(
+                    "therapy_tts_synthesis_seconds",
+                    elapsed,
+                    {"language_group": "unknown", "outcome": "error"},
+                )
+                self._tts_started_at = None
+        elif isinstance(frame, TTSAudioRawFrame) and source_component == "tts":
+            sample_rate = max(1, int(getattr(frame, "sample_rate", 0) or 0))
+            channels = max(1, int(getattr(frame, "num_channels", 1) or 1))
+            self._tts_audio_seconds += len(frame.audio) / (sample_rate * channels * 2)
+        elif isinstance(frame, BotStoppedSpeakingFrame) and self._tts_audio_seconds > 0:
+            from therapy.observability.telemetry import record_metric
+
+            record_metric(
+                "therapy_tts_realtime_factor",
+                self._tts_processing_seconds / self._tts_audio_seconds,
+                {"language_group": "unknown", "outcome": "success"},
+            )
+            self._tts_audio_seconds = 0.0
+            self._tts_processing_seconds = 0.0
         if not isinstance(frame, MetricsFrame):
             return
         from therapy.observability.telemetry import record_metric
@@ -293,6 +405,11 @@ class MetricsFrameAdapter(BaseObserver):
                     )
                 elif isinstance(item, TTSUsageMetricsData):
                     record_metric(
+                        "therapy_tts_requests_total",
+                        1,
+                        {"language_group": "unknown", "outcome": "success"},
+                    )
+                    record_metric(
                         "therapy_tts_characters_total",
                         item.value,
                         {"language_group": "unknown"},
@@ -303,6 +420,13 @@ class MetricsFrameAdapter(BaseObserver):
                         item.value,
                         {"stage": component, "outcome": "success"},
                     )
+                    if component == "tts":
+                        self._tts_processing_seconds += item.value
+                        record_metric(
+                            "therapy_tts_synthesis_seconds",
+                            item.value,
+                            {"language_group": "unknown", "outcome": "success"},
+                        )
             except Exception:
                 continue  # metric translation must never disturb the pipeline
 
@@ -320,8 +444,8 @@ def build_task_telemetry(
     llm_service: object,
     *,
     session_id: str | None,
-) -> dict[str, Any]:
-    """`PipelineTask` telemetry kwargs (pinned 1.5.0 parameter surface).
+) -> TaskTelemetry:
+    """`PipelineWorker` telemetry kwargs (pinned 1.5.0 parameter surface).
 
     Tracing/turn tracking activate only when the owned global provider is
     installed (`therapy.observability.telemetry.initialize`); the audited

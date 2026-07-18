@@ -121,8 +121,10 @@ async def main() -> None:
     channel = pc.createDataChannel("chat", ordered=True)
 
     @pc.on("iceconnectionstatechange")
-    def on_ice() -> None:
+    def _on_ice() -> None:
         print(f"ICE: {pc.iceConnectionState}", flush=True)
+
+    _ = _on_ice
 
     await pc.setLocalDescription(await pc.createOffer())
     while pc.iceGatheringState != "complete":

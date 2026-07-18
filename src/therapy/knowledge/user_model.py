@@ -11,7 +11,7 @@ import json
 import os
 import re
 import sqlite3
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Generator, Mapping, Sequence
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -211,7 +211,7 @@ def _utc_now() -> str:
     return datetime.now(UTC).isoformat(timespec="microseconds")
 
 
-def _tokens(text: str) -> set[str]:
+def tokens(text: str) -> set[str]:
     return {token.casefold() for token in _TOKEN_RE.findall(text)}
 
 
@@ -248,7 +248,7 @@ class UserModel:
         self.migrate_v1_facts()
 
     @contextmanager
-    def _connect(self) -> Iterator[sqlite3.Connection]:
+    def _connect(self) -> Generator[sqlite3.Connection, None, None]:
         connection = sqlite3.connect(self._db_path, timeout=30.0)
         connection.row_factory = sqlite3.Row
         try:
@@ -2065,9 +2065,18 @@ class UserModel:
     @staticmethod
     def is_eligible(claim: Mapping[str, object]) -> bool:
         """Check mechanical floor using currently auditable evidence only."""
+        occurrences = claim.get("n_auditable_occurrences", 0)
+        sessions = claim.get("n_auditable_sessions", 0)
+        if (
+            isinstance(occurrences, bool)
+            or not isinstance(occurrences, int)
+            or isinstance(sessions, bool)
+            or not isinstance(sessions, int)
+        ):
+            return False
         return (
-            int(claim.get("n_auditable_occurrences", 0)) >= GRADUATION_MIN_OCCURRENCES
-            and int(claim.get("n_auditable_sessions", 0)) >= GRADUATION_MIN_SESSIONS
+            occurrences >= GRADUATION_MIN_OCCURRENCES
+            and sessions >= GRADUATION_MIN_SESSIONS
         )
 
     def _propose(self, claim_kind: ClaimKind, claim_id: int) -> bool:
@@ -2503,7 +2512,7 @@ class UserModel:
         if not 1 <= k <= 50:
             raise ValueError("k must be between 1 and 50")
         self.revalidate_stale(now)
-        topic_tokens = _tokens(topic)
+        topic_tokens = tokens(topic)
         allow_private = (
             self._topic_explicitly_raises_boundary(topic)
             if allow_never_initiate is None
@@ -2519,7 +2528,7 @@ class UserModel:
             )
             if (node["never_initiate"] or boundary_match) and not allow_private:
                 continue
-            overlap = len(topic_tokens & _tokens(node["statement"]))
+            overlap = len(topic_tokens & tokens(node["statement"]))
             if overlap == 0:
                 continue
             score = overlap * _STATUS_WEIGHT.get(node["status"], 0.0)

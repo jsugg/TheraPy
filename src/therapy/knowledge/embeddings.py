@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import os
 import time
-from collections.abc import Iterator
+from collections.abc import Generator, Iterable
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -33,7 +33,9 @@ def _record_metric(name: str, value: float, attributes: dict[str, str]) -> None:
 
 
 @contextmanager
-def _embedding_batch(cache: EmbeddingCache) -> Iterator[None]:
+def _embedding_batch(
+    cache: EmbeddingCache, *, item_count: int, character_count: int
+) -> Generator[None, None, None]:
     """Time one embedding call without exposing inputs, vectors, or cache paths."""
     started = time.monotonic()
     outcome = "success"
@@ -43,6 +45,7 @@ def _embedding_batch(cache: EmbeddingCache) -> Iterator[None]:
         outcome = "error"
         raise
     finally:
+        elapsed = time.monotonic() - started
         _record_metric(
             "therapy_embedding_batches_total",
             1,
@@ -50,7 +53,16 @@ def _embedding_batch(cache: EmbeddingCache) -> Iterator[None]:
         )
         _record_metric(
             "therapy_embedding_seconds",
-            time.monotonic() - started,
+            elapsed,
+            {"cache": cache},
+        )
+        _record_metric("therapy_embedding_items", item_count, {"cache": cache})
+        _record_metric(
+            "therapy_embedding_characters", character_count, {"cache": cache}
+        )
+        _record_metric(
+            "therapy_embedding_characters_per_second",
+            character_count / max(elapsed, 1e-9),
             {"cache": cache},
         )
 
@@ -84,7 +96,13 @@ class EmbeddingBackend(Protocol):
 class _EmbeddingModel(Protocol):
     """Structural subset of FastEmbed used by this adapter."""
 
-    def embed(self, texts: list[str]) -> Iterator[object]: ...
+    def embed(
+        self,
+        documents: str | Iterable[str],
+        batch_size: int = 256,
+        parallel: int | None = None,
+        **kwargs: object,
+    ) -> Iterable[object]: ...
 
 
 class FastEmbedBackend:
@@ -103,46 +121,65 @@ class FastEmbedBackend:
     def _load(self) -> _EmbeddingModel:
         if self._model is not None:
             return self._model
+        started = time.monotonic()
+        outcome = "error"
         try:
-            from fastembed import TextEmbedding
-            from fastembed.common.model_description import ModelSource, PoolingType
-        except ImportError as error:
-            raise RuntimeError(
-                "fastembed is required for local semantic retrieval; install project dependencies"
-            ) from error
-        supported = {
-            str(item["model"]) for item in TextEmbedding.list_supported_models()
-        }
-        if MODEL_NAME not in supported:
-            TextEmbedding.add_custom_model(
-                model=MODEL_NAME,
-                pooling=PoolingType.MEAN,
-                normalization=True,
-                sources=ModelSource(hf=MODEL_NAME),
-                dim=MODEL_DIMENSION,
-                model_file=MODEL_FILE,
+            try:
+                from fastembed import TextEmbedding
+                from fastembed.common.model_description import (
+                    ModelSource,
+                    PoolingType,
+                )
+            except ImportError as error:
+                raise RuntimeError(
+                    "fastembed is required for local semantic retrieval; "
+                    "install project dependencies"
+                ) from error
+            supported = {
+                str(item["model"]) for item in TextEmbedding.list_supported_models()
+            }
+            if MODEL_NAME not in supported:
+                TextEmbedding.add_custom_model(
+                    model=MODEL_NAME,
+                    pooling=PoolingType.MEAN,
+                    normalization=True,
+                    sources=ModelSource(hf=MODEL_NAME),
+                    dim=MODEL_DIMENSION,
+                    model_file=MODEL_FILE,
+                )
+            offline = os.environ.get("THERAPY_EMBEDDINGS_OFFLINE", "0").casefold() in {
+                "1",
+                "true",
+                "yes",
+                "on",
+            }
+            model: _EmbeddingModel = TextEmbedding(
+                model_name=MODEL_NAME,
+                cache_dir=str(self.cache_dir),
+                local_files_only=offline,
+                revision=MODEL_REVISION,
+                threads=max(1, min(os.cpu_count() or 1, 4)),
             )
-        offline = os.environ.get("THERAPY_EMBEDDINGS_OFFLINE", "0").casefold() in {
-            "1",
-            "true",
-            "yes",
-            "on",
-        }
-        self._model = TextEmbedding(
-            model_name=MODEL_NAME,
-            cache_dir=str(self.cache_dir),
-            local_files_only=offline,
-            revision=MODEL_REVISION,
-            threads=max(1, min(os.cpu_count() or 1, 4)),
-        )
-        return self._model
+            self._model = model
+            outcome = "success"
+            return model
+        finally:
+            _record_metric(
+                "therapy_embedding_model_load_seconds",
+                time.monotonic() - started,
+                {"outcome": outcome},
+            )
 
     def embed_documents(self, texts: list[str]) -> list[np.ndarray]:
         """Embed passages with E5-required task prefix."""
         if not texts:
             return []
         cache: EmbeddingCache = "cold" if self._model is None else "warm"
-        with _embedding_batch(cache):
+        with _embedding_batch(
+            cache,
+            item_count=len(texts),
+            character_count=sum(map(len, texts)),
+        ):
             model = self._load()
             vectors = list(model.embed([f"passage: {text}" for text in texts]))
             return [self._validated(vector) for vector in vectors]
@@ -152,7 +189,7 @@ class FastEmbedBackend:
         if not text.strip():
             raise ValueError("query text must not be empty")
         cache: EmbeddingCache = "cold" if self._model is None else "warm"
-        with _embedding_batch(cache):
+        with _embedding_batch(cache, item_count=1, character_count=len(text)):
             model = self._load()
             vector = next(iter(model.embed([f"query: {text}"])))
             return self._validated(vector)

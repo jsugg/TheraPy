@@ -15,21 +15,33 @@ import subprocess
 import sys
 import tempfile
 import time
-from collections.abc import Iterator
+from collections.abc import Generator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
-from typing import BinaryIO, Literal
+from typing import BinaryIO, Literal, cast
 
 import httpx
+
+from therapy.observability.interactions import JsonValue, require_json_object
 
 RESULTS: list[str] = []
 SCRIPT_NAME = "verify_longitudinal_loop"
 SCENARIOS = frozenset({"longitudinal-loop"})
 
 type VerificationResult = Literal["pass", "fail"]
+
+
+def _object_list(value: object, label: str) -> list[dict[str, JsonValue]]:
+    """Validate an API field as a list of JSON objects."""
+    if not isinstance(value, list):
+        raise TypeError(f"{label} must be a list")
+    return [
+        require_json_object(item, f"{label}[{index}]")
+        for index, item in enumerate(cast(list[object], value))
+    ]
 
 
 def build_verification_record(
@@ -109,7 +121,7 @@ def _await_health(server: ServerProcess, timeout: float = 30.0) -> None:
 
 
 @contextmanager
-def _server(data_dir: Path, log_path: Path) -> Iterator[ServerProcess]:
+def _server(data_dir: Path, log_path: Path) -> Generator[ServerProcess, None, None]:
     port = _free_port()
     log_file = log_path.open("wb")
     environment = {
@@ -144,16 +156,14 @@ def _server(data_dir: Path, log_path: Path) -> Iterator[ServerProcess]:
         server.stop()
 
 
-def _json(response: httpx.Response) -> dict[str, object]:
+def _json(response: httpx.Response) -> dict[str, JsonValue]:
     if response.status_code >= 400:
         raise AssertionError(
             f"{response.request.method} {response.request.url.path} -> "
             f"{response.status_code}: {response.text}"
         )
-    payload = response.json()
-    if not isinstance(payload, dict):
-        raise AssertionError("API response root must be an object")
-    return payload
+    payload: object = response.json()
+    return require_json_object(payload, "API response")
 
 
 def _agent_turn(
@@ -163,7 +173,7 @@ def _agent_turn(
     session_id: str | None = None,
     language: str = "en",
     finalize: bool = False,
-) -> dict[str, object]:
+) -> dict[str, JsonValue]:
     body: dict[str, object] = {
         "text": text,
         "language": language,
@@ -174,26 +184,28 @@ def _agent_turn(
     return _json(client.post("/api/testing/agent/turn", json=body))
 
 
-def _confirm_next(client: httpx.Client, topic: str) -> dict[str, object]:
+def _confirm_next(client: httpx.Client, topic: str) -> dict[str, JsonValue]:
     raised = _agent_turn(client, topic)
     insight = raised.get("insight")
     _require("adjacent-reflection", isinstance(insight, dict), topic)
+    insight_object = require_json_object(insight, "agent insight")
     resolution = _agent_turn(
         client,
         "yes",
         session_id=str(raised["session_id"]),
     )
     recorded = resolution.get("resolution")
+    recorded_object = require_json_object(recorded, "agent insight resolution")
     _require(
         "conversational-confirmation",
-        isinstance(recorded, dict) and recorded.get("state") == "confirmed",
+        recorded_object.get("state") == "confirmed",
         "explicit yes resolves only the insight raised in this session",
     )
-    return insight if isinstance(insight, dict) else {}
+    return insight_object
 
 
 def _verify_agent_graph_context_research(client: httpx.Client) -> None:
-    last_distillation: dict[str, object] | None = None
+    last_distillation: dict[str, JsonValue] | None = None
     for index in range(3):
         result = _agent_turn(
             client,
@@ -214,13 +226,16 @@ def _verify_agent_graph_context_research(client: httpx.Client) -> None:
     proposed = _json(client.get("/api/graph"))
     nodes = proposed.get("nodes")
     edges = proposed.get("edges")
+    proposed_nodes = _object_list(nodes, "proposed graph nodes")
+    proposed_edges = _object_list(edges, "proposed graph edges")
     _require(
         "no-premature-confirmation",
-        isinstance(nodes, list)
-        and isinstance(edges, list)
-        and nodes
-        and edges
-        and all(item["status"] == "proposed" for item in [*nodes, *edges]),
+        bool(proposed_nodes)
+        and bool(proposed_edges)
+        and all(
+            item.get("status") == "proposed"
+            for item in [*proposed_nodes, *proposed_edges]
+        ),
         "mechanical eligibility plus judgment produces proposals, never confirmation",
     )
 
@@ -237,12 +252,12 @@ def _verify_agent_graph_context_research(client: httpx.Client) -> None:
     confirmed = _json(client.get("/api/graph"))
     confirmed_nodes = confirmed.get("nodes")
     confirmed_edges = confirmed.get("edges")
+    typed_confirmed_nodes = _object_list(confirmed_nodes, "confirmed graph nodes")
+    typed_confirmed_edges = _object_list(confirmed_edges, "confirmed graph edges")
     _require(
         "confirmed-graph",
-        isinstance(confirmed_nodes, list)
-        and isinstance(confirmed_edges, list)
-        and all(node["status"] == "confirmed" for node in confirmed_nodes)
-        and all(edge["status"] == "confirmed" for edge in confirmed_edges),
+        all(node.get("status") == "confirmed" for node in typed_confirmed_nodes)
+        and all(edge.get("status") == "confirmed" for edge in typed_confirmed_edges),
         "HTTP graph reports confirmed node and edge state",
     )
 
@@ -299,7 +314,8 @@ def _verify_agent_graph_context_research(client: httpx.Client) -> None:
         )
     )
     sources = citation.get("sources")
-    source = sources[0] if isinstance(sources, list) and sources else {}
+    typed_sources = _object_list(sources, "research query sources")
+    source = typed_sources[0] if typed_sources else {}
     _require(
         "research-grounding",
         "visible checklist" in str(grounded.get("reply")).casefold()
@@ -341,11 +357,11 @@ def _quiet_delivery(client: httpx.Client) -> dict[str, object]:
         "idempotency_key": "verify-restart",
         "topic": "planning",
     }
-    quiet = _json(client.post("/api/testing/proactivity/run", json=request))["job"]
+    quiet_response = _json(client.post("/api/testing/proactivity/run", json=request))
+    quiet = require_json_object(quiet_response.get("job"), "quiet-hours job")
     _require(
         "quiet-hours",
-        isinstance(quiet, dict)
-        and quiet.get("state") == "retry"
+        quiet.get("state") == "retry"
         and quiet.get("result") == {"reason": "quiet_hours"},
         "delivery is durably postponed inside overnight quiet hours",
     )
@@ -354,16 +370,16 @@ def _quiet_delivery(client: httpx.Client) -> dict[str, object]:
 
 
 def _restart_delivery(client: httpx.Client, request: dict[str, object]) -> None:
-    delivered = _json(client.post("/api/testing/proactivity/run", json=request))["job"]
-    jobs = _json(client.get("/api/proactivity/jobs"))["jobs"]
-    messages = _json(client.get("/api/proactivity/in-app?consume=false"))["messages"]
+    delivery_response = _json(client.post("/api/testing/proactivity/run", json=request))
+    delivered = require_json_object(delivery_response.get("job"), "delivered job")
+    jobs_response = _json(client.get("/api/proactivity/jobs"))
+    jobs = _object_list(jobs_response.get("jobs"), "proactivity jobs")
+    messages_response = _json(client.get("/api/proactivity/in-app?consume=false"))
+    messages = _object_list(messages_response.get("messages"), "in-app messages")
     _require(
         "restart-idempotency",
-        isinstance(delivered, dict)
-        and delivered.get("state") == "delivered"
-        and isinstance(jobs, list)
+        delivered.get("state") == "delivered"
         and sum(job["idempotency_key"] == "verify-restart" for job in jobs) == 1
-        and isinstance(messages, list)
         and any(message["channel"] == "check_in" for message in messages),
         "same persisted job delivers once after a full server restart",
     )

@@ -20,7 +20,7 @@ from therapy.observability.model import CaptureMode
 
 #: Backends the runtime may export interactions to. `journal` is the
 #: always-on local source of truth; `phoenix` is the single backend selected
-#: by the O0.3 ADR (docs/evidence/observability-backend-spike.md). No third
+#: by the O0.3 ADR (.local/working-notes/evidence/observability-backend-spike.md). No third
 #: runtime SDK path ships (plan §4).
 SUPPORTED_BACKENDS: tuple[str, ...] = ("journal", "phoenix")
 

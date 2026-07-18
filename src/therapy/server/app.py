@@ -4,11 +4,11 @@ import asyncio
 import json
 import os
 import sqlite3
-from collections.abc import Iterator, Sequence
+from collections.abc import Generator, Sequence
 from contextlib import asynccontextmanager, contextmanager
 from functools import lru_cache
 from pathlib import Path
-from typing import TYPE_CHECKING, Annotated, Literal
+from typing import TYPE_CHECKING, Annotated, Literal, cast
 
 if TYPE_CHECKING:
     from therapy.acceptance import AcceptanceAgent
@@ -309,10 +309,9 @@ def ready() -> dict[str, object]:
     except OSError:
         checks["turn"] = "unreachable"
 
+    capture = capture_service()
     checks["capture"] = (
-        "ready"
-        if capture_service() is not None and capture_service().writer is not None
-        else "degraded"
+        "ready" if capture is not None and capture.writer is not None else "degraded"
     )
     checks["telemetry"] = "ready" if telemetry_state().enabled else "disabled"
     checks["voice"] = "ready" if _voice_gateway is not None else "starting"
@@ -327,7 +326,7 @@ def ready() -> dict[str, object]:
 
 
 @contextmanager
-def _audit(operation: str, component: str = "data") -> Iterator[None]:
+def _audit(operation: str, component: str = "data") -> Generator[None, None, None]:
     """Minimal content-free audit event for destructive/research/data
     operations (obs plan O3.1); never IDs, names, paths, or payloads.
 
@@ -369,7 +368,7 @@ def _read_rows(route_class: str, count: int) -> None:
     )
 
 
-def _resolve_session(
+def resolve_session(
     store: MemoryStore, *, new_session: bool, explicit: str | None
 ) -> tuple[str | None, bool]:
     """Resolve which stored session a new connection will land in.
@@ -448,7 +447,7 @@ async def offer(
     store = _store()
     new_session = request.query_params.get("new_session") == "1"
     with broad_span("offer.resolve_session", component="voice", operation="resolve"):
-        resolved, resumed = _resolve_session(
+        resolved, resumed = resolve_session(
             store,
             new_session=new_session,
             explicit=request.query_params.get("session"),
@@ -1164,7 +1163,12 @@ async def restore_owner_data(
             decoded = json.loads(payload)
             if not isinstance(decoded, dict):
                 raise ValueError("restore snapshot root must be an object")
-            result = _data().restore_snapshot(decoded)
+            raw_snapshot = cast(dict[object, object], decoded)
+            if not all(isinstance(key, str) for key in raw_snapshot):
+                raise ValueError("restore snapshot field names must be strings")
+            result = _data().restore_snapshot(
+                cast(dict[str, object], raw_snapshot)
+            )
         except (json.JSONDecodeError, ValueError, sqlite3.IntegrityError) as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
         return {"restored": result}
@@ -1298,7 +1302,7 @@ def _client_origin_allowed(origin: str | None, request: Request) -> bool:
 
 
 @contextmanager
-def _client_trace_parent(traceparent: str | None) -> Iterator[None]:
+def _client_trace_parent(traceparent: str | None) -> Generator[None, None, None]:
     """Adopt only a valid remote W3C traceparent; ignore all other context."""
     if not traceparent:
         yield

@@ -15,11 +15,13 @@ from __future__ import annotations
 import asyncio
 import logging
 import random
+import time
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from typing import Protocol
+from typing import Protocol, cast
 
-from therapy.observability.journal import JournalStore
+from therapy.observability.journal import JournalStore, LoadedInteraction
 from therapy.observability.logging import emit_event
 
 
@@ -41,7 +43,7 @@ class InteractionExporter(Protocol):
     @property
     def backend_name(self) -> str: ...
 
-    async def export(self, interaction: dict) -> str | None:
+    async def export(self, interaction: LoadedInteraction) -> str | None:
         """Deliver one journaled interaction (`{"interaction":…,"events":…}`).
 
         Returns the backend record ID when available. Raises `ExportError`
@@ -99,22 +101,37 @@ class ExportWorker:
 
     async def drain_once(self) -> int:
         """One bounded cycle; returns how many records were attempted."""
+        from therapy.observability.model import WorkloadClass
+        from therapy.observability.telemetry import run_in_thread
+
         backend = self._exporter.backend_name
-        pending = await asyncio.to_thread(
-            self._store.pending_exports, backend, self._config.batch_limit
+        backend_label = "phoenix" if backend == "phoenix" else "unknown"
+        pending = await run_in_thread(
+            WorkloadClass.BACKGROUND,
+            self._store.pending_exports,
+            backend,
+            self._config.batch_limit,
         )
         attempted = 0
         for interaction_id in pending:
             if attempted >= self._config.max_attempts_per_cycle * self._config.batch_limit:
                 break
-            payload = await asyncio.to_thread(self._store.load, interaction_id)
+            payload = await run_in_thread(
+                WorkloadClass.BACKGROUND, self._store.load, interaction_id
+            )
             if payload is None:
                 continue
+            operation = self._operation(payload)
             attempted += 1
+            export_started = time.monotonic()
+            outcome = "error"
+            export_outcome = "failure"
             try:
                 backend_record_id = await self._exporter.export(payload)
             except PermanentExportError as exc:
-                await asyncio.to_thread(
+                export_outcome = "rejected"
+                await run_in_thread(
+                    WorkloadClass.BACKGROUND,
                     self._store.record_export_attempt,
                     interaction_id,
                     backend,
@@ -124,10 +141,14 @@ class ExportWorker:
                 )
                 self._note_degraded(type(exc).__name__)
             except Exception as exc:
-                attempts = await asyncio.to_thread(
-                    self._attempts_so_far, interaction_id, backend
+                attempts = await run_in_thread(
+                    WorkloadClass.BACKGROUND,
+                    self._attempts_so_far,
+                    interaction_id,
+                    backend,
                 )
-                await asyncio.to_thread(
+                await run_in_thread(
+                    WorkloadClass.BACKGROUND,
                     self._store.record_export_attempt,
                     interaction_id,
                     backend,
@@ -137,19 +158,58 @@ class ExportWorker:
                 )
                 self._note_degraded(type(exc).__name__)
             else:
-                await asyncio.to_thread(
+                await run_in_thread(
+                    WorkloadClass.BACKGROUND,
                     self._store.record_export_attempt,
                     interaction_id,
                     backend,
                     acknowledged=True,
                     backend_record_id=backend_record_id,
                 )
-                self._observe_export_success()
+                outcome = "success"
+                export_outcome = "accepted"
+                self._observe_export_success(operation)
                 self._note_recovered()
+            finally:
+                from therapy.observability.telemetry import record_metric
+
+                record_metric(
+                    "therapy_llm_capture_export_seconds",
+                    time.monotonic() - export_started,
+                    {"outcome": outcome},
+                )
+                record_metric(
+                    "therapy_llm_capture_exports_total",
+                    1,
+                    {"backend": backend_label, "outcome": export_outcome},
+                )
+                if outcome == "error":
+                    record_metric(
+                        "therapy_llm_capture_records_total",
+                        1,
+                        {"operation": operation, "status": "failed"},
+                    )
         return attempted
 
     @staticmethod
-    def _observe_export_success() -> None:
+    def _operation(payload: Mapping[str, object]) -> str:
+        """Return the finite journal operation without exposing payload data."""
+        from therapy.observability.model import InteractionOperation
+
+        interaction_value = payload.get("interaction")
+        interaction: Mapping[str, object] | None = None
+        if isinstance(interaction_value, Mapping):
+            raw_interaction = cast(Mapping[object, object], interaction_value)
+            if all(isinstance(key, str) for key in raw_interaction):
+                interaction = cast(Mapping[str, object], interaction_value)
+        raw = interaction.get("operation") if interaction is not None else None
+        try:
+            return InteractionOperation(raw).value if isinstance(raw, str) else "unknown"
+        except ValueError:
+            return "unknown"
+
+    @staticmethod
+    def _observe_export_success(operation: str) -> None:
         import time as _time
 
         from therapy.observability.telemetry import record_metric
@@ -160,16 +220,11 @@ class ExportWorker:
         record_metric(
             "therapy_llm_capture_records_total",
             1,
-            {"operation": "reply", "status": "exported"},
+            {"operation": operation, "status": "exported"},
         )
 
     def _attempts_so_far(self, interaction_id: str, backend: str) -> int:
-        row = self._store._conn.execute(
-            "SELECT attempts FROM interaction_exports "
-            "WHERE interaction_id=? AND backend=?",
-            (interaction_id, backend),
-        ).fetchone()
-        return int(row["attempts"]) if row is not None else 0
+        return self._store.export_attempts(interaction_id, backend)
 
     def _backoff_at(self, attempts: int) -> str:
         delay = min(

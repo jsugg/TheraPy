@@ -10,18 +10,18 @@ from __future__ import annotations
 import json
 import re
 import sqlite3
-from collections.abc import Awaitable, Callable, Iterator
+from collections.abc import Awaitable, Callable, Generator, Mapping, Sequence
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any, Literal, TypedDict, cast
+from typing import Literal, TypedDict, cast
 from uuid import uuid4
 
 from therapy.knowledge.user_model import (
     GRADUATION_MIN_SESSIONS,
     ClaimKind,
     UserModel,
-    _tokens,
+    tokens,
 )
 from therapy.memory.summarizer import complete, render_transcript
 from therapy.observability.model import InteractionOperation
@@ -33,6 +33,12 @@ type InsightState = Literal[
 type InsightMetricState = Literal[
     "proposed", "delivered", "snoozed", "dismissed", "confirmed", "rejected"
 ]
+
+
+def _required_int(value: object, field: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"{field} must be an integer")
+    return value
 
 
 def _record_transition(state: InsightMetricState) -> None:
@@ -139,8 +145,10 @@ def cross_session_patterns(model: UserModel) -> list[dict[str, object]]:
     ]
     recurring.sort(
         key=lambda node: (
-            int(node["n_auditable_sessions"]),
-            int(node["n_auditable_occurrences"]),
+            _required_int(node["n_auditable_sessions"], "auditable_sessions"),
+            _required_int(
+                node["n_auditable_occurrences"], "auditable_occurrences"
+            ),
         ),
         reverse=True,
     )
@@ -156,7 +164,7 @@ class InsightService:
         self._db_path = self.data_dir / "therapy.db"
 
     @contextmanager
-    def _connect(self) -> Iterator[sqlite3.Connection]:
+    def _connect(self) -> Generator[sqlite3.Connection, None, None]:
         connection = sqlite3.connect(self._db_path, timeout=30.0)
         connection.row_factory = sqlite3.Row
         try:
@@ -183,7 +191,7 @@ class InsightService:
             if event["event_type"] != "longitudinal_judgment":
                 continue
             kind = cast(ClaimKind, event["claim_kind"])
-            claim_id = int(event["claim_id"])
+            claim_id = _required_int(event["claim_id"], "claim_id")
             claim = (
                 self.model.get_node(claim_id)
                 if kind == "node"
@@ -213,7 +221,7 @@ class InsightService:
                             uuid4().hex,
                             kind,
                             claim_id,
-                            int(event["id"]),
+                            _required_int(event["id"], "event_id"),
                             claim["statement"],
                             json.dumps(snapshot, separators=(",", ":")),
                             event["created_at"],
@@ -282,12 +290,12 @@ class InsightService:
             ).fetchone()
         if outstanding is not None:
             return None
-        topic_tokens = _tokens(topic)
+        topic_tokens = tokens(topic)
         selected = next(
             (
                 insight
                 for insight in self._eligible_queue()
-                if topic_tokens & _tokens(insight["statement_snapshot"])
+                if topic_tokens & tokens(insight["statement_snapshot"])
                 or (
                     adjacent_claim_ids is not None
                     and insight["claim_id"] in adjacent_claim_ids
@@ -611,7 +619,7 @@ def pending_insights(model: UserModel) -> list[InsightRecord]:
 
 def should_raise_now(insight: InsightRecord, topic: str) -> bool:
     """Return lexical adjacency result; semantic retrieval augments this in context."""
-    return bool(_tokens(insight["statement_snapshot"]) & _tokens(topic))
+    return bool(tokens(insight["statement_snapshot"]) & tokens(topic))
 
 
 def next_insight_for_topic(
@@ -622,7 +630,7 @@ def next_insight_for_topic(
 
 
 async def session_recap(
-    turns: list[dict[str, Any]], *, recapper: Recapper | None = None
+    turns: Sequence[Mapping[str, object]], *, recapper: Recapper | None = None
 ) -> str:
     """Generate owner-facing recap independently from internal summary."""
     if not turns:

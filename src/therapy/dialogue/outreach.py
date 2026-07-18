@@ -10,7 +10,7 @@ import logging
 import os
 import sqlite3
 import time as time_module
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Callable, Generator, Mapping
 from contextlib import contextmanager
 from datetime import UTC, datetime, time, timedelta
 from pathlib import Path
@@ -22,6 +22,7 @@ from therapy.dialogue.proactive import CHANNELS, CHECK_IN, GREETING, PUSH
 from therapy.knowledge.schema import migrate_database
 from therapy.knowledge.user_model import UserModel
 from therapy.observability.logging import emit_event
+from therapy.observability.telemetry import SpanLike
 
 type Channel = Literal["push", "greeting", "check_in", "digest"]
 type JobState = Literal[
@@ -109,6 +110,83 @@ def _matches(topic: str, boundaries: list[str]) -> bool:
     return any(boundary.casefold() in folded for boundary in boundaries)
 
 
+def _bounded_channel(channel: object) -> str:
+    """Normalize persisted channel data before it becomes a metric label."""
+    return str(channel) if channel in CHANNELS else "unknown"
+
+
+def _record_job(stage: str, channel: object) -> None:
+    """Record one content-free proactivity state transition."""
+    from therapy.observability.telemetry import record_metric
+
+    record_metric(
+        "therapy_proactivity_jobs_total",
+        1,
+        {"stage": stage, "channel": _bounded_channel(channel)},
+    )
+
+
+def _record_webpush(status_class: str) -> None:
+    """Record one bounded Web Push delivery outcome."""
+    from therapy.observability.telemetry import record_metric
+
+    record_metric(
+        "therapy_webpush_deliveries_total", 1, {"status_class": status_class}
+    )
+    record_metric("therapy_webpush_ttl_seconds", 3_600)
+
+
+def _record_active_subscriptions(count: int) -> None:
+    """Publish the current active Web Push subscription count."""
+    from therapy.observability.telemetry import record_metric
+
+    record_metric("therapy_webpush_active_subscriptions", count)
+
+
+def _record_suppression(reason: object, channel: object) -> None:
+    """Record a finite proactivity suppression without its topic or content."""
+    from therapy.observability.telemetry import record_metric
+
+    finite_reason = (
+        str(reason)
+        if reason in {"channel_disabled", "never_initiate", "nothing_due"}
+        else "unknown"
+    )
+    record_metric(
+        "therapy_proactivity_suppressions_total",
+        1,
+        {"reason": finite_reason, "channel": _bounded_channel(channel)},
+    )
+
+
+@contextmanager
+def _proactivity_span(stage: str) -> Generator[object | None, None, None]:
+    """Create one bounded child span in the non-empty scheduler batch."""
+    from therapy.observability.telemetry import broad_span
+
+    with broad_span(
+        f"proactivity.{stage}", component="proactivity", operation=stage
+    ) as span:
+        yield span
+
+
+@contextmanager
+def _proactivity_batch_span() -> Generator[SpanLike | None, None, None]:
+    """Create the detached root used only by non-empty or failed batches."""
+    from therapy.observability.context import current_trace_context
+    from therapy.observability.telemetry import link_root
+
+    parent = current_trace_context()
+    with link_root(
+        "proactivity.batch",
+        component="scheduler",
+        operation="tick",
+        parent_trace_id=parent.trace_id,
+        parent_span_id=parent.span_id,
+    ) as span:
+        yield span
+
+
 def _quiet(settings: ChannelSettings, now: datetime) -> tuple[bool, datetime | None]:
     zone = _timezone(settings["timezone"])
     local = now.astimezone(zone)
@@ -157,6 +235,13 @@ class VapidKeys:
         descriptor = os.open(self.path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         with os.fdopen(descriptor, "wb") as handle:
             handle.write(payload)
+        from therapy.observability.telemetry import record_metric
+
+        record_metric(
+            "therapy_webpush_subscription_events_total",
+            1,
+            {"event": "key_created"},
+        )
 
     def public_key(self) -> str:
         """Return URL-safe uncompressed P-256 application-server key."""
@@ -183,16 +268,53 @@ class WebPushSender:
         """Send one minimal encrypted notification with a bounded timeout."""
         from pywebpush import webpush
 
+        endpoint = subscription.get("endpoint")
+        keys = subscription.get("keys")
+        if not isinstance(endpoint, str) or not isinstance(keys, dict):
+            raise ValueError("push subscription has an invalid shape")
+        raw_keys = cast(dict[object, object], keys)
+        if not all(isinstance(key, str) for key in raw_keys):
+            raise ValueError("push subscription key names must be strings")
+        subscription_keys = cast(dict[str, object], raw_keys)
+        auth = subscription_keys.get("auth")
+        p256dh = subscription_keys.get("p256dh")
+        if not isinstance(auth, str) or not isinstance(p256dh, str):
+            raise ValueError("push subscription keys have an invalid shape")
+        subscription_info: dict[
+            str, str | bytes | dict[str, str | bytes]
+        ] = {
+            "endpoint": endpoint,
+            "keys": {"auth": auth, "p256dh": p256dh},
+        }
         self.keys.ensure()
-        webpush(
-            subscription_info=subscription,
-            data=payload,
-            vapid_private_key=str(self.keys.path),
-            vapid_claims={
-                "sub": os.getenv("THERAPY_VAPID_SUBJECT", "mailto:therapy@localhost")
-            },
-            ttl=3_600,
-            timeout=10,
+        try:
+            response = webpush(
+                subscription_info=subscription_info,
+                data=payload,
+                vapid_private_key=str(self.keys.path),
+                vapid_claims={
+                    "sub": os.getenv(
+                        "THERAPY_VAPID_SUBJECT", "mailto:therapy@localhost"
+                    )
+                },
+                ttl=3_600,
+                timeout=10,
+            )
+        except Exception as exc:
+            status_code = getattr(getattr(exc, "response", None), "status_code", None)
+            if "timeout" in type(exc).__name__.casefold():
+                status_class = "timeout"
+            elif isinstance(status_code, int) and 400 <= status_code < 500:
+                status_class = "4xx"
+            elif isinstance(status_code, int) and 500 <= status_code < 600:
+                status_class = "5xx"
+            else:
+                status_class = "invalid"
+            _record_webpush(status_class)
+            raise
+        status_code = getattr(response, "status_code", 201)
+        _record_webpush(
+            "2xx" if isinstance(status_code, int) and 200 <= status_code < 300 else "invalid"
         )
 
 
@@ -227,7 +349,7 @@ class ProactivityService:
                 )
 
     @contextmanager
-    def _connect(self) -> Iterator[sqlite3.Connection]:
+    def _connect(self) -> Generator[sqlite3.Connection, None, None]:
         connection = sqlite3.connect(self.db_path, timeout=30.0)
         connection.row_factory = sqlite3.Row
         try:
@@ -464,6 +586,9 @@ class ProactivityService:
         now = _iso(_utc_now())
         with self._connect() as connection:
             with connection:
+                existed = connection.execute(
+                    "SELECT 1 FROM push_subscriptions WHERE endpoint = ?", (endpoint,)
+                ).fetchone()
                 connection.execute(
                     """
                     INSERT INTO push_subscriptions (
@@ -474,6 +599,14 @@ class ProactivityService:
                     """,
                     (subscription_id, endpoint, p256dh, auth, now, now),
                 )
+        from therapy.observability.telemetry import record_metric
+
+        record_metric(
+            "therapy_webpush_subscription_events_total",
+            1,
+            {"event": "refreshed" if existed is not None else "created"},
+        )
+        _record_active_subscriptions(len(self._subscriptions()))
         return subscription_id
 
     def unsubscribe(self, subscription_id: str) -> bool:
@@ -484,7 +617,17 @@ class ProactivityService:
                     "UPDATE push_subscriptions SET active = 0, updated_at = ? WHERE id = ?",
                     (_iso(_utc_now()), subscription_id),
                 )
-        return cursor.rowcount > 0
+        deactivated = cursor.rowcount > 0
+        if deactivated:
+            from therapy.observability.telemetry import record_metric
+
+            record_metric(
+                "therapy_webpush_subscription_events_total",
+                1,
+                {"event": "invalidated"},
+            )
+            _record_active_subscriptions(len(self._subscriptions()))
+        return deactivated
 
     def _send_push(self) -> int:
         subscriptions = self._subscriptions()
@@ -582,45 +725,49 @@ class ProactivityService:
     def deliver(self, job_id: str, *, now: datetime | None = None) -> OutreachJob:
         """Claim and deliver one job after re-fetching every safety guard."""
         current = (now or _utc_now()).astimezone(UTC)
-        with self._connect() as connection:
-            with connection:
-                row = connection.execute(
-                    "SELECT * FROM proactivity_jobs WHERE id = ?", (job_id,)
-                ).fetchone()
-                if row is None:
-                    raise KeyError(job_id)
-                job = self._job(row)
-                ready_at = job["next_attempt_at"] or job["due_at"]
-                if (
-                    job["state"] not in {"pending", "retry"}
-                    or _parse_datetime(ready_at) > current
-                ):
-                    return job
-                cursor = connection.execute(
-                    """
-                    UPDATE proactivity_jobs SET state = 'processing',
-                        attempt_count = attempt_count + 1, updated_at = ?
-                    WHERE id = ? AND state IN ('pending','retry')
-                    """,
-                    (_iso(current), job_id),
+        with _proactivity_span("claim"):
+            with self._connect() as connection:
+                with connection:
+                    row = connection.execute(
+                        "SELECT * FROM proactivity_jobs WHERE id = ?", (job_id,)
+                    ).fetchone()
+                    if row is None:
+                        raise KeyError(job_id)
+                    job = self._job(row)
+                    ready_at = job["next_attempt_at"] or job["due_at"]
+                    if (
+                        job["state"] not in {"pending", "retry"}
+                        or _parse_datetime(ready_at) > current
+                    ):
+                        return job
+                    cursor = connection.execute(
+                        """
+                        UPDATE proactivity_jobs SET state = 'processing',
+                            attempt_count = attempt_count + 1, updated_at = ?
+                        WHERE id = ? AND state IN ('pending','retry')
+                        """,
+                        (_iso(current), job_id),
+                    )
+                    if not cursor.rowcount:
+                        return job
+        _record_job("claimed", job["channel"])
+        with _proactivity_span("guards"):
+            settings = self.channel_settings(job["channel"])
+            boundaries = self.model.never_initiate_topics()
+            quiet, allowed_at = _quiet(settings, current)
+            if not settings["enabled"]:
+                return self._finish(
+                    job_id, "suppressed", {"reason": "channel_disabled"}, current
                 )
-                if not cursor.rowcount:
-                    return job
-        settings = self.channel_settings(job["channel"])
-        boundaries = self.model.never_initiate_topics()
-        quiet, allowed_at = _quiet(settings, current)
-        if not settings["enabled"]:
-            return self._finish(
-                job_id, "suppressed", {"reason": "channel_disabled"}, current
-            )
-        if job["topic"] and _matches(job["topic"], boundaries):
-            return self._finish(
-                job_id, "suppressed", {"reason": "never_initiate"}, current
-            )
-        if quiet and allowed_at is not None:
-            return self._postpone(job_id, allowed_at, current)
+            if job["topic"] and _matches(job["topic"], boundaries):
+                return self._finish(
+                    job_id, "suppressed", {"reason": "never_initiate"}, current
+                )
+            if quiet and allowed_at is not None:
+                return self._postpone(job_id, allowed_at, current)
         try:
-            result = self._deliver_content(job, boundaries, current)
+            with _proactivity_span("delivery"):
+                result = self._deliver_content(job, boundaries, current)
             if "suppressed" in result:
                 return self._finish(
                     job_id, "suppressed", {"reason": result["suppressed"]}, current
@@ -644,100 +791,167 @@ class ProactivityService:
         result: object,
         now: datetime,
     ) -> OutreachJob:
-        with self._connect() as connection:
-            with connection:
-                connection.execute(
-                    """
-                    UPDATE proactivity_jobs SET state = ?, result_json = ?,
-                        next_attempt_at = NULL, delivered_at = ?, updated_at = ?
-                    WHERE id = ?
-                    """,
-                    (
-                        state,
-                        json.dumps(result, ensure_ascii=False, sort_keys=True),
-                        _iso(now) if state == "delivered" else None,
-                        _iso(now),
-                        job_id,
-                    ),
-                )
-                row = connection.execute(
-                    "SELECT * FROM proactivity_jobs WHERE id = ?", (job_id,)
-                ).fetchone()
-        return self._job(row)
+        with _proactivity_span("persist"):
+            with self._connect() as connection:
+                with connection:
+                    connection.execute(
+                        """
+                        UPDATE proactivity_jobs SET state = ?, result_json = ?,
+                            next_attempt_at = NULL, delivered_at = ?, updated_at = ?
+                        WHERE id = ?
+                        """,
+                        (
+                            state,
+                            json.dumps(result, ensure_ascii=False, sort_keys=True),
+                            _iso(now) if state == "delivered" else None,
+                            _iso(now),
+                            job_id,
+                        ),
+                    )
+                    row = connection.execute(
+                        "SELECT * FROM proactivity_jobs WHERE id = ?", (job_id,)
+                    ).fetchone()
+        finished = self._job(row)
+        _record_job(state, finished["channel"])
+        if state == "suppressed":
+            reason = (
+                cast(dict[object, object], result).get("reason")
+                if isinstance(result, dict)
+                else None
+            )
+            _record_suppression(reason, finished["channel"])
+        _record_job("finalized", finished["channel"])
+        return finished
 
     def _postpone(
         self, job_id: str, allowed_at: datetime, now: datetime
     ) -> OutreachJob:
-        with self._connect() as connection:
-            with connection:
-                connection.execute(
-                    """
-                    UPDATE proactivity_jobs SET state = 'retry', attempt_count = 0,
-                        next_attempt_at = ?, result_json = ?, updated_at = ? WHERE id = ?
-                    """,
-                    (
-                        _iso(allowed_at),
-                        json.dumps({"reason": "quiet_hours"}),
-                        _iso(now),
-                        job_id,
-                    ),
-                )
-                row = connection.execute(
-                    "SELECT * FROM proactivity_jobs WHERE id = ?", (job_id,)
-                ).fetchone()
-        return self._job(row)
+        with _proactivity_span("persist"):
+            with self._connect() as connection:
+                with connection:
+                    connection.execute(
+                        """
+                        UPDATE proactivity_jobs SET state = 'retry', attempt_count = 0,
+                            next_attempt_at = ?, result_json = ?, updated_at = ?
+                        WHERE id = ?
+                        """,
+                        (
+                            _iso(allowed_at),
+                            json.dumps({"reason": "quiet_hours"}),
+                            _iso(now),
+                            job_id,
+                        ),
+                    )
+                    row = connection.execute(
+                        "SELECT * FROM proactivity_jobs WHERE id = ?", (job_id,)
+                    ).fetchone()
+        postponed = self._job(row)
+        _record_job("retry", postponed["channel"])
+        return postponed
 
     def _retry_or_fail(self, job_id: str, error: str, now: datetime) -> OutreachJob:
-        with self._connect() as connection:
-            with connection:
-                row = connection.execute(
-                    "SELECT attempt_count FROM proactivity_jobs WHERE id = ?", (job_id,)
-                ).fetchone()
-                attempts = int(row["attempt_count"])
-                if attempts >= _MAX_ATTEMPTS:
-                    state: JobState = "failed"
-                    retry_at = None
-                else:
-                    state = "retry"
-                    digest = hashlib.sha256(f"{job_id}:{attempts}".encode()).digest()
-                    jitter = digest[0] % 31
-                    retry_at = _iso(
-                        now + timedelta(seconds=(2**attempts) * 30 + jitter)
+        with _proactivity_span("persist"):
+            with self._connect() as connection:
+                with connection:
+                    row = connection.execute(
+                        "SELECT attempt_count, channel FROM proactivity_jobs WHERE id = ?",
+                        (job_id,),
+                    ).fetchone()
+                    attempts = int(row["attempt_count"])
+                    if attempts >= _MAX_ATTEMPTS:
+                        state: JobState = "failed"
+                        retry_at = None
+                    else:
+                        state = "retry"
+                        digest = hashlib.sha256(f"{job_id}:{attempts}".encode()).digest()
+                        jitter = digest[0] % 31
+                        retry_at = _iso(
+                            now + timedelta(seconds=(2**attempts) * 30 + jitter)
+                        )
+                    connection.execute(
+                        """
+                        UPDATE proactivity_jobs SET state = ?, next_attempt_at = ?,
+                            result_json = ?, updated_at = ? WHERE id = ?
+                        """,
+                        (
+                            state,
+                            retry_at,
+                            json.dumps({"error": error[:500]}),
+                            _iso(now),
+                            job_id,
+                        ),
                     )
-                connection.execute(
-                    """
-                    UPDATE proactivity_jobs SET state = ?, next_attempt_at = ?,
-                        result_json = ?, updated_at = ? WHERE id = ?
-                    """,
-                    (
-                        state,
-                        retry_at,
-                        json.dumps({"error": error[:500]}),
-                        _iso(now),
-                        job_id,
-                    ),
-                )
-                updated = connection.execute(
-                    "SELECT * FROM proactivity_jobs WHERE id = ?", (job_id,)
-                ).fetchone()
-        return self._job(updated)
+                    updated = connection.execute(
+                        "SELECT * FROM proactivity_jobs WHERE id = ?", (job_id,)
+                    ).fetchone()
+        result = self._job(updated)
+        _record_job("retry" if state == "retry" else "finalized", result["channel"])
+        return result
 
     def tick(self, *, now: datetime | None = None, limit: int = 10) -> int:
         """Schedule and deliver a bounded due batch."""
         current = (now or _utc_now()).astimezone(UTC)
-        self.ensure_scheduled(current)
-        with self._connect() as connection:
-            rows = connection.execute(
-                """
-                SELECT id FROM proactivity_jobs
-                WHERE state IN ('pending','retry')
-                  AND COALESCE(next_attempt_at, due_at) <= ?
-                ORDER BY COALESCE(next_attempt_at, due_at), id LIMIT ?
-                """,
-                (_iso(current), max(1, min(limit, 100))),
-            ).fetchall()
-        for row in rows:
-            self.deliver(str(row["id"]), now=current)
+        try:
+            self.ensure_scheduled(current)
+            with self._connect() as connection:
+                rows = connection.execute(
+                    """
+                    SELECT id, channel, COALESCE(next_attempt_at, due_at) AS ready_at
+                    FROM proactivity_jobs
+                    WHERE state IN ('pending','retry')
+                      AND COALESCE(next_attempt_at, due_at) <= ?
+                    ORDER BY COALESCE(next_attempt_at, due_at), id LIMIT ?
+                    """,
+                    (_iso(current), max(1, min(limit, 100))),
+                ).fetchall()
+                queue_rows = connection.execute(
+                    """
+                    SELECT state, channel, COUNT(*) AS count
+                    FROM proactivity_jobs
+                    WHERE state IN ('pending','retry','processing')
+                    GROUP BY state, channel
+                    """
+                ).fetchall()
+            from therapy.observability.telemetry import record_metric
+
+            queue_counts = {
+                (str(row["state"]), str(row["channel"])): int(row["count"])
+                for row in queue_rows
+            }
+            for state in ("pending", "retry", "processing"):
+                for channel in CHANNELS:
+                    record_metric(
+                        "therapy_proactivity_queue_jobs",
+                        queue_counts.get((state, channel), 0),
+                        {"state": state, "channel": channel},
+                    )
+            _record_active_subscriptions(len(self._subscriptions()))
+            oldest_age = 0.0
+            for row in rows:
+                _record_job("due", row["channel"])
+                oldest_age = max(
+                    oldest_age,
+                    max(
+                        0.0,
+                        (
+                            current - _parse_datetime(str(row["ready_at"]))
+                        ).total_seconds(),
+                    ),
+                )
+            record_metric("therapy_proactivity_oldest_due_age_seconds", oldest_age)
+        except Exception as exc:
+            with _proactivity_batch_span() as span:
+                if span is not None:
+                    span.set_attribute("outcome", "error")
+                    span.set_attribute("error.type", type(exc).__name__)
+            raise
+        if not rows:
+            return 0
+        with _proactivity_batch_span() as span:
+            if span is not None:
+                span.set_attribute("count", len(rows))
+            for row in rows:
+                self.deliver(str(row["id"]), now=current)
         return len(rows)
 
     def in_app_messages(self, *, consume: bool = False) -> list[dict[str, object]]:
@@ -821,10 +1035,15 @@ class ProactivityScheduler:
 
     async def run(self) -> None:
         """Tick until application shutdown without blocking the event loop."""
+        from therapy.observability.model import WorkloadClass
+        from therapy.observability.telemetry import run_in_thread
+
         while not self._stop.is_set():
             tick_started = time_module.monotonic()
             try:
-                processed = await asyncio.to_thread(self.service.tick)
+                processed = await run_in_thread(
+                    WorkloadClass.BACKGROUND, self.service.tick
+                )
                 from therapy.observability.telemetry import record_metric
 
                 _scheduler_heartbeat["last_tick"] = time_module.time()
@@ -840,22 +1059,7 @@ class ProactivityScheduler:
                     time_module.monotonic() - tick_started,
                     {"outcome": "success"},
                 )
-                if processed:
-                    # only non-empty batches get a trace root (obs plan
-                    # O2.2/O2.3: empty ticks are metric-only, never spans)
-                    from therapy.observability.context import current_trace_context
-                    from therapy.observability.telemetry import link_root
-
-                    parent = current_trace_context()
-                    with link_root(
-                        "proactivity.batch",
-                        component="scheduler",
-                        operation="tick",
-                        parent_trace_id=parent.trace_id,
-                        parent_span_id=parent.span_id,
-                    ) as span:
-                        if span is not None:
-                            span.set_attribute("count", processed)
+                del processed  # non-empty roots and children are owned by tick().
             except Exception as exc:
                 from therapy.observability.telemetry import record_metric
 

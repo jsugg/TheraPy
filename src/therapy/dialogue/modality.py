@@ -24,6 +24,11 @@ class ReplyModality:
             return self._override
         return self._last_input == VOICE
 
+    @property
+    def last_input(self) -> str:
+        """Return the finite modality of the most recent accepted user turn."""
+        return self._last_input
+
     @staticmethod
     def _transition(outcome: str) -> None:
         """Finite modality transition evidence (plan O3.2) — state change only."""

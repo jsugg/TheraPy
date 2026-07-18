@@ -14,13 +14,78 @@ from __future__ import annotations
 
 import logging
 import threading
+import time
+from collections.abc import Callable, Generator, Mapping
+from contextlib import AbstractContextManager, contextmanager
 from dataclasses import dataclass, field
-from typing import Any
+from typing import TYPE_CHECKING, Protocol, cast, runtime_checkable
 
 from therapy.observability.config import ObservabilityConfig
 from therapy.observability.logging import emit_event
-from therapy.observability.model import TelemetryPlane
+from therapy.observability.model import TelemetryPlane, WorkloadClass
 from therapy.observability.routing import classify_scope, scrub_broad_attributes
+
+if TYPE_CHECKING:
+    import httpx
+    from opentelemetry.sdk.resources import Resource
+    from opentelemetry.sdk.trace import SpanProcessor
+    from opentelemetry.trace import StatusCode
+
+    from therapy.observability.journal import LoadedInteraction
+
+
+class SpanLike(Protocol):
+    """The small span surface exposed to workflow modules."""
+
+    def set_attribute(self, key: str, value: str | bool | int | float) -> None:
+        """Set one already-scrubbed finite attribute."""
+        ...
+
+
+@runtime_checkable
+class _SpanProcessorLike(Protocol):
+    """Runtime-validated processor surface used by the optional OTel SDK."""
+
+    def on_start(self, span: object, parent_context: object | None = None) -> None: ...
+
+    def on_end(self, span: object) -> None: ...
+
+    def shutdown(self) -> None: ...
+
+    def force_flush(self, timeout_millis: int = 30000) -> bool: ...
+
+
+@runtime_checkable
+class _InstrumentationScopeLike(Protocol):
+    """Minimal instrumentation-scope surface used for default-deny routing."""
+
+    name: str
+
+
+@runtime_checkable
+class _ReadableSpanLike(Protocol):
+    """Runtime span envelope required before broad-plane scrubbing."""
+
+    instrumentation_scope: object
+    attributes: Mapping[str, object] | None
+    status: object
+
+
+@runtime_checkable
+class _StatusLike(Protocol):
+    """Status fields retained while dropping free-form descriptions."""
+
+    status_code: object
+    description: str | None
+
+
+def _processor(value: object | None) -> _SpanProcessorLike | None:
+    """Validate an optional SDK processor at the integration boundary."""
+    if value is None:
+        return None
+    if not isinstance(value, _SpanProcessorLike):
+        raise TypeError("OTel processor does not satisfy the required contract")
+    return value
 
 
 @dataclass
@@ -28,13 +93,15 @@ class TelemetryState:
     enabled: bool = False
     provider: object | None = None
     meter_provider: object | None = None
-    instruments: dict[str, object] = field(default_factory=dict)
+    instruments: dict[str, object] = field(default_factory=lambda: {})
     dropped_unknown_scopes: int = 0
     dropped_forbidden_keys: int = 0
-    _lock: threading.Lock = field(default_factory=threading.Lock)
+    lock: threading.Lock = field(default_factory=threading.Lock)
 
 
 _state = TelemetryState()
+_executor_lock = threading.Lock()
+_executor_active: dict[WorkloadClass, int] = {}
 
 
 def state() -> TelemetryState:
@@ -132,11 +199,10 @@ def initialize(config: ObservabilityConfig, *, service_version: str) -> bool:
             max_export_batch_size=256,
         )
 
-    provider.add_span_processor(
-        PlaneRoutingSpanProcessor(
-            broad=broad_processor, restricted=restricted_processor
-        )
+    routing = PlaneRoutingSpanProcessor(
+        broad=broad_processor, restricted=restricted_processor
     )
+    provider.add_span_processor(cast("SpanProcessor", routing))
     trace.set_tracer_provider(provider)
     _state.enabled = True
     _state.provider = provider
@@ -146,7 +212,7 @@ def initialize(config: ObservabilityConfig, *, service_version: str) -> bool:
     return True
 
 
-def _initialize_metrics(config: ObservabilityConfig, resource) -> None:
+def _initialize_metrics(config: ObservabilityConfig, resource: Resource) -> None:
     """Meter provider + every §8 instrument from the frozen manifest."""
     if not config.otlp_broad_endpoint:
         return
@@ -196,26 +262,29 @@ def record_metric(name: str, value: float, attributes: dict[str, str] | None = N
     from therapy.observability.metrics import INSTRUMENT_INDEX
 
     spec = INSTRUMENT_INDEX.get(name)
+    if spec is None:
+        return
+    supplied = attributes or {}
     clean: dict[str, str] = {}
-    for key, raw in (attributes or {}).items():
-        if spec is None or key not in spec.attributes:
-            with _state._lock:
+    undeclared_count = len(supplied.keys() - spec.attributes.keys())
+    if undeclared_count:
+        with _state.lock:
+            _state.dropped_forbidden_keys += undeclared_count
+    for key, allowed in spec.attributes.items():
+        raw = supplied.get(key)
+        if raw is None:
+            with _state.lock:
                 _state.dropped_forbidden_keys += 1
-            continue
-        allowed = spec.attributes[key]
+            return
         text = str(raw)
-        if allowed is not None:
-            clean[key] = text if text in allowed else "unknown"
+        if text in allowed:
+            clean[key] = text
+        elif "unknown" in allowed:
+            clean[key] = "unknown"
         else:
-            # bounded-enum dimension: shape-guard hostile/free input so a
-            # typo or env-injected value can never mint a label (audit H-02)
-            import re as _re
-
-            clean[key] = (
-                text
-                if _re.fullmatch(r"[a-z0-9_.-]{1,32}", text)
-                else "unknown"
-            )
+            with _state.lock:
+                _state.dropped_forbidden_keys += 1
+            return
     add = getattr(instrument, "add", None)
     if callable(add):
         add(value, clean)
@@ -227,6 +296,54 @@ def record_metric(name: str, value: float, attributes: dict[str, str] | None = N
     set_value = getattr(instrument, "set", None)
     if callable(set_value):
         set_value(value, clean)
+
+
+async def run_in_thread[**P, R](
+    workload_class: WorkloadClass,
+    func: Callable[P, R],
+    /,
+    *args: P.args,
+    **kwargs: P.kwargs,
+) -> R:
+    """Run blocking work with bounded executor queue/active/completion evidence."""
+    import asyncio
+
+    queued_at = time.monotonic()
+
+    def invoke() -> R:
+        started_at = time.monotonic()
+        dimensions = {"workload_class": workload_class.value}
+        record_metric(
+            "therapy_executor_queue_wait_seconds", started_at - queued_at, dimensions
+        )
+        with _executor_lock:
+            active = _executor_active.get(workload_class, 0) + 1
+            _executor_active[workload_class] = active
+        record_metric("therapy_executor_active", active, dimensions)
+        outcome = "success"
+        try:
+            return func(*args, **kwargs)
+        except BaseException:
+            outcome = "error"
+            raise
+        finally:
+            elapsed = time.monotonic() - started_at
+            with _executor_lock:
+                remaining = max(0, _executor_active.get(workload_class, 1) - 1)
+                _executor_active[workload_class] = remaining
+            record_metric("therapy_executor_active", remaining, dimensions)
+            record_metric(
+                "therapy_executor_completed_total",
+                1,
+                {**dimensions, "outcome": outcome},
+            )
+            record_metric(
+                "therapy_executor_task_seconds",
+                elapsed,
+                {**dimensions, "outcome": outcome},
+            )
+
+    return await asyncio.to_thread(invoke)
 
 
 def _instrument_fastapi() -> None:
@@ -243,9 +360,10 @@ def _instrument_fastapi() -> None:
     except ImportError:
         return
 
-    def _server_request_hook(span, scope: dict) -> None:
+    def _server_request_hook(span: SpanLike, scope: dict[str, object]) -> None:
         # strip concrete-target attributes at the source; the routing scrub
         # is the second, default-deny line of defense
+        del scope
         for key in ("url.query", "url.full", "http.target", "client.address",
                     "client.port", "user_agent.original"):
             try:
@@ -294,7 +412,9 @@ def _instrument_system_metrics() -> None:
         )
 
 
-def instrumented_async_client(destination: str, **kwargs):
+def instrumented_async_client(
+    destination: str, *, timeout: httpx.Timeout | float = 5.0
+) -> httpx.AsyncClient:
     """An httpx.AsyncClient for ONE audited outbound destination.
 
     Never global instrumentation (plan O2.1 item 3): each owned wrapper
@@ -315,13 +435,44 @@ def instrumented_async_client(destination: str, **kwargs):
             outcome="rejected",
             rate_limited=True,
         )
-    client = httpx.AsyncClient(**kwargs)
+    client = httpx.AsyncClient(timeout=timeout)
+
+    async def _owned_request(request: httpx.Request) -> None:
+        request.extensions["therapy.started_at"] = time.monotonic()
+
+    async def _owned_response(response: httpx.Response) -> None:
+        started = response.request.extensions.pop("therapy.started_at", None)
+        elapsed = (
+            time.monotonic() - started if isinstance(started, float) else 0.0
+        )
+        status_class = (
+            f"{response.status_code // 100}xx"
+            if 200 <= response.status_code < 600
+            else "none"
+        )
+        outcome = (
+            "success" if 200 <= response.status_code < 400 else "error"
+        )
+        _record_outbound_result(
+            destination=label.value,
+            operation=response.request.method.casefold(),
+            status_class=status_class,
+            tls=response.request.url.scheme.casefold() == "https",
+            outcome=outcome,
+            elapsed=elapsed,
+            request_bytes=_content_length(response.request.headers),
+            response_bytes=_content_length(response.headers),
+        )
+
+    client.event_hooks["request"].append(_owned_request)
+    client.event_hooks["response"].append(_owned_response)
     if not _state.enabled:
         return client
     try:
         from opentelemetry.instrumentation.httpx import HTTPXClientInstrumentor
 
-        def _request_hook(span, request) -> None:
+        def _request_hook(span: SpanLike, request: object) -> None:
+            del request
             span.set_attribute("therapy.destination", label.value)
             for key in ("url.full", "url.query", "http.url"):
                 try:
@@ -335,6 +486,99 @@ def instrumented_async_client(destination: str, **kwargs):
     except ImportError:
         pass
     return client
+
+
+def _content_length(headers: object) -> int | None:
+    """Return one bounded HTTP content length without retaining headers."""
+    getter = getattr(headers, "get", None)
+    if not callable(getter):
+        return None
+    raw = getter("content-length")
+    if not isinstance(raw, str | int):
+        return None
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return None
+    return value if 0 <= value <= 1_000_000_000_000 else None
+
+
+def _record_outbound_result(
+    *,
+    destination: str,
+    operation: str,
+    status_class: str,
+    tls: bool,
+    outcome: str,
+    elapsed: float,
+    request_bytes: int | None = None,
+    response_bytes: int | None = None,
+) -> None:
+    """Record one owned outbound request using only finite content-free fields."""
+    finite_operation = (
+        operation
+        if operation in {"get", "post", "put", "patch", "delete", "head", "options"}
+        else "other"
+    )
+    dimensions = {
+        "destination": destination,
+        "operation": finite_operation,
+        "outcome": outcome,
+    }
+    record_metric(
+        "therapy_outbound_requests_total",
+        1,
+        {
+            **dimensions,
+            "status_class": status_class,
+            "tls": str(tls).lower(),
+        },
+    )
+    record_metric("therapy_outbound_request_seconds", elapsed, dimensions)
+    for direction, byte_count in (
+        ("request", request_bytes),
+        ("response", response_bytes),
+    ):
+        if byte_count is not None:
+            record_metric(
+                "therapy_outbound_bytes",
+                byte_count,
+                {"destination": destination, "direction": direction},
+            )
+
+
+def record_outbound_retry_count(destination: str, count: int) -> None:
+    """Record retries for one logical owned outbound request."""
+    from therapy.observability.model import Destination, normalize_enum
+
+    label = normalize_enum(destination, Destination, Destination.UNKNOWN)
+    record_metric(
+        "therapy_outbound_retry_count",
+        max(0, count),
+        {"destination": label.value},
+    )
+
+
+def record_outbound_failure(
+    destination: str,
+    operation: str,
+    *,
+    tls: bool,
+    started_at: float,
+    timed_out: bool,
+) -> None:
+    """Record a transport failure that has no HTTP response hook."""
+    from therapy.observability.model import Destination, normalize_enum
+
+    label = normalize_enum(destination, Destination, Destination.UNKNOWN)
+    _record_outbound_result(
+        destination=label.value,
+        operation=operation,
+        status_class="none",
+        tls=tls,
+        outcome="timeout" if timed_out else "error",
+        elapsed=max(0.0, time.monotonic() - started_at),
+    )
 
 
 def storage_operation(component: str, operation: str):
@@ -352,7 +596,10 @@ def storage_operation(component: str, operation: str):
         started = _time.monotonic()
         outcome = "success"
         try:
-            yield
+            with broad_span(
+                "db.operation", component=component, operation=operation
+            ):
+                yield
         except _sqlite3.OperationalError as exc:
             outcome = "error"
             if "locked" in str(exc).lower() or "busy" in str(exc).lower():
@@ -379,12 +626,37 @@ def storage_operation(component: str, operation: str):
     return _instrumented()
 
 
-def broad_span(name: str, *, component: str, operation: str):
-    """Owned broad span helper: records status once, scope `therapy.broad`."""
-    from contextlib import contextmanager
+def record_storage_result(component: str, operation: str, result: object) -> None:
+    """Record only a result-size bucket for one successful storage operation."""
+    from collections.abc import Sized
 
+    from therapy.observability.model import count_bucket
+
+    if result is None:
+        count = 0
+    elif isinstance(result, bool):
+        count = int(result)
+    elif isinstance(result, Sized) and not isinstance(result, (str, bytes, bytearray)):
+        count = len(result)
+    else:
+        count = 1
+    record_metric(
+        "therapy_storage_result_rows_total",
+        1,
+        {
+            "component": component,
+            "operation": operation,
+            "bucket": count_bucket(count),
+        },
+    )
+
+
+def broad_span(
+    name: str, *, component: str, operation: str
+) -> AbstractContextManager[SpanLike | None]:
+    """Owned broad span helper: records status once, scope `therapy.broad`."""
     @contextmanager
-    def _noop():
+    def _noop() -> Generator[SpanLike | None, None, None]:
         yield None
 
     if not _state.enabled:
@@ -399,14 +671,18 @@ def broad_span(name: str, *, component: str, operation: str):
     return span_cm
 
 
-def link_root(name: str, *, component: str, operation: str, parent_trace_id: str,
-              parent_span_id: str):
+def link_root(
+    name: str,
+    *,
+    component: str,
+    operation: str,
+    parent_trace_id: str,
+    parent_span_id: str,
+) -> AbstractContextManager[SpanLike | None]:
     """A NEW trace root LINKED to its trigger (detached finalizers/batches);
     never a multi-hour parent span (plan O2.1 item 4, O2.2)."""
-    from contextlib import contextmanager
-
     @contextmanager
-    def _noop():
+    def _noop() -> Generator[SpanLike | None, None, None]:
         yield None
 
     if not _state.enabled:
@@ -476,34 +752,40 @@ class PlaneRoutingSpanProcessor:
     importable without the SDK.
     """
 
-    def __init__(self, broad: Any | None, restricted: Any | None) -> None:
-        self._broad = broad
-        self._restricted = restricted
+    def __init__(self, broad: object | None, restricted: object | None) -> None:
+        self._broad = _processor(broad)
+        self._restricted = _processor(restricted)
 
-    def on_start(self, span, parent_context=None) -> None:
+    def on_start(self, span: object, parent_context: object | None = None) -> None:
         for processor in (self._broad, self._restricted):
             if processor is not None:
                 processor.on_start(span, parent_context)
 
-    def on_ending(self, span) -> None:
+    def on_ending(self, span: object) -> None:
         """SDK >=1.4x pre-end hook; routing happens in on_end."""
+        del span
 
     # the SDK's synchronous multiplexer calls the private name directly
-    _on_ending = on_ending
+    def _on_ending(self, span: object) -> None:
+        self.on_ending(span)
 
-    def on_end(self, span) -> None:
-        scope = getattr(span, "instrumentation_scope", None)
-        plane = classify_scope(getattr(scope, "name", None))
+    def on_end(self, span: object) -> None:
+        readable = span if isinstance(span, _ReadableSpanLike) else None
+        scope = readable.instrumentation_scope if readable is not None else None
+        scope_name = scope.name if isinstance(scope, _InstrumentationScopeLike) else None
+        plane = classify_scope(scope_name)
         if plane is TelemetryPlane.RESTRICTED:
             if self._restricted is not None:
                 self._restricted.on_end(span)
             return
         if plane is TelemetryPlane.BROAD:
             if self._broad is not None:
-                attributes = dict(span.attributes or {})
+                if readable is None:
+                    raise TypeError("broad OTel span does not satisfy the read contract")
+                attributes = dict(readable.attributes or {})
                 result = scrub_broad_attributes(attributes)
                 if result.dropped_keys:
-                    with _state._lock:
+                    with _state.lock:
                         _state.dropped_forbidden_keys += len(result.dropped_keys)
                     record_metric(
                         "therapy_broad_span_drops_total",
@@ -523,9 +805,9 @@ class PlaneRoutingSpanProcessor:
                 # C-01): denylisted attributes gone, span events (exception
                 # message/stack carriers) dropped, status description
                 # stripped to its code.
-                self._broad.on_end(_ScrubbedSpanView(span, result.attributes))
+                self._broad.on_end(_ScrubbedSpanView(readable, result.attributes))
             return
-        with _state._lock:
+        with _state.lock:
             _state.dropped_unknown_scopes += 1
         record_metric(
             "therapy_broad_span_drops_total", 1, {"reason": "unknown_scope"}
@@ -596,15 +878,16 @@ class PhoenixInteractionExporter:
             endpoint=f"{endpoint}/v1/traces", timeout=timeout
         )
 
-    async def export(self, interaction: dict) -> str | None:
-        import asyncio
+    async def export(self, interaction: LoadedInteraction) -> str | None:
+        return await run_in_thread(
+            WorkloadClass.BACKGROUND, self._export_sync, interaction
+        )
 
-        return await asyncio.to_thread(self._export_sync, interaction)
-
-    def _export_sync(self, payload: dict) -> str:
+    def _export_sync(self, payload: LoadedInteraction) -> str:
         import json as _json
         from datetime import datetime
 
+        from opentelemetry.sdk.trace import ReadableSpan
         from opentelemetry.sdk.trace.export import SpanExportResult
         from opentelemetry.trace import SpanKind
 
@@ -621,8 +904,8 @@ class PhoenixInteractionExporter:
         self._id_generator.next_trace_id = int(row["trace_id"], 16)
         self._id_generator.next_span_id = int(row["span_id"], 16)
 
-        envelope = {
-            "interaction": {k: row[k] for k in row.keys()},
+        envelope: dict[str, object] = {
+            "interaction": row,
             "events": events,
         }
         attributes = {
@@ -646,7 +929,9 @@ class PhoenixInteractionExporter:
             start_time=_ns(row["started_at"]) or None,
         )
         span.end(_ns(row["completed_at"] or row["updated_at"]) or None)
-        result = self._exporter.export([span])  # type: ignore[list-item]
+        if not isinstance(span, ReadableSpan):
+            raise ExportError("owned tracer did not return an SDK readable span")
+        result = self._exporter.export([span])
         if result is not SpanExportResult.SUCCESS:
             raise ExportError("phoenix OTLP export failed")
         return row["span_id"]
@@ -657,7 +942,9 @@ _LOCAL_HOSTS = frozenset(
 )
 
 
-def make_interaction_exporter(config: ObservabilityConfig):
+def make_interaction_exporter(
+    config: ObservabilityConfig,
+) -> PhoenixInteractionExporter | None:
     """The single selected backend adapter, or None for journal-only."""
     if config.interaction_backend != "phoenix":
         return None
@@ -703,16 +990,20 @@ class _ScrubbedSpanView:
 
     __slots__ = ("_span", "_attributes", "_status")
 
-    def __init__(self, span, attributes: dict[str, object]) -> None:
+    def __init__(
+        self, span: _ReadableSpanLike, attributes: dict[str, object]
+    ) -> None:
         self._span = span
         self._attributes = attributes
-        status = getattr(span, "status", None)
+        status = span.status
         self._status = status
-        if status is not None and getattr(status, "description", None):
+        if isinstance(status, _StatusLike) and status.description:
             try:
                 from opentelemetry.trace.status import Status
 
-                self._status = Status(status_code=status.status_code)
+                self._status = Status(
+                    status_code=cast("StatusCode", status.status_code)
+                )
             except Exception:
                 pass
 
@@ -721,12 +1012,12 @@ class _ScrubbedSpanView:
         return self._attributes
 
     @property
-    def events(self) -> tuple:
+    def events(self) -> tuple[()]:
         return ()
 
     @property
-    def status(self):
+    def status(self) -> object:
         return self._status
 
-    def __getattr__(self, name: str):
+    def __getattr__(self, name: str) -> object:
         return getattr(self._span, name)

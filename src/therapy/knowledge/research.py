@@ -11,23 +11,23 @@ import re
 import shutil
 import sqlite3
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Generator
 from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Literal, TypedDict
+from typing import Literal, ParamSpec, TypedDict, TypeVar
 from uuid import uuid4
 
 import numpy as np
 
 from therapy.knowledge.embeddings import EmbeddingBackend, FastEmbedBackend
 from therapy.knowledge.research_ingest import (
-    _SUPPORTED_EXTENSIONS,
+    SUPPORTED_EXTENSIONS,
     ExtractedSource,
     OCRBackend,
     SourceBlock,
-    _validate_input,
     extract_source,
+    validate_input,
 )
 from therapy.knowledge.schema import migrate_database
 
@@ -44,6 +44,9 @@ type ResearchStage = Literal[
 type ResearchOutcome = Literal["success", "error", "timeout", "rejected"]
 type DivergenceKind = Literal["db_without_file", "file_without_db"]
 type ArtifactOperation = Literal["write", "delete"]
+
+_P = ParamSpec("_P")
+_R = TypeVar("_R")
 
 
 def _record_metric(name: str, value: float, attributes: dict[str, str]) -> None:
@@ -63,7 +66,7 @@ def _exception_outcome(error: BaseException) -> ResearchOutcome:
 
 
 @contextmanager
-def _research_stage(stage: ResearchStage) -> Iterator[None]:
+def _research_stage(stage: ResearchStage) -> Generator[None, None, None]:
     """Time one content-free research stage with a finite outcome."""
     started = time.monotonic()
     outcome: ResearchOutcome = "success"
@@ -82,7 +85,7 @@ def _research_stage(stage: ResearchStage) -> Iterator[None]:
 
 def _source_format(filename: str) -> str:
     """Map a filename to a finite format without exposing the filename."""
-    return _SUPPORTED_EXTENSIONS.get(Path(filename).suffix.casefold(), "unknown")
+    return SUPPORTED_EXTENSIONS.get(Path(filename).suffix.casefold(), "unknown")
 
 
 def _record_divergence(
@@ -108,22 +111,24 @@ def _record_divergence(
     )
 
 
-def _traced_storage(component: str, operation: str):
+def _traced_storage(
+    component: str, operation: str
+) -> Callable[[Callable[_P, _R]], Callable[_P, _R]]:
     """Bounded db.operation instrumentation (obs plan O3.3); no SQL/paths."""
     import functools
 
-    def decorate(func):
+    def decorate(func: Callable[_P, _R]) -> Callable[_P, _R]:
         @functools.wraps(func)
-        def wrapper(*args, **kwargs):
-            from therapy.observability.telemetry import broad_span, storage_operation
+        def wrapper(*args: _P.args, **kwargs: _P.kwargs) -> _R:
+            from therapy.observability.telemetry import (
+                record_storage_result,
+                storage_operation,
+            )
 
-            with broad_span(
-                f"{component}.{operation}",
-                component=component,
-                operation=operation,
-            ):
-                with storage_operation(component, operation):
-                    return func(*args, **kwargs)
+            with storage_operation(component, operation):
+                result = func(*args, **kwargs)
+            record_storage_result(component, operation, result)
+            return result
 
         return wrapper
 
@@ -216,7 +221,7 @@ class ResearchKB:
         self.embedder = embedder or FastEmbedBackend(self.data_dir)
 
     @contextmanager
-    def _connect(self) -> Iterator[sqlite3.Connection]:
+    def _connect(self) -> Generator[sqlite3.Connection, None, None]:
         connection = sqlite3.connect(self.db_path, timeout=30.0)
         connection.row_factory = sqlite3.Row
         try:
@@ -283,8 +288,11 @@ class ResearchKB:
         ocr_backend: OCRBackend | None = None,
     ) -> IngestResult:
         """Validate, extract/OCR, preserve, and semantically index one source."""
+        started = time.monotonic()
         outcome: ResearchOutcome = "success"
         deduplicated = False
+        result: IngestResult | None = None
+        source_format = _source_format(filename)
         try:
             result = self._ingest_bytes(
                 data,
@@ -305,11 +313,28 @@ class ResearchKB:
                 "therapy_research_ingests_total",
                 1,
                 {
-                    "format": _source_format(filename),
+                    "format": source_format,
                     "outcome": outcome,
                     "deduplicated": str(deduplicated).lower(),
                 },
             )
+            _record_metric(
+                "therapy_research_ingest_seconds",
+                time.monotonic() - started,
+                {"format": source_format, "outcome": outcome},
+            )
+            _record_metric(
+                "therapy_research_source_bytes", len(data), {"format": source_format}
+            )
+            if result is not None:
+                _record_metric(
+                    "therapy_research_blocks", result["blocks"], {"kind": "total"}
+                )
+                _record_metric(
+                    "therapy_research_blocks",
+                    result["review_blocks"],
+                    {"kind": "review"},
+                )
 
     def _ingest_bytes(
         self,
@@ -327,7 +352,7 @@ class ResearchKB:
                 source_title or Path(filename).stem,
                 source_ref or filename,
             )
-            _validate_input(data, filename, declared_type)
+            validate_input(data, filename, declared_type)
         digest = hashlib.sha256(data).hexdigest()
         duplicate: IngestResult | None = None
         with _research_stage("db"):
@@ -363,6 +388,11 @@ class ResearchKB:
                 declared_type,
                 ocr_backend=ocr_backend,
             )
+        _record_metric(
+            "therapy_research_pages",
+            len({block.page for block in extracted.blocks if block.page is not None}),
+            {"format": extracted.format},
+        )
         artifact = self._write_artifact(digest, filename, data)
         now = _utc_now()
         try:
@@ -527,6 +557,7 @@ class ResearchKB:
             )
             params = (document_id,) if document_id is not None else ()
             doc_ids = [int(row["id"]) for row in connection.execute(query, params)]
+        _record_metric("therapy_research_reindex_documents", len(doc_ids), {})
         indexed = 0
         for doc_id in doc_ids:
             from therapy.observability.telemetry import broad_span
@@ -559,6 +590,19 @@ class ResearchKB:
                         "research.excluded_review_count",
                         sum(int(row["needs_review"]) for row in rows),
                     )
+                _record_metric(
+                    "therapy_research_reindex_blocks", len(rows), {"kind": "total"}
+                )
+                _record_metric(
+                    "therapy_research_reindex_blocks",
+                    len(items),
+                    {"kind": "indexed"},
+                )
+                _record_metric(
+                    "therapy_research_reindex_blocks",
+                    sum(int(row["needs_review"]) for row in rows),
+                    {"kind": "review_excluded"},
+                )
                 with _research_stage("embed"):
                     vectors = self.embedder.embed_documents([item[3] for item in items])
                     if len(vectors) != len(items):
@@ -643,8 +687,11 @@ class ResearchKB:
                     CHUNK_POLICY_VERSION,
                 ),
             ).fetchall()
+        _record_metric("therapy_research_unindexed_documents", len(stale), {})
         for row in stale:
             self.reindex(int(row["id"]))
+        if stale:
+            _record_metric("therapy_research_unindexed_documents", 0, {})
 
     @_traced_storage("research", "query")
     def query(
@@ -655,6 +702,7 @@ class ResearchKB:
         threshold: float = DEFAULT_RELEVANCE_THRESHOLD,
     ) -> list[SearchResult]:
         """Return bounded multilingual semantic results above relevance floor."""
+        started = time.monotonic()
         outcome = "error"
         try:
             results = self._query(text, k, threshold=threshold)
@@ -662,6 +710,11 @@ class ResearchKB:
             return results
         finally:
             _record_metric("therapy_research_queries_total", 1, {"outcome": outcome})
+            _record_metric(
+                "therapy_research_query_seconds",
+                time.monotonic() - started,
+                {"outcome": outcome},
+            )
 
     def _query(
         self,
@@ -705,6 +758,7 @@ class ResearchKB:
                         CHUNK_POLICY_VERSION,
                     ),
                 ).fetchall()
+            _record_metric("therapy_research_query_candidates", len(rows), {})
             scored: list[tuple[float, sqlite3.Row]] = []
             query_norm = float(np.linalg.norm(query_vector))
             for row in rows:
@@ -726,7 +780,7 @@ class ResearchKB:
                     str(item[1]["anchor"]),
                 )
             )
-            return [
+            results = [
                 SearchResult(
                     document_id=int(row["doc_id"]),
                     text=str(row["text"]),
@@ -747,6 +801,12 @@ class ResearchKB:
                 )
                 for score, row in scored[:k]
             ]
+            _record_metric("therapy_research_query_results", len(results), {})
+            if results:
+                _record_metric(
+                    "therapy_research_query_top_score", results[0]["score"], {}
+                )
+            return results
 
     def ground(self, topic: str) -> str | None:
         """Return one labeled untrusted passage for silent technique grounding."""
@@ -940,7 +1000,10 @@ class ResearchKB:
         """Export corpus metadata, blocks, and preserved source artifacts."""
         documents: list[dict[str, object]] = []
         for summary in self.documents():
-            document = self.document(int(summary["id"]))
+            summary_id = summary["id"]
+            if isinstance(summary_id, bool) or not isinstance(summary_id, int):
+                raise RuntimeError("research document id is not an integer")
+            document = self.document(summary_id)
             if document is None:
                 continue
             artifact_path = document.get("artifact_path")

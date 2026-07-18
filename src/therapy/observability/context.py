@@ -63,6 +63,11 @@ def current_trace_context() -> TraceContext:
     return context
 
 
+def active_trace_context() -> TraceContext | None:
+    """Return the active context without creating a new trace root."""
+    return _current.get()
+
+
 def current_interaction_id() -> str | None:
     return _current_interaction.get()
 

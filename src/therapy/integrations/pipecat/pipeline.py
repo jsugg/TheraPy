@@ -39,20 +39,25 @@ user model in context (older history never verbatim). On disconnect the
 session is summarized and distilled in the background.
 """
 
+from __future__ import annotations
+
 import asyncio
 import logging
 import os
 import time
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Protocol, cast
 
 import numpy as np
+from numpy.typing import NDArray
 from pipecat.audio.vad.silero import SileroVADAnalyzer
 from pipecat.audio.vad.vad_analyzer import VADParams
 from pipecat.frames.frames import (
     BotStartedSpeakingFrame,
     BotStoppedSpeakingFrame,
+    CancelFrame,
+    EndFrame,
     Frame,
     InputAudioRawFrame,
     LLMConfigureOutputFrame,
@@ -70,9 +75,9 @@ from pipecat.frames.frames import (
     UserStoppedSpeakingFrame,
 )
 from pipecat.pipeline.pipeline import Pipeline
-from pipecat.pipeline.runner import PipelineRunner
-from pipecat.pipeline.task import PipelineParams, PipelineTask
-from pipecat.processors.aggregators.llm_context import LLMContext
+from pipecat.pipeline.runner import WorkerRunner
+from pipecat.pipeline.worker import PipelineParams, PipelineWorker
+from pipecat.processors.aggregators.llm_context import LLMContext, LLMContextMessage
 from pipecat.processors.aggregators.llm_response_universal import (
     LLMContextAggregatorPair,
 )
@@ -106,9 +111,12 @@ from therapy.knowledge.context import ContextAssembler, replace_longitudinal_con
 from therapy.knowledge.insight import session_recap
 from therapy.knowledge.user_model import UserModel
 from therapy.memory import MemoryStore, make_summarizer
-from therapy.memory.store import resume_window_secs
+from therapy.memory.store import RowDict, resume_window_secs
 from therapy.memory.summarizer import entitle
+from therapy.observability.interactions import JsonValue, require_json_object
 from therapy.observability.logging import emit_event
+from therapy.observability.model import WorkloadClass
+from therapy.observability.telemetry import run_in_thread
 from therapy.perception.stt import (
     DEFAULT_LANGUAGE,
     clamp_language,
@@ -121,12 +129,15 @@ from therapy.server import live
 from therapy.server.protocol import presence_message, session_state_message
 from therapy.speech.tts import voice_for
 
+if TYPE_CHECKING:
+    from faster_whisper import WhisperModel
+
 logger = logging.getLogger(__name__)
 
 LANGUAGE_ENUM = {"en": Language.EN, "es": Language.ES, "pt": Language.PT}
 
 # Shared across connections — see MultilingualWhisperSTTService._load.
-_whisper_model: Any = None
+_whisper_model: WhisperModel | None = None
 
 # Reconnect-resume coordination (SPEC §8). A dropped connection schedules
 # finalization, but the same client usually reconnects seconds later — the
@@ -135,12 +146,80 @@ _whisper_model: Any = None
 # (live.py ownership tokens; only the current owner may close a session).
 _finalizers: dict[str, asyncio.Task[None]] = {}
 
-type SessionTurns = list[dict[str, object]]
+type SessionTurns = Sequence[Mapping[str, object]]
 type SummaryGenerator = Callable[[SessionTurns], Awaitable[str]]
 type DistillationGenerator = Callable[
     [UserModel, SessionTurns, str], Awaitable[knowledge_distill.DistillResult]
 ]
-type TextArtifactGenerator = Callable[[SessionTurns], Awaitable[str]]
+type TextArtifactGenerator = Callable[[SessionTurns], Awaitable[str | None]]
+
+
+class _FrameProcessorInitializer(Protocol):
+    """Typed constructor seam for Pipecat's partially annotated processor."""
+
+    def __call__(self, processor: FrameProcessor) -> None: ...
+
+
+class _WhisperInitializer(Protocol):
+    """Typed constructor seam for the pinned Whisper service."""
+
+    def __call__(
+        self,
+        service: WhisperSTTService,
+        *,
+        settings: WhisperSTTSettings,
+    ) -> None: ...
+
+
+def _runtime_value(value: object) -> object:
+    """Erase incomplete third-party hints before runtime boundary checks."""
+    return value
+
+
+def _initialize_frame_processor(processor: FrameProcessor) -> None:
+    """Invoke the validated no-argument FrameProcessor constructor."""
+    initializer = vars(FrameProcessor).get("__init__")
+    if not callable(initializer):
+        raise TypeError("Pipecat FrameProcessor constructor is not callable")
+    cast(_FrameProcessorInitializer, initializer)(processor)
+
+
+def _initialize_whisper_service(service: WhisperSTTService) -> None:
+    """Initialize the pinned Whisper service through a typed boundary."""
+    initializer = vars(WhisperSTTService).get("__init__")
+    if not callable(initializer):
+        raise TypeError("Pipecat Whisper constructor is not callable")
+    cast(_WhisperInitializer, initializer)(
+        service,
+        settings=WhisperSTTSettings(model=whisper_model(), language=Language.EN),
+    )
+
+
+def _object_mapping(value: object) -> dict[str, object] | None:
+    """Narrow a third-party mapping after validating every key type."""
+    if not isinstance(value, dict):
+        return None
+    raw = cast(dict[object, object], value)
+    if not all(isinstance(key, str) for key in raw):
+        return None
+    return cast(dict[str, object], raw)
+
+
+def _replace_pipecat_context(
+    messages: list[LLMContextMessage], note: str | None
+) -> list[LLMContextMessage]:
+    """Adapt owned message dictionaries back to Pipecat's typed union."""
+    owned_messages: list[dict[str, JsonValue]] = [
+        require_json_object(message, "pipecat.context.message")
+        for message in messages
+    ]
+    replaced = replace_longitudinal_context(owned_messages, note)
+    if not all(
+        isinstance(message.get("role"), str) and "content" in message
+        for message in replaced
+    ):
+        raise TypeError("longitudinal context produced an invalid message")
+    return cast(list[LLMContextMessage], replaced)
 
 
 @dataclass(frozen=True, slots=True)
@@ -161,7 +240,7 @@ async def _default_distillation(
     return await knowledge_distill.distill_session(model, turns, session_id)
 
 
-async def _generate_session_artifacts(
+async def generate_session_artifacts(
     turns: SessionTurns,
     model: UserModel,
     session_id: str,
@@ -210,12 +289,14 @@ async def _generate_session_artifacts(
     except Exception as exc:
         _artifact_failed("distill", exc)
     try:
-        recap_value = (await recap(turns)).strip() or None
+        recap_result = await recap(turns)
+        recap_value = recap_result.strip() or None if recap_result else None
         _artifact_outcome("recap", "success")
     except Exception as exc:
         _artifact_failed("recap", exc)
     try:
-        title_value = (await title(turns)).strip() or None
+        title_result = await title(turns)
+        title_value = title_result.strip() or None if title_result else None
         _artifact_outcome("title", "success")
     except Exception as exc:
         _artifact_failed("title", exc)
@@ -311,8 +392,8 @@ def tts_settings_for(language: str) -> TTSUpdateSettingsFrame:
 
 
 def _transcribe_utterance(
-    model: Any,
-    audio_float: Any,
+    model: WhisperModel,
+    audio_float: NDArray[np.float32],
     language: str | None,
     no_speech_threshold: float,
 ) -> tuple[str, str | None, float]:
@@ -354,11 +435,11 @@ class MultilingualWhisperSTTService(WhisperSTTService):
     TranscriptionFrame for downstream voice switching.
     """
 
-    def __init__(self, recorder: Any = None, **kwargs: Any) -> None:
-        super().__init__(
-            settings=WhisperSTTSettings(model=whisper_model(), language=Language.EN),
-            **kwargs,
-        )
+    def __init__(
+        self,
+        recorder: Callable[[bytes, str, str], None] | None = None,
+    ) -> None:
+        _initialize_whisper_service(self)
         self.current_language: str = DEFAULT_LANGUAGE
         # (audio, text, language) → persisted user turn; this is the one spot
         # where the raw utterance and its transcript exist together (SPEC §8).
@@ -410,8 +491,13 @@ class MultilingualWhisperSTTService(WhisperSTTService):
         no_speech = threshold if isinstance(threshold, float) else 0.6
 
         decode_started = time_module.monotonic()
-        text, detected, probability = await asyncio.to_thread(
-            _transcribe_utterance, self._model, audio_float, None, no_speech
+        text, detected, probability = await run_in_thread(
+            WorkloadClass.REALTIME,
+            _transcribe_utterance,
+            self._model,
+            audio_float,
+            None,
+            no_speech,
         )
         if audio_seconds > 0:
             record_metric(
@@ -455,7 +541,8 @@ class MultilingualWhisperSTTService(WhisperSTTService):
                     1,
                     {"reason": "unsupported_detection"},
                 )
-                text, _, _ = await asyncio.to_thread(
+                text, _, _ = await run_in_thread(
+                    WorkloadClass.REALTIME,
                     _transcribe_utterance,
                     self._model,
                     audio_float,
@@ -476,7 +563,9 @@ class MultilingualWhisperSTTService(WhisperSTTService):
             record_metric("therapy_stt_empty_total", 1, {"reason": "no_speech"})
         if text:
             if self._recorder:
-                await asyncio.to_thread(self._recorder, audio, text, language)
+                await run_in_thread(
+                    WorkloadClass.REALTIME, self._recorder, audio, text, language
+                )
             try:
                 frame_language = Language(language)
             except ValueError:
@@ -507,7 +596,7 @@ class TurnRelay(FrameProcessor):
         reply_language: ReplyLanguage,
         memory_refresher: Callable[[str], Awaitable[str | None]] | None = None,
     ) -> None:
-        super().__init__()
+        _initialize_frame_processor(self)
         self._language: str | None = None
         self._modality = modality
         self._reply_language = reply_language
@@ -543,7 +632,7 @@ class TurnRelay(FrameProcessor):
                 memory_note = await self._memory_refresher(frame.text)
                 await self.push_frame(
                     LLMMessagesTransformFrame(
-                        transform=lambda messages: replace_longitudinal_context(
+                        transform=lambda messages: _replace_pipecat_context(
                             messages, memory_note
                         ),
                         run_llm=False,
@@ -592,10 +681,16 @@ class TurnRelay(FrameProcessor):
 class BotTextRelay(FrameProcessor):
     """Accumulates the LLM reply; ships the full text to client and store."""
 
-    def __init__(self, get_language, recorder: Any = None) -> None:
-        super().__init__()
+    def __init__(
+        self,
+        get_language: Callable[[], str],
+        get_modality: Callable[[], str] = lambda: "unknown",
+        recorder: Callable[[str], None] | None = None,
+    ) -> None:
+        _initialize_frame_processor(self)
         self._parts: list[str] = []
         self._get_language = get_language
+        self._get_modality = get_modality
         self._recorder = recorder
 
     async def process_frame(self, frame: Frame, direction: FrameDirection) -> None:
@@ -603,12 +698,36 @@ class BotTextRelay(FrameProcessor):
         if direction == FrameDirection.DOWNSTREAM:
             if isinstance(frame, LLMTextFrame):
                 self._parts.append(frame.text)
-            elif isinstance(frame, LLMFullResponseEndFrame) and self._parts:
+            elif isinstance(frame, LLMFullResponseEndFrame):
                 text = "".join(self._parts).strip()
                 self._parts = []
+                from therapy.observability.model import (
+                    LanguageGroup,
+                    Modality,
+                    normalize_enum,
+                )
+                from therapy.observability.telemetry import record_metric
+
+                record_metric(
+                    "therapy_conversation_turns_total",
+                    1,
+                    {
+                        "modality": normalize_enum(
+                            self._get_modality(), Modality, Modality.UNKNOWN
+                        ).value,
+                        "language_group": normalize_enum(
+                            self._get_language(),
+                            LanguageGroup,
+                            LanguageGroup.UNKNOWN,
+                        ).value,
+                        "outcome": "success" if text else "incomplete",
+                    },
+                )
                 if text:
                     if self._recorder:
-                        await asyncio.to_thread(self._recorder, text)
+                        await run_in_thread(
+                            WorkloadClass.REALTIME, self._recorder, text
+                        )
                     await self.push_frame(
                         OutputTransportMessageUrgentFrame(
                             message={
@@ -623,7 +742,7 @@ class BotTextRelay(FrameProcessor):
         await self.push_frame(frame, direction)
 
 
-class _DeterministicTestLLM(FrameProcessor):
+class DeterministicTestLLM(FrameProcessor):
     """Test-only Pipecat LLM boundary; exercises framing without a provider."""
 
     async def process_frame(self, frame: Frame, direction: FrameDirection) -> None:
@@ -651,7 +770,7 @@ class _DeterministicTestPassthrough(FrameProcessor):
     """Test-only lightweight processor preserving real Pipecat frame flow."""
 
     def __init__(self, language: str = DEFAULT_LANGUAGE) -> None:
-        super().__init__()
+        _initialize_frame_processor(self)
         self.current_language = language
 
     async def process_frame(self, frame: Frame, direction: FrameDirection) -> None:
@@ -667,7 +786,7 @@ class InputAudioProbe(FrameProcessor):
     """
 
     def __init__(self) -> None:
-        super().__init__()
+        _initialize_frame_processor(self)
         self._samples = 0
         self._sumsq = 0.0
         self._rate = 16_000
@@ -694,7 +813,7 @@ class TTFAMonitor(FrameProcessor):
     """Logs time from end-of-user-speech to first synthesized audio (R1)."""
 
     def __init__(self) -> None:
-        super().__init__()
+        _initialize_frame_processor(self)
         self._turn_started_at: float | None = None
         # First reply of a pipeline pays model warm-up; label it honestly
         # (plan O3.2/O3 audit: mode was hard-coded "warm").
@@ -752,9 +871,10 @@ class PresenceRelay(FrameProcessor):
     """
 
     def __init__(self, modality: ReplyModality) -> None:
-        super().__init__()
+        _initialize_frame_processor(self)
         self._modality = modality
         self._state: str | None = None
+        self._barge_started_at: float | None = None
 
     async def _emit(self, state: str) -> None:
         if state == self._state:
@@ -765,31 +885,51 @@ class PresenceRelay(FrameProcessor):
         )
         _count_data_channel("presence", "sent")
 
+    def _finish_barge_in(self, outcome: str) -> None:
+        """Record a detected interruption once its audio-stop outcome is known."""
+        if self._barge_started_at is None:
+            return
+        from therapy.observability.telemetry import record_metric
+
+        record_metric("therapy_barge_ins_total", 1, {"outcome": outcome})
+        record_metric(
+            "therapy_barge_in_stop_seconds",
+            time.monotonic() - self._barge_started_at,
+            {"outcome": outcome},
+        )
+        self._barge_started_at = None
+
     async def process_frame(self, frame: Frame, direction: FrameDirection) -> None:
         await super().process_frame(frame, direction)
         if isinstance(frame, UserStartedSpeakingFrame):
             # The user (re)took the floor — barge-in included: back to listening.
+            if self._state == "speaking":
+                self._barge_started_at = time.monotonic()
             await self._emit("listening")
         elif isinstance(frame, UserStoppedSpeakingFrame):
             await self._emit("thinking")
         elif isinstance(frame, BotStartedSpeakingFrame):
+            self._finish_barge_in("timeout")
             await self._emit("speaking")
         elif isinstance(frame, BotStoppedSpeakingFrame):
+            self._finish_barge_in("success")
             await self._emit("listening")
+        elif isinstance(frame, (CancelFrame, EndFrame)):
+            self._finish_barge_in("error")
         elif isinstance(frame, LLMFullResponseEndFrame) and not self._modality.speak:
             # A silent (typed→text) reply produces no bot audio, so no
             # BotStopped will bring us back — return to listening here.
             await self._emit("listening")
-        elif (
-            isinstance(frame, OutputTransportMessageUrgentFrame)
-            and isinstance(frame.message, dict)
-            and frame.message.get("type") == "transcript"
-            and frame.message.get("role") == "user"
-            and frame.message.get("modality") == "text"
-        ):
-            # A typed turn has no VAD frames; mark 'thinking' as its echoed
-            # transcript passes on the way to the client.
-            await self._emit("thinking")
+        elif isinstance(frame, OutputTransportMessageUrgentFrame):
+            message = _object_mapping(_runtime_value(frame.message))
+            if (
+                message is not None
+                and message.get("type") == "transcript"
+                and message.get("role") == "user"
+                and message.get("modality") == "text"
+            ):
+                # A typed turn has no VAD frames; its echoed transcript marks thinking.
+                await self._emit("thinking")
         await self.push_frame(frame, direction)
 
 
@@ -801,7 +941,7 @@ def make_llm_service():
     former gives hosted free models for dev, the latter fully-local models.
     """
     if os.environ.get("THERAPY_TEST_MODE") == "1":
-        return _DeterministicTestLLM()
+        return DeterministicTestLLM()
     provider = os.environ.get("THERAPY_LLM", "anthropic")
     model = os.environ.get("THERAPY_LLM_MODEL")
     if provider == "anthropic":
@@ -874,7 +1014,7 @@ async def run_bot(
     # the resume window reopens the interrupted session instead of starting
     # an amnesiac new one (field test: a 4-minute WebRTC drop made the bot
     # deny the whole prior conversation).
-    resumed_turns: list[dict] = []
+    resumed_turns: list[RowDict] = []
     session_id = None
     if resume_session_id:
         if store.has_session(resume_session_id):
@@ -932,8 +1072,8 @@ async def run_bot(
         context_assembler = ContextAssembler(user_model, store)
 
     async def refresh_memory(text: str) -> str | None:
-        turn_context = await asyncio.to_thread(
-            context_assembler.assemble, text, session_id
+        turn_context = await run_in_thread(
+            WorkloadClass.REALTIME, context_assembler.assemble, text, session_id
         )
         return turn_context["note"]
 
@@ -989,16 +1129,31 @@ async def run_bot(
     )
     stt.current_language = initial_language
     turn_relay = TurnRelay(modality, reply_language, refresh_memory)
-    tts: FrameProcessor = (
-        _DeterministicTestPassthrough()
-        if test_mode
-        else KokoroTTSService(
-            settings=KokoroTTSSettings(
-                voice=voice_for(initial_language),
-                language=LANGUAGE_ENUM[initial_language],
+    if test_mode:
+        tts: FrameProcessor = _DeterministicTestPassthrough()
+    else:
+        tts_load_started = time.monotonic()
+        from therapy.observability.telemetry import record_metric
+
+        try:
+            tts = KokoroTTSService(
+                settings=KokoroTTSSettings(
+                    voice=voice_for(initial_language),
+                    language=LANGUAGE_ENUM[initial_language],
+                )
             )
+        except Exception:
+            record_metric(
+                "therapy_tts_model_load_seconds",
+                time.monotonic() - tts_load_started,
+                {"outcome": "error"},
+            )
+            raise
+        record_metric(
+            "therapy_tts_model_load_seconds",
+            time.monotonic() - tts_load_started,
+            {"outcome": "success"},
         )
-    )
     llm = make_llm_service()
 
     # Continuity (SPEC §8): current conversation stays verbatim; past context
@@ -1006,7 +1161,9 @@ async def run_bot(
     # session IS the current conversation — its turns are rehydrated
     # verbatim after the reconnect marker. (recent_summaries already
     # excludes it: reopen_session cleared its ended_at.)
-    messages = [{"role": "system", "content": build_system_prompt()}]
+    messages: list[LLMContextMessage] = [
+        {"role": "system", "content": build_system_prompt()}
+    ]
     # Graph-walk context assembly (W3): identity + preferences + the
     # never_initiate list, plus relevant confirmed/pattern claims. The opening
     # topic is the resumed conversation's last user turn, if any.
@@ -1023,7 +1180,9 @@ async def run_bot(
         messages.append({"role": "system", "content": memory_note})
     if resumed_turns:
         messages.append({"role": "system", "content": resume_note()})
-        messages.extend(rehydrate_messages(resumed_turns))
+        messages.extend(
+            cast(list[LLMContextMessage], rehydrate_messages(resumed_turns))
+        )
     context = LLMContext(messages=messages)
     aggregators = LLMContextAggregatorPair(context)
 
@@ -1040,6 +1199,7 @@ async def run_bot(
             llm,
             BotTextRelay(
                 get_language=lambda: reply_language.language,
+                get_modality=lambda: modality.last_input,
                 recorder=record_assistant,
             ),
             tts,
@@ -1052,7 +1212,7 @@ async def run_bot(
 
     from therapy.integrations.pipecat.observability import build_task_telemetry
 
-    task = PipelineTask(
+    worker = PipelineWorker(
         pipeline,
         params=PipelineParams(
             enable_metrics=True,
@@ -1071,8 +1231,14 @@ async def run_bot(
         )
 
     @transport.event_handler("on_app_message")
-    async def on_app_message(transport: Any, message: Any, sender: str) -> None:
-        if not isinstance(message, dict):
+    async def _on_app_message(
+        transport_instance: SmallWebRTCTransport,
+        message_value: object,
+        sender: str,
+    ) -> None:
+        del transport_instance, sender
+        message = _object_mapping(_runtime_value(message_value))
+        if message is None:
             _count_app_message("invalid", "rejected")
             return
 
@@ -1082,7 +1248,7 @@ async def run_bot(
             state = session_state_message(
                 session_id, bool(resumed_turns), resumed_turns
             )
-            await task.queue_frames([OutputTransportMessageUrgentFrame(message=state)])
+            await worker.queue_frames([OutputTransportMessageUrgentFrame(message=state)])
             _count_data_channel("session", "replayed")
             _count_app_message("client_ready", "accepted")
             return
@@ -1091,7 +1257,7 @@ async def run_bot(
         if message.get("type") == "voice_replies":
             enabled = message.get("enabled")
             speak = modality.set_override(enabled if isinstance(enabled, bool) else None)
-            await task.queue_frames([LLMConfigureOutputFrame(skip_tts=not speak)])
+            await worker.queue_frames([LLMConfigureOutputFrame(skip_tts=not speak)])
             _count_app_message("voice_reply", "accepted")
             return
 
@@ -1128,7 +1294,7 @@ async def run_bot(
                     )
                 )
             if frames:
-                await task.queue_frames(frames)
+                await worker.queue_frames(frames)
             _count_app_message("reply_language", "accepted")
             return
 
@@ -1173,14 +1339,23 @@ async def run_bot(
         )
         stt.current_language = language
         turn_relay.note_language(reply)
-        await asyncio.to_thread(store.add_turn, session_id, "user", TEXT, label, text)
-        await asyncio.to_thread(
+        await run_in_thread(
+            WorkloadClass.REALTIME,
+            store.add_turn,
+            session_id,
+            "user",
+            TEXT,
+            label,
+            text,
+        )
+        await run_in_thread(
+            WorkloadClass.REALTIME,
             user_model.add_observation, text, session_id=session_id, language=label
         )
         turn_memory = await refresh_memory(text)
         frames.append(
             LLMMessagesTransformFrame(
-                transform=lambda messages: replace_longitudinal_context(
+                transform=lambda messages: _replace_pipecat_context(
                     messages, turn_memory
                 ),
                 run_llm=False,
@@ -1196,9 +1371,11 @@ async def run_bot(
         )
         # Queued at the pipeline source — frames must not be pushed from the
         # transport's event task directly.
-        await task.queue_frames(frames)
+        await worker.queue_frames(frames)
         _count_data_channel("transcript", "queued")
         _count_app_message("text", "queued")
+
+    _ = _on_app_message
 
     finalized = False
     # Detached finalizers get a NEW linked trace root, never a multi-hour
@@ -1242,7 +1419,9 @@ async def run_bot(
             return
         finalized = True
         finalize_started = time_module.monotonic()
-        turns = await asyncio.to_thread(store.session_turns, session_id)
+        turns = await run_in_thread(
+            WorkloadClass.BACKGROUND, store.session_turns, session_id
+        )
         summary: str | None = None
         title: str | None = None
         recap: str | None = None
@@ -1271,7 +1450,7 @@ async def run_bot(
                 recap = f"You reflected on: {last_user_text}"
                 title = "Acceptance conversation"
             else:
-                artifacts = await _generate_session_artifacts(
+                artifacts = await generate_session_artifacts(
                     turns, user_model, session_id
                 )
                 summary = artifacts.summary
@@ -1279,10 +1458,16 @@ async def run_bot(
                 title = artifacts.title
         if title:
             # Fill-only: a user's rename (or an earlier generation) wins.
-            await asyncio.to_thread(store.ensure_title, session_id, title)
+            await run_in_thread(
+                WorkloadClass.BACKGROUND, store.ensure_title, session_id, title
+            )
         if recap:
-            await asyncio.to_thread(store.ensure_recap, session_id, recap)
-        await asyncio.to_thread(store.end_session, session_id, summary)
+            await run_in_thread(
+                WorkloadClass.BACKGROUND, store.ensure_recap, session_id, recap
+            )
+        await run_in_thread(
+            WorkloadClass.BACKGROUND, store.end_session, session_id, summary
+        )
         live.release(session_id, owner)
         record_metric(
             "therapy_session_finalization_seconds",
@@ -1348,13 +1533,20 @@ async def run_bot(
         finalize_task.add_done_callback(_forget)
 
     @transport.event_handler("on_client_disconnected")
-    async def on_client_disconnected(transport: Any, connection: Any) -> None:
+    async def _on_client_disconnected(
+        transport_instance: SmallWebRTCTransport,
+        connection: SmallWebRTCConnection,
+    ) -> None:
+        del transport_instance, connection
         schedule_finalize()
-        await task.cancel()
+        await worker.cancel()
 
-    runner = PipelineRunner(handle_sigint=False)
+    _ = _on_client_disconnected
+
+    runner = WorkerRunner(handle_sigint=False)
     try:
-        await runner.run(task)
+        await runner.add_workers(worker)
+        await runner.run()
     finally:
         # A preempted pipeline (new connection cancelled this one) never sees
         # on_client_disconnected — its session must still close and summarize.

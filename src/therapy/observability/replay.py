@@ -12,9 +12,12 @@ import json
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import cast
 
-from therapy.observability.interactions import JsonValue, canonical_json
+from therapy.observability.interactions import (
+    JsonValue,
+    canonical_json,
+    require_json_object,
+)
 from therapy.observability.journal import JournalError, JournalStore
 
 _MAX_INTERACTION_ID_CHARS = 256
@@ -65,9 +68,10 @@ class RenderedReplay:
 
 
 def _json_object(value: object, label: str) -> dict[str, JsonValue]:
-    if not isinstance(value, dict) or not all(isinstance(key, str) for key in value):
-        raise ReplayVerificationError(f"{label} must be a JSON object")
-    return cast(dict[str, JsonValue], value)
+    try:
+        return require_json_object(value, label)
+    except TypeError as exc:
+        raise ReplayVerificationError(str(exc)) from exc
 
 
 def _required_text(payload: dict[str, JsonValue], key: str) -> str:

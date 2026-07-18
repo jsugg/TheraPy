@@ -20,6 +20,7 @@ Source of truth for every LLM attempt. Design points:
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import sqlite3
 import stat
@@ -28,12 +29,15 @@ from collections.abc import Iterator
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from types import TracebackType
+from typing import TypedDict
 
 from therapy.observability.interactions import (
     InteractionRecord,
     JsonValue,
     canonical_json,
     checksum,
+    require_json_object,
 )
 from therapy.observability.model import (
     INTERACTION_STATUS_TRANSITIONS,
@@ -44,6 +48,78 @@ from therapy.observability.model import (
 )
 
 JOURNAL_SCHEMA_VERSION = 2
+
+
+class InteractionJournalRow(TypedDict):
+    """Typed persisted interaction row returned by `JournalStore.load`."""
+
+    interaction_id: str
+    schema_version: int
+    payload_encoding: str
+    key_version: str | None
+    nonce: bytes | None
+    trace_id: str
+    span_id: str
+    operation: str
+    provider: str
+    status: str
+    started_at: str
+    completed_at: str | None
+    canonical_request_json: str
+    canonical_record_json: str
+    provider_request_json: str
+    terminal_json: str | None
+    checksum: str
+    next_sequence: int
+    created_at: str
+    updated_at: str
+
+
+class InteractionEventRow(TypedDict):
+    """Typed persisted interaction event returned by `JournalStore.load`."""
+
+    sequence: int
+    kind: str
+    observed_at: str
+    payload_json: str
+    checksum: str
+
+
+class LoadedInteraction(TypedDict):
+    """One interaction row and its ordered event rows."""
+
+    interaction: InteractionJournalRow
+    events: list[InteractionEventRow]
+
+
+def _row_str(row: sqlite3.Row, key: str) -> str:
+    value = row[key]
+    if not isinstance(value, str):
+        raise JournalError(f"journal column {key!r} is not text")
+    return value
+
+
+def _row_int(row: sqlite3.Row, key: str) -> int:
+    value = row[key]
+    if not isinstance(value, int):
+        raise JournalError(f"journal column {key!r} is not an integer")
+    return value
+
+
+def _row_optional_str(row: sqlite3.Row, key: str) -> str | None:
+    value = row[key]
+    if value is not None and not isinstance(value, str):
+        raise JournalError(f"journal column {key!r} is not nullable text")
+    return value
+
+
+def _row_optional_bytes(row: sqlite3.Row, key: str) -> bytes | None:
+    value = row[key]
+    if value is None:
+        return None
+    if not isinstance(value, bytes):
+        raise JournalError(f"journal column {key!r} is not nullable bytes")
+    return value
 
 #: v2 (2026-07-16): `canonical_record_json` persists the COMPLETE §5.2
 #: pre-dispatch envelope so exact reconstruction never depends on scattered
@@ -140,8 +216,7 @@ class JournalStore:
         self._last_checkpoint_at: str | None = None
         path.parent.mkdir(parents=True, exist_ok=True)
         self._restrict_permissions(path.parent, directory=True)
-        # check_same_thread=False: the single async writer serializes all
-        # access but hops threads via asyncio.to_thread.
+        # check_same_thread=False: one async writer serializes thread-pool access.
         self._conn = sqlite3.connect(
             path,
             isolation_level=None,
@@ -215,9 +290,16 @@ class JournalStore:
         if record.status is not InteractionStatus.STARTED:
             raise JournalConflict("start_attempt requires status=started")
         payload = record.to_json_dict()
-        canonical_request = canonical_json(payload["request"])  # type: ignore[arg-type]
+        request = require_json_object(payload.get("request"), "interaction.request")
+        provider_native = require_json_object(
+            payload.get("provider_native"), "interaction.provider_native"
+        )
+        provider_request = require_json_object(
+            provider_native.get("request"), "interaction.provider_native.request"
+        )
+        canonical_request = canonical_json(request)
         canonical_record = canonical_json(payload)
-        provider_request = canonical_json(payload["provider_native"]["request"])  # type: ignore[index]
+        provider_request_json = canonical_json(provider_request)
         digest = checksum(payload)
         now = _utcnow()
         try:
@@ -246,7 +328,7 @@ class JournalStore:
                         record.started_at,
                         canonical_request,
                         canonical_record,
-                        provider_request,
+                        provider_request_json,
                         digest,
                         now,
                         now,
@@ -561,6 +643,7 @@ class JournalStore:
                         backend_record_id,
                     ),
                 )
+
             else:
                 self._conn.execute(
                     """
@@ -580,9 +663,24 @@ class JournalStore:
                     ),
                 )
 
+    def export_attempts(self, interaction_id: str, backend: str) -> int:
+        """Return the durable attempt count for one backend export."""
+        row = self._conn.execute(
+            "SELECT attempts FROM interaction_exports "
+            "WHERE interaction_id=? AND backend=?",
+            (interaction_id, backend),
+        ).fetchone()
+        if row is None:
+            return 0
+        attempts: object = row["attempts"]
+        if not isinstance(attempts, int):
+            raise JournalError("export attempt count is not an integer")
+        return attempts
+
     # -- read/replay ----------------------------------------------------------
 
-    def load(self, interaction_id: str) -> dict[str, JsonValue] | None:
+    def load(self, interaction_id: str) -> LoadedInteraction | None:
+        """Load and validate one interaction plus its ordered events."""
         row = self._conn.execute(
             "SELECT * FROM interactions WHERE interaction_id=?", (interaction_id,)
         ).fetchone()
@@ -593,10 +691,39 @@ class JournalStore:
             "FROM interaction_events WHERE interaction_id=? ORDER BY sequence",
             (interaction_id,),
         ).fetchall()
-        return {
-            "interaction": dict(row),
-            "events": [dict(event) for event in events],
-        }
+        interaction = InteractionJournalRow(
+            interaction_id=_row_str(row, "interaction_id"),
+            schema_version=_row_int(row, "schema_version"),
+            payload_encoding=_row_str(row, "payload_encoding"),
+            key_version=_row_optional_str(row, "key_version"),
+            nonce=_row_optional_bytes(row, "nonce"),
+            trace_id=_row_str(row, "trace_id"),
+            span_id=_row_str(row, "span_id"),
+            operation=_row_str(row, "operation"),
+            provider=_row_str(row, "provider"),
+            status=_row_str(row, "status"),
+            started_at=_row_str(row, "started_at"),
+            completed_at=_row_optional_str(row, "completed_at"),
+            canonical_request_json=_row_str(row, "canonical_request_json"),
+            canonical_record_json=_row_str(row, "canonical_record_json"),
+            provider_request_json=_row_str(row, "provider_request_json"),
+            terminal_json=_row_optional_str(row, "terminal_json"),
+            checksum=_row_str(row, "checksum"),
+            next_sequence=_row_int(row, "next_sequence"),
+            created_at=_row_str(row, "created_at"),
+            updated_at=_row_str(row, "updated_at"),
+        )
+        loaded_events = [
+            InteractionEventRow(
+                sequence=_row_int(event, "sequence"),
+                kind=_row_str(event, "kind"),
+                observed_at=_row_str(event, "observed_at"),
+                payload_json=_row_str(event, "payload_json"),
+                checksum=_row_str(event, "checksum"),
+            )
+            for event in events
+        ]
+        return LoadedInteraction(interaction=interaction, events=loaded_events)
 
     def verify_checksums(self, interaction_id: str) -> bool:
         """Corruption check over the WHOLE row: the pre-dispatch canonical
@@ -667,14 +794,23 @@ class JournalStore:
         envelope["stream"] = stream
         native = envelope.get("provider_native")
         if isinstance(native, dict):
-            native["ordered_events"] = list(native.get("ordered_events") or []) + native_events
+            ordered_events = native.get("ordered_events")
+            if ordered_events is None:
+                ordered_events = []
+            if not isinstance(ordered_events, list):
+                raise JournalError("provider ordered_events is not an array")
+            native["ordered_events"] = ordered_events + native_events
         if row["terminal_json"] is not None:
-            terminal = _json.loads(row["terminal_json"])
+            terminal = require_json_object(
+                _json.loads(row["terminal_json"]), "interaction terminal"
+            )
             envelope["terminal"] = terminal
-            if isinstance(terminal, dict) and isinstance(terminal.get("response"), dict):
-                envelope["response"] = terminal["response"]
-            if isinstance(terminal, dict) and isinstance(terminal.get("error"), dict):
-                envelope["error"] = terminal["error"]
+            response = terminal.get("response")
+            error = terminal.get("error")
+            if isinstance(response, dict):
+                envelope["response"] = response
+            if isinstance(error, dict):
+                envelope["error"] = error
         return envelope
 
     def iter_interaction_ids(self) -> Iterator[str]:
@@ -735,7 +871,12 @@ class _Transaction:
         self._conn.execute("BEGIN IMMEDIATE")
         return self._conn
 
-    def __exit__(self, exc_type, exc, tb) -> None:
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: TracebackType | None,
+    ) -> None:
         if exc_type is None:
             self._conn.execute("COMMIT")
         elif self._conn.in_transaction:
@@ -750,12 +891,15 @@ class _Transaction:
 @dataclass(frozen=True, slots=True)
 class _WriteOp:
     method: str
-    args: tuple
-    kwargs: dict
-    future: asyncio.Future
+    args: tuple[object, ...]
+    kwargs: dict[str, object]
+    future: asyncio.Future[None]
     #: durable ops complete their future only after commit; grouped ops
     #: (stream deltas) may resolve on enqueue-flush.
     durable: bool
+    stream_item: tuple[
+        str, int, InteractionEventKind, str, dict[str, JsonValue]
+    ] | None = None
 
 
 class AsyncJournalWriter:
@@ -810,6 +954,12 @@ class AsyncJournalWriter:
             await self._apply(batch)
 
     async def _apply(self, batch: list[_WriteOp]) -> None:
+        from therapy.observability.model import WorkloadClass
+        from therapy.observability.telemetry import run_in_thread
+
+        batch_started = time.monotonic()
+        batch_failed = False
+        batch_bytes = sum(self._operation_bytes(op) for op in batch)
         index = 0
         while index < len(batch):
             op = batch[index]
@@ -821,14 +971,28 @@ class AsyncJournalWriter:
                     and batch[index + len(run)].method == "append_stream_event"
                 ):
                     run.append(batch[index + len(run)])
-                items = [tuple(member.args) for member in run]
+                items = [
+                    member.stream_item
+                    for member in run
+                    if member.stream_item is not None
+                ]
+                if len(items) != len(run):
+                    raise JournalError("stream append operation lacks typed payload")
+                started = time.monotonic()
                 try:
-                    started = time.monotonic()
-                    await asyncio.to_thread(
-                        self._store.append_stream_events, items
+                    await run_in_thread(
+                        WorkloadClass.BACKGROUND,
+                        self._store.append_stream_events,
+                        items,
                     )
-                    self._observe_append((time.monotonic() - started) * 1000)
+                    self._observe_append(
+                        (time.monotonic() - started) * 1000, "success"
+                    )
                 except Exception as exc:
+                    batch_failed = True
+                    self._observe_append(
+                        (time.monotonic() - started) * 1000, "error"
+                    )
                     for member in run:
                         if not member.future.done():
                             member.future.set_exception(exc)
@@ -838,36 +1002,95 @@ class AsyncJournalWriter:
                             member.future.set_result(None)
                 index += len(run)
                 continue
+            started = time.monotonic()
             try:
-                started = time.monotonic()
-                await asyncio.to_thread(
-                    getattr(self._store, op.method), *op.args, **op.kwargs
+                await run_in_thread(
+                    WorkloadClass.BACKGROUND,
+                    getattr(self._store, op.method),
+                    *op.args,
+                    **op.kwargs,
                 )
-                self._observe_append((time.monotonic() - started) * 1000)
+                self._observe_append((time.monotonic() - started) * 1000, "success")
             except Exception as exc:  # propagate to the caller, keep writing
+                batch_failed = True
+                self._observe_append((time.monotonic() - started) * 1000, "error")
                 if not op.future.done():
                     op.future.set_exception(exc)
             else:
                 if not op.future.done():
                     op.future.set_result(None)
             index += 1
+        from therapy.observability.telemetry import record_metric
+
+        outcome = "error" if batch_failed else "success"
+        record_metric(
+            "therapy_llm_capture_group_commits_total", 1, {"outcome": outcome}
+        )
+        record_metric(
+            "therapy_llm_capture_group_commit_seconds",
+            time.monotonic() - batch_started,
+            {"outcome": outcome},
+        )
+        record_metric("therapy_llm_capture_group_commit_records", len(batch))
+        record_metric("therapy_llm_capture_append_bytes", batch_bytes)
+        record_metric("therapy_llm_capture_queue_depth", self._queue.qsize())
 
     @staticmethod
-    def _observe_append(duration_ms: float) -> None:
+    def _operation_bytes(op: _WriteOp) -> int:
+        """Return the local canonical payload size without exporting its content."""
+        if op.method == "start_attempt" and op.args:
+            record = op.args[0]
+            if isinstance(record, InteractionRecord):
+                return len(record.canonical().encode("utf-8"))
+        if op.method == "append_stream_event" and len(op.args) >= 5:
+            return len(
+                json.dumps(
+                    op.args[4], ensure_ascii=False, sort_keys=True, separators=(",", ":")
+                ).encode("utf-8")
+            )
+        if op.method in {
+            "finish_success",
+            "finish_error",
+            "mark_incomplete",
+        } and len(op.args) >= 2:
+            return len(
+                json.dumps(
+                    op.args[1], ensure_ascii=False, sort_keys=True, separators=(",", ":")
+                ).encode("utf-8")
+            )
+        return 0
+
+    @staticmethod
+    def _observe_append(duration_ms: float, outcome: str) -> None:
         from therapy.observability.telemetry import record_metric
 
         record_metric(
             "therapy_llm_capture_append_seconds",
             duration_ms / 1000,
-            {"outcome": "success"},
+            {"outcome": outcome},
         )
 
-    async def _submit(self, method: str, *args, durable: bool, **kwargs) -> None:
+    async def _submit(
+        self,
+        method: str,
+        *args: object,
+        durable: bool,
+        stream_item: tuple[
+            str, int, InteractionEventKind, str, dict[str, JsonValue]
+        ]
+        | None = None,
+        **kwargs: object,
+    ) -> None:
         if self._closed:
             raise JournalError("journal writer is closed")
         loop = asyncio.get_running_loop()
-        future: asyncio.Future = loop.create_future()
-        await self._queue.put(_WriteOp(method, args, kwargs, future, durable))
+        future: asyncio.Future[None] = loop.create_future()
+        await self._queue.put(
+            _WriteOp(method, args, kwargs, future, durable, stream_item)
+        )
+        from therapy.observability.telemetry import record_metric
+
+        record_metric("therapy_llm_capture_queue_depth", self._queue.qsize())
         await future
 
     async def start_attempt(self, record: InteractionRecord) -> None:
@@ -889,6 +1112,7 @@ class AsyncJournalWriter:
             observed_at,
             payload,
             durable=False,
+            stream_item=(interaction_id, sequence, kind, observed_at, payload),
         )
 
     async def finish_success(
@@ -922,6 +1146,11 @@ class AsyncJournalWriter:
             except (TimeoutError, asyncio.CancelledError):
                 self._task.cancel()
         try:
-            await asyncio.wait_for(asyncio.to_thread(self._store.close), timeout)
+            from therapy.observability.model import WorkloadClass
+            from therapy.observability.telemetry import run_in_thread
+
+            await asyncio.wait_for(
+                run_in_thread(WorkloadClass.MAINTENANCE, self._store.close), timeout
+            )
         except TimeoutError:
             pass  # the connection dies with the process; data is committed

@@ -106,9 +106,38 @@ class Workloads:
         self.client = client
         self.server = server
 
-    def _timed(self, method: str, path: str, **kw) -> tuple[float, httpx.Response]:
+    def _timed(
+        self,
+        method: str,
+        path: str,
+        *,
+        files: dict[str, tuple[str, bytes, str]] | None = None,
+        data: dict[str, str] | None = None,
+        params: dict[str, str] | None = None,
+        json: object | None = None,
+        timeout: float | None = None,
+    ) -> tuple[float, httpx.Response]:
         start = time.perf_counter()
-        response = self.client.request(method, f"{self.server}{path}", **kw)
+        request_url = f"{self.server}{path}"
+        if timeout is None:
+            response = self.client.request(
+                method,
+                request_url,
+                files=files,
+                data=data,
+                params=params,
+                json=json,
+            )
+        else:
+            response = self.client.request(
+                method,
+                request_url,
+                files=files,
+                data=data,
+                params=params,
+                json=json,
+                timeout=timeout,
+            )
         return time.perf_counter() - start, response
 
     def http_reads(self) -> dict[str, object]:

@@ -41,8 +41,8 @@ def load_canaries(root: Path = FIXTURE_ROOT) -> tuple[dict[str, str], dict[str, 
 class ScanReport:
     """Violations plus the coverage ledger the O0 gate needs."""
 
-    violations: list[str] = field(default_factory=list)
-    restricted_hits: dict[str, int] = field(default_factory=dict)
+    violations: list[str] = field(default_factory=list[str])
+    restricted_hits: dict[str, int] = field(default_factory=dict[str, int])
 
     @property
     def ok(self) -> bool:

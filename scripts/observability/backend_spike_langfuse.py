@@ -29,7 +29,11 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from collections.abc import Mapping
 from pathlib import Path
+from typing import cast
+
+from opentelemetry.sdk.trace import ReadableSpan
 
 REPO_ROOT = next(
     p for p in Path(__file__).resolve().parents if (p / "pyproject.toml").exists()
@@ -38,12 +42,22 @@ sys.path.insert(0, str(REPO_ROOT))
 
 from scripts.observability.backend_spike import (  # noqa: E402
     FIXTURE_ROOT,
-    _canonical_json,
-    _export,
-    _fixture_hash,
     build_spans,
+    canonical_json,
+    export_spans,
+    fixture_hash,
     load_fixtures,
 )
+
+
+def _json_object(value: object, label: str) -> dict[str, object]:
+    """Validate a Langfuse response field as a string-keyed object."""
+    if not isinstance(value, dict):
+        raise TypeError(f"{label} must be a JSON object")
+    mapping = cast(dict[object, object], value)
+    if not all(isinstance(key, str) for key in mapping):
+        raise TypeError(f"{label} must be a JSON object")
+    return cast(dict[str, object], mapping)
 
 
 def _env() -> dict[str, str]:
@@ -57,7 +71,12 @@ def _env() -> dict[str, str]:
     return values
 
 
-def _api(base: str, auth: str, path: str, params: dict | None = None) -> dict:
+def _api(
+    base: str,
+    auth: str,
+    path: str,
+    params: Mapping[str, str | int] | None = None,
+) -> dict[str, object]:
     """One public-API GET with bounded 429 backoff (Hobby-tier rate limits)."""
     url = f"{base}{path}"
     if params:
@@ -68,7 +87,8 @@ def _api(base: str, auth: str, path: str, params: dict | None = None) -> dict:
     for attempt in range(6):
         try:
             with urllib.request.urlopen(request, timeout=30) as response:
-                return json.load(response)
+                payload: object = json.load(response)
+                return _json_object(payload, "Langfuse API response")
         except urllib.error.HTTPError as error:
             if error.code != 429 or attempt == 5:
                 raise
@@ -76,6 +96,29 @@ def _api(base: str, auth: str, path: str, params: dict | None = None) -> dict:
             delay = float(retry_after) if retry_after else 10.0 * (attempt + 1)
             time.sleep(min(delay, 60.0))
     raise RuntimeError("unreachable")
+
+
+def _trace_id(span: ReadableSpan) -> str:
+    """Return one complete hexadecimal trace ID."""
+    context = span.context
+    if context is None:
+        raise RuntimeError("spike span is missing its context")
+    return f"{context.trace_id:032x}"
+
+
+def _api_trace_ids(payload: Mapping[str, object]) -> set[str]:
+    """Validate and extract trace IDs from a Langfuse list response."""
+    data = payload.get("data")
+    if not isinstance(data, list):
+        raise TypeError("Langfuse trace list must contain JSON objects")
+    identifiers: set[str] = set()
+    for index, trace_value in enumerate(cast(list[object], data)):
+        trace = _json_object(trace_value, f"Langfuse traces[{index}]")
+        identifier = trace.get("id")
+        if not isinstance(identifier, str):
+            raise TypeError("Langfuse trace ID must be a string")
+        identifiers.add(identifier)
+    return identifiers
 
 
 def main() -> int:
@@ -101,7 +144,7 @@ def main() -> int:
         "backend": "langfuse-cloud",
         "endpoint": otlp_endpoint.replace(base, "<LANGFUSE_BASE_URL>"),
         "fixture_count": len(fixtures),
-        "fixture_sha256": _fixture_hash(),
+        "fixture_sha256": fixture_hash(),
         "captured_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "tier_facts": {
             "plan": "Hobby (verified 2026-07-15)",
@@ -110,25 +153,21 @@ def main() -> int:
         },
     }
 
-    first_result, first_ms = _export(spans, otlp_endpoint, headers)
-    result["measurements"] = {"first_export_wall_ms": first_ms}
-    result["checks"] = {
+    first_result, first_ms = export_spans(spans, otlp_endpoint, headers)
+    measurements: dict[str, object] = {"first_export_wall_ms": first_ms}
+    checks: dict[str, dict[str, object]] = {
         "first_export": {"passed": first_result == "SUCCESS", "actual": first_result}
     }
-    checks: dict[str, dict[str, object]] = result["checks"]  # type: ignore[assignment]
-    measurements: dict[str, object] = result["measurements"]  # type: ignore[assignment]
+    result["measurements"] = measurements
+    result["checks"] = checks
 
     # ingestion is asynchronous; poll until every trace is queryable
-    expected_trace_ids = {
-        f"{span.context.trace_id:032x}" for span in spans
-    }
+    expected_trace_ids = {_trace_id(span) for span in spans}
     found: set[str] = set()
     deadline = time.monotonic() + 120
     while time.monotonic() < deadline and found != expected_trace_ids:
         page = _api(base, auth, "/api/public/traces", {"limit": 50})
-        found = {
-            trace["id"] for trace in page.get("data", [])
-        } & expected_trace_ids
+        found = _api_trace_ids(page) & expected_trace_ids
         if found != expected_trace_ids:
             time.sleep(5)
     checks["all_records_queryable"] = {
@@ -141,7 +180,7 @@ def main() -> int:
     envelope_losses: list[str] = []
     api_text_parts: list[str] = []
     for span in spans:
-        trace_id = f"{span.context.trace_id:032x}"
+        trace_id = _trace_id(span)
         time.sleep(1.5)  # stay under Hobby-tier API rate limits
         started = time.perf_counter()
         try:
@@ -152,15 +191,35 @@ def main() -> int:
         latencies.append((time.perf_counter() - started) * 1000)
         text = json.dumps(detail, ensure_ascii=False)
         api_text_parts.append(text)
-        expected = span.attributes.get("therapy.canonical_record")
+        attributes = span.attributes
+        expected = (
+            attributes.get("therapy.canonical_record")
+            if attributes is not None
+            else None
+        )
         if isinstance(expected, str):
             observations = detail.get("observations", [])
+            if not isinstance(observations, list):
+                raise TypeError("Langfuse observations must be JSON objects")
             stored = None
-            for obs in observations:
-                meta = obs.get("metadata") or {}
+            for index, observation in enumerate(cast(list[object], observations)):
+                obs = _json_object(
+                    observation, f"Langfuse observations[{index}]"
+                )
+                metadata = obs.get("metadata")
+                meta = (
+                    _json_object(metadata, "Langfuse observation metadata")
+                    if metadata is not None
+                    else {}
+                )
+                attributes_value = meta.get("attributes")
                 attrs = (
-                    meta.get("attributes") if isinstance(meta, dict) else None
-                ) or {}
+                    _json_object(
+                        attributes_value, "Langfuse observation attributes"
+                    )
+                    if attributes_value is not None
+                    else {}
+                )
                 if "therapy.canonical_record" in attrs:
                     stored = attrs["therapy.canonical_record"]
                     break
@@ -170,7 +229,7 @@ def main() -> int:
             if stored is None:
                 envelope_losses.append(f"{trace_id}: canonical envelope missing")
             elif isinstance(stored, str) and stored != expected:
-                if _canonical_json(json.loads(stored)) != expected:
+                if canonical_json(json.loads(stored)) != expected:
                     envelope_losses.append(f"{trace_id}: envelope transformed")
     checks["canonical_envelope_round_trip"] = {
         "passed": not envelope_losses,
@@ -201,12 +260,10 @@ def main() -> int:
     }
 
     # duplicate resend: identical spans again; count traces afterwards
-    duplicate_result, duplicate_ms = _export(spans, otlp_endpoint, headers)
+    duplicate_result, duplicate_ms = export_spans(spans, otlp_endpoint, headers)
     time.sleep(10)
     page = _api(base, auth, "/api/public/traces", {"limit": 50})
-    after = {
-        trace["id"] for trace in page.get("data", [])
-    } & expected_trace_ids
+    after = _api_trace_ids(page) & expected_trace_ids
     measurements["duplicate_export_wall_ms"] = duplicate_ms
     checks["duplicate_probe_observed"] = {
         "passed": duplicate_result == "SUCCESS" and after == expected_trace_ids,

@@ -272,9 +272,12 @@ def evaluate_speech_cases(
 
 
 def _json_object(value: object, label: str) -> dict[str, object]:
-    if not isinstance(value, dict) or not all(isinstance(key, str) for key in value):
+    if not isinstance(value, dict):
         raise ValueError(f"{label} must be a JSON object")
-    return cast(dict[str, object], value)
+    mapping = cast(dict[object, object], value)
+    if not all(isinstance(key, str) for key in mapping):
+        raise ValueError(f"{label} must be a JSON object")
+    return cast(dict[str, object], mapping)
 
 
 def load_speech_cases(path: Path = SPEECH_FIXTURE_PATH) -> list[SpeechCase]:
@@ -284,10 +287,11 @@ def load_speech_cases(path: Path = SPEECH_FIXTURE_PATH) -> list[SpeechCase]:
     raw_cases = payload.get("cases")
     if not isinstance(raw_cases, list):
         raise ValueError(f"{path}: cases must be a JSON list")
+    typed_raw_cases = cast(list[object], raw_cases)
 
     cases: list[SpeechCase] = []
     seen_ids: set[str] = set()
-    for index, raw_case in enumerate(raw_cases):
+    for index, raw_case in enumerate(typed_raw_cases):
         case = _json_object(raw_case, f"{path}: cases[{index}]")
         review = _json_object(case.get("review"), f"{path}: cases[{index}].review")
         case_id = case.get("id")

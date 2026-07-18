@@ -8,7 +8,7 @@ installed) and prints a sanitized JSON snapshot of:
   emit (parsed from the installed source, not from documentation);
 - the instrumentation scope names Pipecat requests tracers under;
 - every `MetricsData` payload class and its fields;
-- the `PipelineTask`/`PipelineParams` telemetry-relevant signature.
+- the `PipelineWorker`/`PipelineParams` telemetry-relevant signature.
 
 The output is committed as
 `tests/fixtures/observability/pipecat/snapshot-<version>.json` and diffed by
@@ -89,7 +89,7 @@ def main() -> int:
     import importlib.metadata as metadata
 
     import pipecat.metrics.metrics as metrics_module
-    from pipecat.pipeline.task import PipelineParams, PipelineTask
+    from pipecat.pipeline.worker import PipelineParams, PipelineWorker
 
     snapshot: dict[str, object] = {
         "pipecat_version": metadata.version("pipecat-ai"),
@@ -134,8 +134,11 @@ def main() -> int:
         )
     snapshot["metrics_data_classes"] = metrics_classes
 
-    task_params = inspect.signature(PipelineTask.__init__).parameters
-    snapshot["pipeline_task_parameters"] = sorted(
+    worker_initializer = vars(PipelineWorker).get("__init__")
+    if not callable(worker_initializer):
+        raise RuntimeError("PipelineWorker.__init__ is unavailable")
+    task_params = inspect.signature(worker_initializer).parameters
+    snapshot["pipeline_worker_parameters"] = sorted(
         name for name in task_params if name != "self"
     )
     snapshot["pipeline_params_fields"] = sorted(PipelineParams.model_fields)

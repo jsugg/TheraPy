@@ -8,16 +8,18 @@ end, off the realtime path.
 """
 
 import os
+import time
 from collections.abc import Mapping, Sequence
 from typing import Protocol
 
 import httpx
 
-from therapy.observability.capture import capture_service
+from therapy.observability.capture import AttemptHandle, capture_service
 from therapy.observability.interactions import (
     InteractionError,
     InteractionRequest,
     InteractionResponse,
+    JsonValue,
     Message,
 )
 from therapy.observability.model import (
@@ -41,6 +43,11 @@ main topic. Write the title in {language}. Output only the title itself —
 no quotes, no trailing punctuation, no explanation."""
 
 _TITLE_LANGUAGES = {"en": "English", "es": "Spanish", "pt": "Portuguese"}
+
+
+def _runtime_value(value: object) -> object:
+    """Prevent static parameter types from bypassing runtime boundary checks."""
+    return value
 
 
 def dominant_turn_language(turns: Sequence[Mapping[str, object]]) -> str:
@@ -125,7 +132,9 @@ async def complete(
     """
     # Hard boundary (plan O3.2): raw audio objects/bytes must be
     # unrepresentable at every cloud LLM adapter — only text crosses here.
-    if not isinstance(system, str) or not isinstance(user, str):
+    if not isinstance(_runtime_value(system), str) or not isinstance(
+        _runtime_value(user), str
+    ):
         raise TypeError("LLM boundaries accept text only; raw audio/bytes are forbidden")
     provider = (provider or os.environ.get("THERAPY_LLM", "anthropic")).lower()
     if provider == "anthropic":
@@ -147,7 +156,7 @@ async def complete(
     else:
         raise ValueError(f"Unknown THERAPY_LLM provider: {provider!r}")
 
-    handle = None
+    handle: AttemptHandle | None = None
     service = capture_service()
     if service is not None:
         request = InteractionRequest(
@@ -155,7 +164,7 @@ async def complete(
             messages=(Message(role="user", content=user),),
             parameters={"max_tokens": max_tokens},
         )
-        provider_request: dict[str, object] = {
+        provider_request: dict[str, JsonValue] = {
             "model": resolved_model,
             "max_tokens": max_tokens,
             "system": system,
@@ -167,7 +176,7 @@ async def complete(
             provider=normalize_enum(provider, Provider, Provider.UNKNOWN),
             requested_model=resolved_model,
             request=request,
-            provider_request=provider_request,  # type: ignore[arg-type]
+            provider_request=provider_request,
             session_id=session_id,
             turn_id=turn_id,
         )
@@ -183,25 +192,80 @@ async def complete(
 
 
 async def _complete_anthropic(
-    system: str, user: str, model: str, max_tokens: int, handle
+    system: str,
+    user: str,
+    model: str,
+    max_tokens: int,
+    handle: AttemptHandle | None,
 ) -> str:
-    from anthropic import APIError, AsyncAnthropic
+    from anthropic import (
+        DEFAULT_MAX_RETRIES,
+        DEFAULT_TIMEOUT,
+        APIError,
+        APITimeoutError,
+        AsyncAnthropic,
+    )
+
+    from therapy.observability.telemetry import (
+        instrumented_async_client,
+        record_outbound_failure,
+        record_outbound_retry_count,
+    )
 
     request_id: str | None = None
     retries_taken = 0
-    try:
-        # raw response: the allowlisted `request-id` header and SDK retry
-        # count are explicitly parsed fields (§5.2) — never raw headers.
-        raw = await AsyncAnthropic().messages.with_raw_response.create(
-            model=model,
-            max_tokens=max_tokens,
-            system=system,
-            messages=[{"role": "user", "content": user}],
+    request_attempts = 0
+    request_started = time.monotonic()
+
+    async def _count_request(_request: httpx.Request) -> None:
+        nonlocal request_attempts
+        request_attempts += 1
+
+    async def _capture_retry(response: httpx.Response) -> None:
+        if handle is None or not (
+            response.status_code in {408, 409, 429}
+            or response.status_code >= 500
+        ) or request_attempts > DEFAULT_MAX_RETRIES:
+            return
+        await response.aread()
+        await handle.record_event(
+            InteractionEventKind.RETRY,
+            {
+                "retry_attempt": max(0, request_attempts - 1),
+                "http_status": response.status_code,
+                "provider_error_body": response.text,
+            },
         )
+
+    try:
+        async with instrumented_async_client(
+            "anthropic", timeout=DEFAULT_TIMEOUT
+        ) as client:
+            client.event_hooks["request"].append(_count_request)
+            client.event_hooks["response"].append(_capture_retry)
+            # Only the allowlisted request ID and retry count leave the raw
+            # response wrapper; provider headers never reach either plane.
+            raw = await AsyncAnthropic(
+                http_client=client,
+                max_retries=DEFAULT_MAX_RETRIES,
+            ).messages.with_raw_response.create(
+                model=model,
+                max_tokens=max_tokens,
+                system=system,
+                messages=[{"role": "user", "content": user}],
+            )
         request_id = raw.headers.get("request-id")
         retries_taken = int(getattr(raw, "retries_taken", 0) or 0)
         message = raw.parse()
     except APIError as exc:
+        if getattr(exc, "status_code", None) is None:
+            record_outbound_failure(
+                "anthropic",
+                "post",
+                tls=True,
+                started_at=request_started,
+                timed_out=isinstance(exc, APITimeoutError),
+            )
         if handle is not None:
             await handle.fail(
                 InteractionError(
@@ -216,6 +280,13 @@ async def _complete_anthropic(
             )
         raise
     except Exception as exc:
+        record_outbound_failure(
+            "anthropic",
+            "post",
+            tls=True,
+            started_at=request_started,
+            timed_out=isinstance(exc, httpx.TimeoutException),
+        )
         if handle is not None:
             await handle.fail(
                 InteractionError(
@@ -229,6 +300,10 @@ async def _complete_anthropic(
                 finish_class="transport_error",
             )
         raise
+    finally:
+        record_outbound_retry_count(
+            "anthropic", max(retries_taken, request_attempts - 1)
+        )
     parts = [getattr(block, "text", "") or "" for block in message.content]
     completion = "".join(parts).strip()
     if handle is not None:
@@ -261,13 +336,18 @@ async def _complete_openai_style(
     model: str,
     base_url: str,
     provider: str,
-    handle,
+    handle: AttemptHandle | None,
 ) -> str:
     headers = None
     if provider == "openrouter":
         headers = {"Authorization": f"Bearer {os.environ['OPENROUTER_API_KEY']}"}
-    from therapy.observability.telemetry import instrumented_async_client
+    from therapy.observability.telemetry import (
+        instrumented_async_client,
+        record_outbound_failure,
+        record_outbound_retry_count,
+    )
 
+    request_started = time.monotonic()
     try:
         async with instrumented_async_client(provider, timeout=120.0) as client:
             response = await client.post(
@@ -284,6 +364,7 @@ async def _complete_openai_style(
             )
         response.raise_for_status()
     except httpx.HTTPStatusError as exc:
+        record_outbound_retry_count(provider, 0)
         if handle is not None:
             await handle.fail(
                 InteractionError(
@@ -300,6 +381,14 @@ async def _complete_openai_style(
             )
         raise
     except httpx.HTTPError as exc:
+        record_outbound_retry_count(provider, 0)
+        record_outbound_failure(
+            provider,
+            "post",
+            tls=base_url.casefold().startswith("https://"),
+            started_at=request_started,
+            timed_out=isinstance(exc, httpx.TimeoutException),
+        )
         if handle is not None:
             await handle.fail(
                 InteractionError(
@@ -313,6 +402,7 @@ async def _complete_openai_style(
                 finish_class="transport_error",
             )
         raise
+    record_outbound_retry_count(provider, 0)
     body = response.json()
     content = str(body["choices"][0]["message"]["content"]).strip()
     if handle is not None:

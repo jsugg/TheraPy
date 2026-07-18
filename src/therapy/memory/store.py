@@ -14,13 +14,16 @@ import shutil
 import sqlite3
 import uuid
 import wave
-from collections.abc import Iterator
+from collections.abc import Callable, Generator
 from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import ParamSpec, TypeVar, cast
 
 JsonScalar = str | int | None
 RowDict = dict[str, JsonScalar]
+P = ParamSpec("P")
+R = TypeVar("R")
 
 
 def _utc_now() -> str:
@@ -30,7 +33,13 @@ def _utc_now() -> str:
 
 def _row_dict(row: sqlite3.Row) -> RowDict:
     """Convert a SQLite row into a JSON-serializable dictionary."""
-    return dict(row)
+    raw = cast(dict[object, object], dict(row))
+    if not all(
+        isinstance(key, str) and (value is None or isinstance(value, str | int))
+        for key, value in raw.items()
+    ):
+        raise TypeError("SQLite row contains a non-JSON scalar")
+    return cast(RowDict, raw)
 
 
 def resume_window_secs() -> float:
@@ -39,17 +48,24 @@ def resume_window_secs() -> float:
 
 
 
-def _traced_storage(component: str, operation: str):
+def _traced_storage(
+    component: str, operation: str
+) -> Callable[[Callable[P, R]], Callable[P, R]]:
     """Bounded db.operation instrumentation (obs plan O3.3); no SQL/paths."""
     import functools
 
-    def decorate(func):
+    def decorate(func: Callable[P, R]) -> Callable[P, R]:
         @functools.wraps(func)
-        def wrapper(*args, **kwargs):
-            from therapy.observability.telemetry import storage_operation
+        def wrapper(*args: P.args, **kwargs: P.kwargs) -> R:
+            from therapy.observability.telemetry import (
+                record_storage_result,
+                storage_operation,
+            )
 
             with storage_operation(component, operation):
-                return func(*args, **kwargs)
+                result = func(*args, **kwargs)
+            record_storage_result(component, operation, result)
+            return result
 
         return wrapper
 
@@ -73,7 +89,7 @@ class MemoryStore:
         self._init_schema()
 
     @contextmanager
-    def _connect(self) -> Iterator[sqlite3.Connection]:
+    def _connect(self) -> Generator[sqlite3.Connection, None, None]:
         """Open a configured SQLite connection for one method call."""
         connection = sqlite3.connect(self._db_path, timeout=30.0)
         connection.row_factory = sqlite3.Row
@@ -437,7 +453,7 @@ class MemoryStore:
 
     def export_all(self) -> dict[str, object]:
         """Return a JSON-serializable snapshot of sessions and turns."""
-        sessions = []
+        sessions: list[dict[str, object]] = []
         for session in self.sessions():
             session_export: dict[str, object] = dict(session)
             session_export["turns"] = self.session_turns(str(session["id"]))

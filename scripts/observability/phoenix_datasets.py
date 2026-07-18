@@ -73,18 +73,26 @@ class _ClientFactory(Protocol):
 
 
 def _json_object(value: object, label: str) -> dict[str, object]:
-    if not isinstance(value, dict) or not all(isinstance(key, str) for key in value):
+    if not isinstance(value, dict):
         raise ValueError(f"{label} must be a JSON object")
-    return cast(dict[str, object], value)
+    mapping = cast(dict[object, object], value)
+    if not all(isinstance(key, str) for key in mapping):
+        raise ValueError(f"{label} must be a JSON object")
+    return cast(dict[str, object], mapping)
 
 
 def _json_value(value: object, label: str) -> JsonValue:
     if value is None or isinstance(value, (str, int, float, bool)):
         return value
     if isinstance(value, list):
-        return [_json_value(item, f"{label}[]") for item in value]
-    if isinstance(value, dict) and all(isinstance(key, str) for key in value):
-        mapping = cast(dict[str, object], value)
+        return [
+            _json_value(item, f"{label}[]") for item in cast(list[object], value)
+        ]
+    if isinstance(value, dict):
+        raw_mapping = cast(dict[object, object], value)
+        if not all(isinstance(key, str) for key in raw_mapping):
+            raise ValueError(f"{label} contains a non-JSON value")
+        mapping = cast(dict[str, object], raw_mapping)
         return {
             key: _json_value(item, f"{label}.{key}") for key, item in mapping.items()
         }
@@ -151,7 +159,7 @@ def build_behavior_examples() -> list[JsonObject]:
         raise ValueError(f"{BEHAVIOR_FIXTURE_PATH}: cases must be a non-empty list")
 
     examples: list[JsonObject] = []
-    for index, raw_case in enumerate(raw_cases):
+    for index, raw_case in enumerate(cast(list[object], raw_cases)):
         label = f"{BEHAVIOR_FIXTURE_PATH}: cases[{index}]"
         case = _json_object(raw_case, label)
         case_id = _required_string(case, "id", label)
@@ -159,9 +167,10 @@ def build_behavior_examples() -> list[JsonObject]:
         dimension = _required_string(case, "dimension", label)
         expected = case.get("expected_behavior")
         high_risk = case.get("high_risk")
-        if not isinstance(expected, list) or not all(
-            isinstance(item, str) for item in expected
-        ):
+        if not isinstance(expected, list):
+            raise ValueError(f"{label}.expected_behavior must be a list of strings")
+        expected_values = cast(list[object], expected)
+        if not all(isinstance(item, str) for item in expected_values):
             raise ValueError(f"{label}.expected_behavior must be a list of strings")
         if not isinstance(high_risk, bool):
             raise ValueError(f"{label}.high_risk must be a boolean")
@@ -169,7 +178,7 @@ def build_behavior_examples() -> list[JsonObject]:
             {
                 "id": case_id,
                 "input": {"user_input": user_input},
-                "output": {"expected": cast(list[str], expected)},
+                "output": {"expected": cast(list[str], expected_values)},
                 "metadata": {"dimension": dimension, "high_risk": high_risk},
             }
         )

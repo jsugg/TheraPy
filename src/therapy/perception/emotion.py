@@ -24,4 +24,4 @@ class EmotionFrame:
     start_s: float
     end_s: float
     ser_version: str
-    raw_labels: dict[str, float] = field(default_factory=dict)
+    raw_labels: dict[str, float] = field(default_factory=lambda: {})

@@ -64,6 +64,16 @@ class OwnerAnnotation(TypedDict):
     notes: str
 
 
+def _json_object(value: object, label: str) -> dict[str, object]:
+    """Validate an external value as a string-keyed object."""
+    if not isinstance(value, dict):
+        raise ValueError(f"{label} must be a JSON object")
+    mapping = cast(dict[object, object], value)
+    if not all(isinstance(key, str) for key in mapping):
+        raise ValueError(f"{label} must be a JSON object")
+    return cast(dict[str, object], mapping)
+
+
 class OllamaCompletion:
     """Synchronous OpenAI-compatible Ollama completion adapter."""
 
@@ -90,18 +100,16 @@ class OllamaCompletion:
         )
         response.raise_for_status()
         payload: object = response.json()
-        if not isinstance(payload, dict):
-            raise ValueError("Ollama response must be a JSON object")
-        choices = payload.get("choices")
+        response_object = _json_object(payload, "Ollama response")
+        choices = response_object.get("choices")
         if not isinstance(choices, list) or not choices:
             raise ValueError("Ollama response must contain at least one choice")
-        choice = choices[0]
-        if not isinstance(choice, dict):
-            raise ValueError("Ollama response choice must be an object")
+        choice = _json_object(
+            cast(list[object], choices)[0], "Ollama response choice"
+        )
         message = choice.get("message")
-        if not isinstance(message, dict):
-            raise ValueError("Ollama response choice must contain a message")
-        content = message.get("content")
+        message_object = _json_object(message, "Ollama response choice message")
+        content = message_object.get("content")
         if not isinstance(content, str):
             raise ValueError("Ollama response message content must be a string")
         return content.strip()
@@ -114,15 +122,14 @@ def _fixture_metadata(fixture_path: Path) -> tuple[int, str, dict[str, object]]:
         payload: object = json.loads(fixture_bytes)
     except json.JSONDecodeError as error:
         raise ValueError(f"{fixture_path}: fixture must contain valid JSON") from error
-    if not isinstance(payload, dict):
-        raise ValueError(f"{fixture_path}: fixture must be a JSON object")
-    schema_version = payload.get("schema_version")
+    fixture = _json_object(payload, str(fixture_path))
+    schema_version = fixture.get("schema_version")
     if isinstance(schema_version, bool) or not isinstance(schema_version, int):
         raise ValueError(f"{fixture_path}: schema_version must be an integer")
     return (
         schema_version,
         hashlib.sha256(fixture_bytes).hexdigest(),
-        cast(dict[str, object], payload),
+        fixture,
     )
 
 
@@ -143,7 +150,8 @@ def _judge_manifest_config(
 
 def _owner_annotation(value: object, label: str) -> OwnerAnnotation:
     """Validate one bounded owner annotation object."""
-    if not isinstance(value, dict) or set(value) != {
+    annotation = _json_object(value, label)
+    if set(annotation) != {
         "verdict",
         "reviewed_at",
         "response_sha256",
@@ -153,10 +161,10 @@ def _owner_annotation(value: object, label: str) -> OwnerAnnotation:
             f"{label} must contain exactly verdict, reviewed_at, "
             "response_sha256, and notes"
         )
-    verdict = value.get("verdict")
-    reviewed_at = value.get("reviewed_at")
-    response_sha256 = value.get("response_sha256")
-    notes = value.get("notes")
+    verdict = annotation.get("verdict")
+    reviewed_at = annotation.get("reviewed_at")
+    response_sha256 = annotation.get("response_sha256")
+    notes = annotation.get("notes")
     if verdict not in {"pass", "fail", "uncertain"}:
         raise ValueError(f"{label}.verdict must be pass, fail, or uncertain")
     if not isinstance(reviewed_at, str):
@@ -189,13 +197,10 @@ def load_owner_annotations(path: Path) -> dict[str, OwnerAnnotation]:
         raw: object = json.loads(path.read_text(encoding="utf-8"))
     except json.JSONDecodeError as error:
         raise ValueError(f"{path}: annotations must contain valid JSON") from error
-    if not isinstance(raw, dict) or raw.get("schema_version") != 1:
+    root = _json_object(raw, str(path))
+    if root.get("schema_version") != 1:
         raise ValueError(f"{path}: annotations schema_version must be 1")
-    raw_annotations = raw.get("annotations")
-    if not isinstance(raw_annotations, dict) or not all(
-        isinstance(case_id, str) for case_id in raw_annotations
-    ):
-        raise ValueError(f"{path}: annotations must be a case-ID object")
+    raw_annotations = _json_object(root.get("annotations"), f"{path}: annotations")
     return {
         case_id: _owner_annotation(value, f"{path}: annotations[{case_id!r}]")
         for case_id, value in raw_annotations.items()
@@ -235,11 +240,10 @@ def _manifest_cases(manifest: Mapping[str, object], label: str) -> list[dict[str
     if not isinstance(raw_cases, list):
         raise ValueError(f"{label}: cases must be a list")
     cases: list[dict[str, object]] = []
-    for index, raw_case in enumerate(raw_cases):
-        if not isinstance(raw_case, dict):
-            raise ValueError(f"{label}: cases[{index}] must be an object")
-        _manifest_case_key(raw_case)
-        cases.append(cast(dict[str, object], raw_case))
+    for index, raw_case in enumerate(cast(list[object], raw_cases)):
+        case = _json_object(raw_case, f"{label}: cases[{index}]")
+        _manifest_case_key(case)
+        cases.append(case)
     return cases
 
 
@@ -354,7 +358,7 @@ def build_experiment_manifest(
     """
     if judge not in {"none", "ollama"}:
         raise ValueError(f"unknown judge provider: {judge!r}")
-    if isinstance(samples, bool) or not isinstance(samples, int) or samples < 1:
+    if isinstance(samples, bool) or samples < 1:
         raise ValueError("samples must be a positive integer")
     if judge == "ollama" and completion is None:
         raise ValueError("Ollama judge requires a completion callable")
