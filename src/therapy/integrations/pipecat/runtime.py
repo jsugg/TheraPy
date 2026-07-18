@@ -23,14 +23,18 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-class _Connection(Protocol):
+class _NoAnswer(Exception):
+    """Signaling completed without an SDP answer (finite negotiate outcome)."""
+
+
+class Connection(Protocol):
     @property
     def pc_id(self) -> str: ...
 
     async def disconnect(self) -> None: ...
 
 
-class _VendorRequest(Protocol):
+class VendorRequest(Protocol):
     @property
     def sdp(self) -> str: ...
 
@@ -50,21 +54,21 @@ class _VendorRequest(Protocol):
 class _RequestHandler(Protocol):
     async def handle_web_request(
         self,
-        request: _VendorRequest,
+        request: VendorRequest,
         webrtc_connection_callback: Callable[[object], Awaitable[None]],
     ) -> dict[str, object] | None: ...
 
     async def close(self) -> None: ...
 
 
-type RequestFactory = Callable[[WebRTCOffer], _VendorRequest]
+type RequestFactory = Callable[[WebRTCOffer], VendorRequest]
 type PipelineRunner = Callable[
-    [_Connection, SessionTarget], Coroutine[object, object, None]
+    [Connection, SessionTarget], Coroutine[object, object, None]
 ]
 type FinalizerDrainer = Callable[[float], Awaitable[None]]
 
 
-def _load_pipecat() -> tuple[_RequestHandler, RequestFactory]:
+def load_pipecat() -> tuple[_RequestHandler, RequestFactory]:
     """Load the optional realtime stack only when the first offer needs it."""
     from loguru import logger as vendor_logger
 
@@ -90,7 +94,7 @@ def _load_pipecat() -> tuple[_RequestHandler, RequestFactory]:
 
         __str__ = __repr__
 
-    def request_factory(offer: WebRTCOffer) -> _VendorRequest:
+    def request_factory(offer: WebRTCOffer) -> VendorRequest:
         return RedactedSmallWebRTCRequest(
             sdp=offer.sdp,
             type=offer.type,
@@ -103,7 +107,7 @@ def _load_pipecat() -> tuple[_RequestHandler, RequestFactory]:
 
 
 async def _default_pipeline_runner(
-    connection: _Connection, target: SessionTarget
+    connection: Connection, target: SessionTarget
 ) -> None:
     """Load and run the Pipecat pipeline only when a voice offer arrives."""
     from therapy.integrations.pipecat.pipeline import run_bot
@@ -143,7 +147,7 @@ class PipecatVoiceGateway:
         if (handler is None) != (request_factory is None):
             raise ValueError("handler and request_factory must be provided together")
         if handler is None or request_factory is None:
-            handler, request_factory = _load_pipecat()
+            handler, request_factory = load_pipecat()
         self._handler = handler
         self._request_factory = request_factory
         using_default_pipeline = pipeline_runner is None
@@ -156,23 +160,64 @@ class PipecatVoiceGateway:
         self._cancel_timeout = cancel_timeout
         self._lock = asyncio.Lock()
         self._pipeline_task: asyncio.Task[None] | None = None
-        self._pipeline_connection: _Connection | None = None
+        self._pipeline_connection: Connection | None = None
         self._closed = False
 
     async def negotiate(
         self, offer: WebRTCOffer, target: SessionTarget
     ) -> WebRTCAnswer:
-        """Negotiate an offer and atomically replace the single live pipeline."""
+        """Negotiate an offer and atomically replace the single live pipeline.
+
+        Records the finite outcome set success|conflict|invalid|unavailable
+        (obs plan O3.2) — one owned boundary event, no SDP, no peer IDs.
+        """
+        from therapy.observability.logging import emit_event
+        from therapy.observability.telemetry import record_metric
+
+        outcome = "unavailable"
+        try:
+            answer = await self._negotiate_inner(offer, target)
+        except ConnectionConflict:
+            outcome = "conflict"
+            raise
+        except InvalidOffer:
+            outcome = "invalid"
+            raise
+        except _NoAnswer:
+            outcome = "no_answer"
+            raise VoiceUnavailable("Voice signaling produced no answer") from None
+        except Exception:
+            outcome = "unavailable"
+            raise
+        else:
+            outcome = "success"
+            return answer
+        finally:
+            record_metric(
+                "therapy_voice_connections_total",
+                1,
+                {"outcome": outcome, "reason": "negotiate"},
+            )
+            emit_event(
+                "voice.negotiate",
+                component="voice",
+                operation="negotiate",
+                outcome="success" if outcome == "success" else "error",
+            )
+
+    async def _negotiate_inner(
+        self, offer: WebRTCOffer, target: SessionTarget
+    ) -> WebRTCAnswer:
         async with self._lock:
             if self._closed:
                 raise VoiceUnavailable("Voice runtime is shutting down")
 
             callback_failure: BaseException | None = None
-            callback_connection: _Connection | None = None
+            callback_connection: Connection | None = None
 
             async def start_pipeline(connection: object) -> None:
                 nonlocal callback_failure, callback_connection
-                callback_connection = cast(_Connection, connection)
+                callback_connection = cast(Connection, connection)
                 try:
                     await self._replace_pipeline(callback_connection, target)
                 except asyncio.CancelledError:
@@ -182,12 +227,18 @@ class PipecatVoiceGateway:
                     callback_failure = exc
                     await self._disconnect_safely(callback_connection)
 
+            from therapy.observability.telemetry import broad_span
+
             request = self._request_factory(offer)
             try:
-                raw_answer = await self._handler.handle_web_request(
-                    request=request,
-                    webrtc_connection_callback=start_pipeline,
-                )
+                # Stage children (plan O3.2): signaling / start / map / abort.
+                with broad_span(
+                    "voice.signaling", component="voice", operation="negotiate"
+                ):
+                    raw_answer = await self._handler.handle_web_request(
+                        request=request,
+                        webrtc_connection_callback=start_pipeline,
+                    )
             except HTTPException as exc:
                 await self._abort_started_connection(callback_connection)
                 if exc.status_code in {400, 409}:
@@ -219,9 +270,12 @@ class PipecatVoiceGateway:
                 ) from callback_failure
             if raw_answer is None:
                 await self._abort_started_connection(callback_connection)
-                raise VoiceUnavailable("Voice signaling produced no answer")
+                raise _NoAnswer
             try:
-                return self._map_answer(raw_answer)
+                with broad_span(
+                    "voice.map_answer", component="voice", operation="negotiate"
+                ):
+                    return self._map_answer(raw_answer)
             except VoiceUnavailable:
                 await self._abort_started_connection(callback_connection)
                 raise
@@ -260,6 +314,10 @@ class PipecatVoiceGateway:
                 self._consume_task(task)
             self._pipeline_task = None
             self._pipeline_connection = None
+            self._record_pipeline_active()
+            self._transition(
+                "close", "success" if stop_failure is None else "error"
+            )
             if stop_failure is not None:
                 raise stop_failure
 
@@ -270,65 +328,121 @@ class PipecatVoiceGateway:
         async with self._lock:
             connection = self._pipeline_connection
             if self._closed or connection is None or connection.pc_id != peer_id:
+                self._transition("disconnect", "stale")
                 return False
             await self._stop_pipeline()
             try:
                 await self._finalizer_drainer(self._cancel_timeout)
             except TimeoutError as exc:
+                self._transition("disconnect", "drain_timeout")
                 raise VoiceUnavailable(
                     "Voice session finalization did not stop in time"
                 ) from exc
+            self._transition("disconnect", "success")
             return True
 
+    @staticmethod
+    def _transition(transition: str, outcome: str) -> None:
+        """Bounded pipeline-lifecycle evidence (plan O3.2): finite transition
+        and outcome enums only, plus the 0/1 active-pipeline gauge."""
+        from therapy.observability.telemetry import record_metric
+
+        record_metric(
+            "therapy_voice_pipeline_transitions_total",
+            1,
+            {"transition": transition, "outcome": outcome},
+        )
+
+    def _record_pipeline_active(self) -> None:
+        from therapy.observability.telemetry import record_metric
+
+        record_metric(
+            "therapy_voice_pipeline_active",
+            1 if self._pipeline_task is not None else 0,
+        )
+
     async def _replace_pipeline(
-        self, connection: _Connection, target: SessionTarget
+        self, connection: Connection, target: SessionTarget
     ) -> None:
         """Drain the prior pipeline before allowing a replacement to start."""
-        await self._stop_pipeline()
-        task = asyncio.create_task(
-            self._pipeline_runner(connection, target), name="therapy-pipecat-pipeline"
-        )
-        self._pipeline_task = task
-        self._pipeline_connection = connection
-        task.add_done_callback(self._observe_pipeline_completion)
+        from therapy.observability.telemetry import broad_span
 
-        # Give synchronous setup and its first await one loop turn. This catches
-        # missing provider configuration and model initialization failures before
-        # returning a successful SDP answer.
-        await asyncio.sleep(0)
-        if task.done():
-            failure = self._consume_task(task)
-            if failure is None:
-                raise VoiceUnavailable("Voice pipeline stopped during startup")
-            raise VoiceUnavailable("Voice pipeline failed during startup") from failure
+        with broad_span("voice.start", component="voice", operation="start"):
+            await self._stop_pipeline()
+            task = asyncio.create_task(
+                self._pipeline_runner(connection, target),
+                name="therapy-pipecat-pipeline",
+            )
+            self._pipeline_task = task
+            self._pipeline_connection = connection
+            task.add_done_callback(self._observe_pipeline_completion)
+            self._record_pipeline_active()
+
+            # Give synchronous setup and its first await one loop turn. This
+            # catches missing provider configuration and model initialization
+            # failures before returning a successful SDP answer.
+            await asyncio.sleep(0)
+            if task.done():
+                failure = self._consume_task(task)
+                self._transition("replace", "startup_failed")
+                if failure is None:
+                    raise VoiceUnavailable("Voice pipeline stopped during startup")
+                raise VoiceUnavailable(
+                    "Voice pipeline failed during startup"
+                ) from failure
+            self._transition("replace", "success")
 
     async def _stop_pipeline(self) -> None:
         """Cancel, await, and disconnect the currently tracked pipeline."""
+        import time as time_module
+
+        from therapy.observability.telemetry import record_metric
+
         task = self._pipeline_task
         connection = self._pipeline_connection
-        if task is not None and not task.done():
-            task.cancel()
-            done, _ = await asyncio.wait({task}, timeout=self._cancel_timeout)
-            if not done:
-                raise VoiceUnavailable("Previous voice pipeline did not stop in time")
-        if task is not None and task.done():
-            self._consume_task(task)
-        if connection is not None:
-            try:
-                await asyncio.wait_for(
-                    connection.disconnect(), timeout=self._cancel_timeout
-                )
-            except TimeoutError as exc:
-                raise VoiceUnavailable(
-                    "Previous voice peer did not close in time"
-                ) from exc
-            except Exception as exc:
-                raise VoiceUnavailable("Previous voice peer failed to close") from exc
-        if self._pipeline_task is task:
-            self._pipeline_task = None
-            self._pipeline_connection = None
+        if task is None and connection is None:
+            return
+        stop_started = time_module.monotonic()
+        outcome = "success"
+        try:
+            if task is not None and not task.done():
+                task.cancel()
+                done, _ = await asyncio.wait({task}, timeout=self._cancel_timeout)
+                if not done:
+                    outcome = "cancel_timeout"
+                    raise VoiceUnavailable(
+                        "Previous voice pipeline did not stop in time"
+                    )
+            if task is not None and task.done():
+                self._consume_task(task)
+            if connection is not None:
+                try:
+                    await asyncio.wait_for(
+                        connection.disconnect(), timeout=self._cancel_timeout
+                    )
+                except TimeoutError as exc:
+                    outcome = "peer_timeout"
+                    raise VoiceUnavailable(
+                        "Previous voice peer did not close in time"
+                    ) from exc
+                except Exception as exc:
+                    outcome = "peer_error"
+                    raise VoiceUnavailable(
+                        "Previous voice peer failed to close"
+                    ) from exc
+            if self._pipeline_task is task:
+                self._pipeline_task = None
+                self._pipeline_connection = None
+        finally:
+            self._transition("stop", outcome)
+            record_metric(
+                "therapy_voice_pipeline_shutdown_seconds",
+                time_module.monotonic() - stop_started,
+                {"outcome": outcome},
+            )
+            self._record_pipeline_active()
 
-    async def _disconnect_safely(self, connection: _Connection) -> None:
+    async def _disconnect_safely(self, connection: Connection) -> None:
         """Best-effort cleanup for a connection whose pipeline could not start."""
         try:
             await asyncio.wait_for(
@@ -350,19 +464,22 @@ class PipecatVoiceGateway:
                 type(exc).__name__,
             )
 
-    async def _abort_started_connection(self, connection: _Connection | None) -> None:
+    async def _abort_started_connection(self, connection: Connection | None) -> None:
         """Drain any pipeline started before signaling ultimately failed."""
         if connection is None:
             return
-        try:
-            await self._stop_pipeline()
-            return
-        except VoiceUnavailable as exc:
-            logger.error(
-                "Failed to drain rejected Pipecat pipeline failure_type=%s",
-                type(exc).__name__,
-            )
-        await self._disconnect_safely(connection)
+        from therapy.observability.telemetry import broad_span
+
+        with broad_span("voice.abort", component="voice", operation="abort"):
+            try:
+                await self._stop_pipeline()
+                return
+            except VoiceUnavailable as exc:
+                logger.error(
+                    "Failed to drain rejected Pipecat pipeline failure_type=%s",
+                    type(exc).__name__,
+                )
+            await self._disconnect_safely(connection)
 
     def _observe_pipeline_completion(self, task: asyncio.Task[None]) -> None:
         """Consume every background result and surface unexpected failures."""

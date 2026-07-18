@@ -6,15 +6,35 @@ import asyncio
 import json
 import random
 import string
+from collections.abc import Coroutine, Mapping
 from pathlib import Path
+from typing import cast
 
 import pytest
 
 from therapy.knowledge import distill
 from therapy.knowledge.user_model import UserModel
+from therapy.observability.interactions import require_json_object
+
+type MetricCall = tuple[str, float, dict[str, str]]
 
 
-def _run[T](awaitable) -> T:
+@pytest.fixture
+def metric_calls(monkeypatch: pytest.MonkeyPatch) -> list[MetricCall]:
+    from therapy.observability import telemetry
+
+    calls: list[MetricCall] = []
+
+    def capture(
+        name: str, value: float, attrs: dict[str, str] | None = None
+    ) -> None:
+        calls.append((name, value, attrs or {}))
+
+    monkeypatch.setattr(telemetry, "record_metric", capture)
+    return calls
+
+
+def _run[T](awaitable: Coroutine[object, object, T]) -> T:
     return asyncio.run(awaitable)
 
 
@@ -32,7 +52,7 @@ def _turns(session: str = "s1") -> list[dict[str, object]]:
     ]
 
 
-async def _accept(_kind: str, _claim: dict[str, object]) -> bool:
+async def _accept(_kind: str, _claim: Mapping[str, object]) -> bool:
     return True
 
 
@@ -123,7 +143,9 @@ def test_quotes_must_match_user_turn_and_take_actual_provenance() -> None:
         distill.verify_quotes(raw, _turns(), "s1")
 
 
-def test_distillation_is_session_scoped_atomic_and_idempotent(tmp_path: Path) -> None:
+def test_distillation_is_session_scoped_atomic_and_idempotent(
+    tmp_path: Path, metric_calls: list[MetricCall]
+) -> None:
     model = UserModel(tmp_path)
     own = model.add_observation("session one observation", session_id="s1")
     other = model.add_observation("session two observation", session_id="s2")
@@ -131,7 +153,9 @@ def test_distillation_is_session_scoped_atomic_and_idempotent(tmp_path: Path) ->
     assert other is not None
     calls = 0
 
-    async def extractor(_transcript: str, observations: list[str]):
+    async def extractor(
+        _transcript: str, observations: list[str]
+    ) -> list[distill.RawCandidate]:
         nonlocal calls
         calls += 1
         assert observations == ["session one observation"]
@@ -168,9 +192,32 @@ def test_distillation_is_session_scoped_atomic_and_idempotent(tmp_path: Path) ->
     assert first.run_id == second.run_id
     assert first.promoted_nodes == second.promoted_nodes
     assert calls == 1
-    assert model.get_node(first.promoted_nodes[0])["n_occurrences"] == 1
+    first_node = model.get_node(first.promoted_nodes[0])
+    assert first_node is not None
+    assert first_node["n_occurrences"] == 1
     assert model.pending_observations("s1") == []
     assert [row["id"] for row in model.pending_observations("s2")] == [other]
+    attempts = [
+        attrs["outcome"]
+        for name, _, attrs in metric_calls
+        if name == "therapy_distillation_attempts_total"
+    ]
+    assert attempts == ["success"]
+    runs = [
+        attrs
+        for name, _, attrs in metric_calls
+        if name == "therapy_distillation_runs_total"
+    ]
+    assert runs == [
+        {"outcome": "success", "idempotent": "false"},
+        {"outcome": "success", "idempotent": "true"},
+    ]
+    assert all(set(attrs) == {"outcome", "idempotent"} for attrs in runs)
+    assert [
+        attrs["outcome"]
+        for name, _, attrs in metric_calls
+        if name == "therapy_distillation_seconds"
+    ] == ["success", "success"]
 
 
 def test_overlapping_finalizers_commit_one_idempotent_run(tmp_path: Path) -> None:
@@ -179,7 +226,9 @@ def test_overlapping_finalizers_commit_one_idempotent_run(tmp_path: Path) -> Non
     both_extractors_started = asyncio.Event()
     extractor_calls = 0
 
-    async def extractor(_transcript: str, _observations: list[str]):
+    async def extractor(
+        _transcript: str, _observations: list[str]
+    ) -> list[distill.RawCandidate]:
         nonlocal extractor_calls
         extractor_calls += 1
         if extractor_calls == 2:
@@ -219,16 +268,24 @@ def test_overlapping_finalizers_commit_one_idempotent_run(tmp_path: Path) -> Non
     assert node["n_occurrences"] == 1
     assert model.pending_observations("s1") == []
     runs = model.export_all()["distillation_runs"]
-    assert len(runs) == 1
-    assert runs[0]["state"] == "succeeded"
+    assert isinstance(runs, list)
+    typed_runs = cast(list[object], runs)
+    assert len(typed_runs) == 1
+    run_value = typed_runs[0]
+    run = require_json_object(run_value, "distillation_runs[0]")
+    assert run["state"] == "succeeded"
 
 
-def test_validation_failure_retries_then_keeps_inbox_unconsumed(tmp_path: Path) -> None:
+def test_validation_failure_retries_then_keeps_inbox_unconsumed(
+    tmp_path: Path, metric_calls: list[MetricCall]
+) -> None:
     model = UserModel(tmp_path)
     inbox_id = model.add_observation("keep me", session_id="s1")
     attempts = 0
 
-    async def invalid(_transcript: str, _observations: list[str]):
+    async def invalid(
+        _transcript: str, _observations: list[str]
+    ) -> list[distill.RawCandidate]:
         nonlocal attempts
         attempts += 1
         return [{"kind": "node", "type": "bogus", "statement": "No."}]
@@ -246,16 +303,43 @@ def test_validation_failure_retries_then_keeps_inbox_unconsumed(tmp_path: Path) 
 
     assert attempts == distill.MAX_EXTRACTION_ATTEMPTS
     assert [row["id"] for row in model.pending_observations("s1")] == [inbox_id]
-    run = model.export_all()["distillation_runs"][0]
+    runs = model.export_all()["distillation_runs"]
+    assert isinstance(runs, list)
+    typed_runs = cast(list[object], runs)
+    run_value = typed_runs[0]
+    run = require_json_object(run_value, "distillation_runs[0]")
     assert run["state"] == "failed"
-    assert "CandidateValidationError" in run["error"]
+    error = run.get("error")
+    assert isinstance(error, str)
+    assert "CandidateValidationError" in error
+    assert [
+        attrs["outcome"]
+        for name, _, attrs in metric_calls
+        if name == "therapy_distillation_attempts_total"
+    ] == ["invalid"] * distill.MAX_EXTRACTION_ATTEMPTS
+    assert (
+        "therapy_distillation_runs_total",
+        1,
+        {"outcome": "error", "idempotent": "false"},
+    ) in metric_calls
+    assert [
+        attrs["category"]
+        for name, _, attrs in metric_calls
+        if name == "therapy_distillation_validation_failures_total"
+    ] == ["schema"] * distill.MAX_EXTRACTION_ATTEMPTS
+    assert any(
+        name == "therapy_distillation_seconds" and attrs == {"outcome": "error"}
+        for name, _, attrs in metric_calls
+    )
 
 
 def test_unresolved_edge_rolls_back_nodes_evidence_and_inbox(tmp_path: Path) -> None:
     model = UserModel(tmp_path)
     inbox_id = model.add_observation("edge observation", session_id="s1")
 
-    async def extractor(_transcript: str, _observations: list[str]):
+    async def extractor(
+        _transcript: str, _observations: list[str]
+    ) -> list[distill.RawCandidate]:
         return [
             {
                 "kind": "node",
@@ -292,7 +376,9 @@ def test_edge_resolves_existing_multilingual_alias_and_gets_evidence(
 ) -> None:
     model = UserModel(tmp_path)
 
-    async def first_extractor(_transcript: str, _observations: list[str]):
+    async def first_extractor(
+        _transcript: str, _observations: list[str]
+    ) -> list[distill.RawCandidate]:
         return [
             {
                 "kind": "node",
@@ -318,7 +404,9 @@ def test_edge_resolves_existing_multilingual_alias_and_gets_evidence(
         )
     )
 
-    async def edge_extractor(_transcript: str, _observations: list[str]):
+    async def edge_extractor(
+        _transcript: str, _observations: list[str]
+    ) -> list[distill.RawCandidate]:
         return [
             {
                 "kind": "edge",
@@ -342,6 +430,7 @@ def test_edge_resolves_existing_multilingual_alias_and_gets_evidence(
 
     assert len(result.promoted_edges) == 1
     edge = model.get_edge(result.promoted_edges[0])
+    assert edge is not None
     assert edge["type"] == "triggers"
     evidence = model.evidence("edge", edge["id"])
     assert evidence[0]["language"] == "pt"
@@ -358,7 +447,7 @@ def test_judgment_is_separate_and_negative_snapshot_is_not_reasked(
     assert node_id is not None
     judgments = 0
 
-    async def reject(_kind: str, _claim: dict[str, object]) -> bool:
+    async def reject(_kind: str, _claim: Mapping[str, object]) -> bool:
         nonlocal judgments
         judgments += 1
         return False
@@ -366,7 +455,9 @@ def test_judgment_is_separate_and_negative_snapshot_is_not_reasked(
     assert _run(distill.graduate(model, judger=reject)) == ([], [])
     assert _run(distill.graduate(model, judger=reject)) == ([], [])
     assert judgments == 1
-    assert model.get_node(node_id)["status"] == "observation"
+    node = model.get_node(node_id)
+    assert node is not None
+    assert node["status"] == "observation"
 
     model.upsert_node("pattern", "Checks email early.", session_id="s3")
     assert _run(distill.graduate(model, judger=reject)) == ([], [])
@@ -394,4 +485,155 @@ def test_node_and_edge_both_graduate_only_after_judgment(tmp_path: Path) -> None
 
     assert nodes == []
     assert edges == [edge_id]
-    assert model.get_edge(edge_id)["status"] == "proposed"
+    edge = model.get_edge(edge_id)
+    assert edge is not None
+    assert edge["status"] == "proposed"
+
+
+def test_distillation_candidate_dispositions_are_bounded_and_content_free(
+    tmp_path: Path, metric_calls: list[MetricCall]
+) -> None:
+    model = UserModel(tmp_path)
+    for session_id in ("s1", "s1", "s2"):
+        model.upsert_node(
+            "pattern", "Checks private mail early.", session_id=session_id
+        )
+    metric_calls.clear()
+
+    async def extractor(
+        _transcript: str, _observations: list[str]
+    ) -> list[distill.RawCandidate]:
+        return [
+            {
+                "kind": "node",
+                "type": "pattern",
+                "statement": "Checks private mail early.",
+            }
+        ]
+
+    async def reject(_kind: str, _claim: Mapping[str, object]) -> bool:
+        return False
+
+    _run(
+        distill.distill_session(
+            model,
+            _turns("s3"),
+            "s3",
+            extractor=extractor,
+            judger=reject,
+            extractor_version="disposition-deferred",
+        )
+    )
+    _run(
+        distill.distill_session(
+            model,
+            _turns("s4"),
+            "s4",
+            extractor=extractor,
+            judger=_accept,
+            extractor_version="disposition-proposed",
+        )
+    )
+
+    dispositions = [
+        attrs
+        for name, _, attrs in metric_calls
+        if name == "therapy_distillation_candidates_total"
+    ]
+    assert {attrs["disposition"] for attrs in dispositions} == {
+        "candidate",
+        "promoted",
+        "proposed",
+        "deferred",
+    }
+    assert all(set(attrs) == {"disposition"} for attrs in dispositions)
+    candidate_histograms = [
+        attrs["disposition"]
+        for name, _, attrs in metric_calls
+        if name == "therapy_distillation_candidate_count"
+    ]
+    assert set(candidate_histograms) == {
+        "candidate",
+        "promoted",
+        "proposed",
+        "deferred",
+    }
+    assert all(
+        attrs["disposition"]
+        in {"candidate", "promoted", "proposed", "deferred"}
+        for attrs in dispositions
+    )
+    assert "private mail" not in json.dumps(metric_calls).casefold()
+    assert "disposition-deferred" not in json.dumps(metric_calls)
+
+
+def test_distillation_retryable_attempt_and_unexpected_error_outcomes(
+    tmp_path: Path, metric_calls: list[MetricCall]
+) -> None:
+    model = UserModel(tmp_path)
+    attempts = 0
+
+    async def retry_once(
+        _transcript: str, _observations: list[str]
+    ) -> list[distill.RawCandidate]:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise TimeoutError("restricted timeout detail")
+        return []
+
+    _run(
+        distill.distill_session(
+            model,
+            _turns(),
+            "retry-session",
+            extractor=retry_once,
+            extractor_version="retry-v1",
+        )
+    )
+    assert [
+        attrs["outcome"]
+        for name, _, attrs in metric_calls
+        if name == "therapy_distillation_attempts_total"
+    ] == ["retry", "success"]
+
+    metric_calls.clear()
+
+    async def fail_hard(
+        _transcript: str, _observations: list[str]
+    ) -> list[distill.RawCandidate]:
+        raise RuntimeError("private completion and session 42")
+
+    with pytest.raises(RuntimeError, match="private completion"):
+        _run(
+            distill.distill_session(
+                model,
+                _turns("hard-error-session"),
+                "hard-error-session",
+                extractor=fail_hard,
+                extractor_version="hard-error-v1",
+            )
+        )
+
+    assert (
+        "therapy_distillation_attempts_total",
+        1,
+        {"outcome": "error"},
+    ) in metric_calls
+    assert (
+        "therapy_distillation_runs_total",
+        1,
+        {"outcome": "error", "idempotent": "false"},
+    ) in metric_calls
+    attempt_attrs = [
+        attrs
+        for name, _, attrs in metric_calls
+        if name == "therapy_distillation_attempts_total"
+    ]
+    assert all(
+        attrs["outcome"] in {"success", "invalid", "retry", "error"}
+        for attrs in attempt_attrs
+    )
+    encoded = json.dumps(metric_calls).casefold()
+    assert "private completion" not in encoded
+    assert "hard-error-session" not in encoded

@@ -64,7 +64,7 @@ class ProactivityConfig:
     explicitly configured, so an unknown channel can never fire.
     """
 
-    channels: dict[str, ChannelConfig] = field(default_factory=dict)
+    channels: dict[str, ChannelConfig] = field(default_factory=lambda: {})
 
     def for_channel(self, channel: str) -> ChannelConfig:
         """Return a channel's config, or a disabled default."""

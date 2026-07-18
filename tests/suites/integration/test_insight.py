@@ -8,7 +8,24 @@ from pathlib import Path
 import pytest
 
 from therapy.knowledge import insight
-from therapy.knowledge.user_model import UserModel
+from therapy.knowledge.user_model import GraphNode, UserModel
+
+type MetricCall = tuple[str, float, dict[str, str]]
+
+
+@pytest.fixture
+def metric_calls(monkeypatch: pytest.MonkeyPatch) -> list[MetricCall]:
+    from therapy.observability import telemetry
+
+    calls: list[MetricCall] = []
+
+    def capture(
+        name: str, value: float, attrs: dict[str, str] | None = None
+    ) -> None:
+        calls.append((name, value, attrs or {}))
+
+    monkeypatch.setattr(telemetry, "record_metric", capture)
+    return calls
 
 
 def _proposed_node(model: UserModel, statement: str = "Skips lunch when busy.") -> int:
@@ -18,6 +35,13 @@ def _proposed_node(model: UserModel, statement: str = "Skips lunch when busy.") 
     assert node_id is not None
     assert model.propose(node_id)
     return node_id
+
+
+def _node(model: UserModel, node_id: int) -> GraphNode:
+    """Return one required graph node for assertions."""
+    node = model.get_node(node_id)
+    assert node is not None
+    return node
 
 
 def test_explicit_model_directory_overrides_process_default(
@@ -50,10 +74,13 @@ def test_cross_session_patterns_rank_auditable_and_hide_private(
     assert "A private recurring worry." not in statements
 
 
-def test_queue_records_snapshot_delivery_and_exact_confirmation(tmp_path: Path) -> None:
+def test_queue_records_snapshot_delivery_and_exact_confirmation(
+    tmp_path: Path, metric_calls: list[MetricCall]
+) -> None:
     model = UserModel(tmp_path)
     node_id = _proposed_node(model)
     service = insight.InsightService(model)
+    metric_calls.clear()
 
     assert service.sync_proposals() == 1
     queued = service.list(state="queued")
@@ -70,19 +97,33 @@ def test_queue_records_snapshot_delivery_and_exact_confirmation(tmp_path: Path) 
     resolved = service.resolve_conversational("session", "Yes, that fits.")
     assert resolved is not None
     assert resolved["state"] == "confirmed"
-    assert model.get_node(node_id)["status"] == "confirmed"
+    assert _node(model, node_id)["status"] == "confirmed"
     assert [event["event_type"] for event in service.history(resolved["id"])] == [
         "delivered",
         "confirmed",
     ]
+    transitions = [
+        attrs["state"]
+        for name, _, attrs in metric_calls
+        if name == "therapy_insight_transitions_total"
+    ]
+    assert transitions == ["proposed", "delivered", "confirmed"]
+    assert [
+        value
+        for name, value, attrs in metric_calls
+        if name == "therapy_insight_queue_depth" and attrs == {}
+    ] == [1, 0, 0]
 
 
-def test_rejection_updates_only_claim_just_delivered(tmp_path: Path) -> None:
+def test_rejection_updates_only_claim_just_delivered(
+    tmp_path: Path, metric_calls: list[MetricCall]
+) -> None:
     model = UserModel(tmp_path)
     first = _proposed_node(model, "Skips lunch when busy.")
     second = _proposed_node(model, "Skips breaks when busy.")
     service = insight.InsightService(model)
     service.sync_proposals()
+    metric_calls.clear()
 
     delivered = service.next_for_topic("lunch", "session")
     assert delivered is not None
@@ -90,11 +131,23 @@ def test_rejection_updates_only_claim_just_delivered(tmp_path: Path) -> None:
 
     assert resolved is not None
     assert resolved["claim_id"] == first
-    assert model.get_node(first)["status"] == "rejected"
-    assert model.get_node(second)["status"] == "proposed"
+    assert _node(model, first)["status"] == "rejected"
+    assert _node(model, second)["status"] == "proposed"
+    assert (
+        "therapy_insight_transitions_total",
+        1,
+        {"state": "rejected"},
+    ) in metric_calls
+    assert (
+        "therapy_insight_queue_depth",
+        1,
+        {},
+    ) in metric_calls
 
 
-def test_snooze_and_dismiss_preserve_graph_proposal(tmp_path: Path) -> None:
+def test_snooze_and_dismiss_preserve_graph_proposal(
+    tmp_path: Path, metric_calls: list[MetricCall]
+) -> None:
     model = UserModel(tmp_path)
     node_id = _proposed_node(model)
     service = insight.InsightService(model)
@@ -103,10 +156,16 @@ def test_snooze_and_dismiss_preserve_graph_proposal(tmp_path: Path) -> None:
 
     assert service.snooze(queued["id"], days=2)
     assert service.list(state="snoozed")[0]["snoozed_until"] is not None
-    assert model.get_node(node_id)["status"] == "proposed"
+    assert _node(model, node_id)["status"] == "proposed"
     assert service.dismiss(queued["id"])
     assert service.list(state="dismissed")[0]["resolved_at"] is not None
-    assert model.get_node(node_id)["status"] == "proposed"
+    assert _node(model, node_id)["status"] == "proposed"
+    states = [
+        attrs["state"]
+        for name, _, attrs in metric_calls
+        if name == "therapy_insight_transitions_total"
+    ]
+    assert states[-2:] == ["snoozed", "dismissed"]
 
 
 def test_session_recap_uses_injected_recapper() -> None:
@@ -119,3 +178,85 @@ def test_session_recap_uses_injected_recapper() -> None:
     result = asyncio.run(insight.session_recap(turns, recapper=recapper))
     assert result.startswith("recap of")
     assert asyncio.run(insight.session_recap([], recapper=recapper)) == ""
+
+
+def test_direct_resolution_and_claim_dismissal_emit_bounded_states(
+    tmp_path: Path, metric_calls: list[MetricCall]
+) -> None:
+    model = UserModel(tmp_path)
+    confirmed = _proposed_node(model, "Checks a private schedule.")
+    dismissed = _proposed_node(model, "Reviews a private checklist.")
+    service = insight.InsightService(model)
+    metric_calls.clear()
+
+    assert service.resolve_claim("node", confirmed, "confirmed")
+    assert service.dismiss_claim("node", dismissed) == 1
+
+    transitions = [
+        attrs
+        for name, _, attrs in metric_calls
+        if name == "therapy_insight_transitions_total"
+    ]
+    assert {attrs["state"] for attrs in transitions} == {
+        "proposed",
+        "confirmed",
+        "dismissed",
+    }
+    assert all(set(attrs) == {"state"} for attrs in transitions)
+    assert all(
+        attrs["state"]
+        in {
+            "proposed",
+            "delivered",
+            "snoozed",
+            "dismissed",
+            "confirmed",
+            "rejected",
+        }
+        for attrs in transitions
+    )
+    gauges = [
+        (value, attrs)
+        for name, value, attrs in metric_calls
+        if name == "therapy_insight_queue_depth"
+    ]
+    assert gauges
+    assert all(attrs == {} and value >= 0 for value, attrs in gauges)
+    encoded = repr(metric_calls).casefold()
+    assert "private schedule" not in encoded
+    assert "private checklist" not in encoded
+
+
+def test_insight_expected_failure_emits_no_false_transition(
+    tmp_path: Path, metric_calls: list[MetricCall]
+) -> None:
+    service = insight.InsightService(UserModel(tmp_path))
+    metric_calls.clear()
+
+    assert service.snooze("missing-insight") is False
+    assert service.resolve("missing-insight", "rejected") is None
+    assert service.dismiss("missing-insight") is False
+
+    assert not any(
+        name in {"therapy_insight_transitions_total", "therapy_insight_queue_depth"}
+        for name, _, _ in metric_calls
+    )
+
+
+def test_insight_unexpected_exception_does_not_emit_content_or_false_state(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    metric_calls: list[MetricCall],
+) -> None:
+    model = UserModel(tmp_path)
+    service = insight.InsightService(model)
+    metric_calls.clear()
+
+    def fail(*_args: object, **_kwargs: object) -> list[dict[str, object]]:
+        raise RuntimeError("private topic, claim 42, insight secret-id")
+
+    monkeypatch.setattr(model, "lifecycle_events", fail)
+    with pytest.raises(RuntimeError, match="private topic"):
+        service.sync_proposals()
+
+    assert metric_calls == []

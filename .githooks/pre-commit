@@ -1,0 +1,61 @@
+#!/bin/sh
+# TheraPy pre-commit — fast static + data-safety gate (host-only, no container).
+# Kept under a second so it never gets in the way. Heavy gates (types, full
+# suite, coverage) live in pre-push. Bypass in emergencies: git commit --no-verify
+set -eu
+
+repo_root=$(git rev-parse --show-toplevel)
+ruff="$repo_root/.venv/bin/ruff"
+attr_lib="$repo_root/.githooks/lib/no-attribution.sh"
+
+# 1) Ruff lint on staged Python files (the enforced rule set: I/UP/B/PT).
+staged_py=$(git diff --cached --name-only --diff-filter=ACM -- '*.py')
+if [ -n "$staged_py" ]; then
+  if [ -x "$ruff" ]; then
+    printf '%s\n' "$staged_py" | xargs "$ruff" check --force-exclude
+  else
+    echo "pre-commit: $ruff missing — run 'uv sync' to lint (skipping)" >&2
+  fi
+fi
+
+# The existing tree was deliberately NOT mass-reformatted, so the first commit
+# touching a long-unformatted file will be asked to run 'ruff format <file>' —
+# format-on-touch, by design.
+# if [ -n "$staged_py" ] && [ -x "$ruff" ]; then
+#   printf '%s\n' "$staged_py" | xargs "$ruff" format --check --force-exclude
+# fi
+
+# 2) Data-safety: never commit personal audio / DBs / secrets, even when a
+#    .gitignore rule is bypassed with 'git add -f'. Mirrors the .gitignore
+#    patterns (docs/SPEC.md Hardening 7-9) as a committing-time backstop.
+# TEMPORARILY RELAXED (owner, 2026-07-17): wav/ogg/webm removed so the voice-e2e
+# lane can commit small SYNTHETIC audio fixtures (.local/voice-e2e-lane-spec.md
+# D-1). Personal recordings remain forbidden by policy — the (^|/)data/ block
+# still guards the live data tree. Restore by swapping the two lines back:
+# if git diff --cached --name-only --diff-filter=ACM \
+#      | grep -Ev '\.env\.example$' \
+#      | grep -Eiq '(^|/)data/|\.(wav|ogg|webm|db|sqlite3|key)$|(^|/)\.env(\.|$)|data-backup-.*\.tgz'; then
+if git diff --cached --name-only --diff-filter=ACM \
+     | grep -Ev '\.env\.example$' \
+     | grep -Eiq '(^|/)data/|\.(db|sqlite3|key)$|(^|/)\.env(\.|$)|data-backup-.*\.tgz'; then
+  echo "pre-commit: refusing to stage personal data / secrets (see .gitignore)" >&2
+  exit 1
+fi
+
+# 3) Attribution guard: repository files must never gain TOOL attribution (owner
+#    rule). Scans only ADDED lines (leading '+' stripped) so pre-existing legit
+#    uses — including plain vendor mentions like 'anthropic adapter' — never trip
+#    it; .githooks/ is excluded because the patterns themselves live here. The
+#    context-aware predicate lives in lib/no-attribution.sh — delete that file to
+#    switch this check off.
+if [ -f "$attr_lib" ]; then
+  . "$attr_lib"
+  added=$(git diff --cached -U0 --diff-filter=ACM -- . ":(exclude).githooks" \
+          | grep -E '^\+[^+]' | sed 's/^+//' || true)
+  hits=$(printf '%s\n' "$added" | attr_scan)
+  if [ -n "$hits" ]; then
+    echo "pre-commit: staged content reads like tool attribution (not mere vendor mention):" >&2
+    printf '%s\n' "$hits" | sed 's/^/    /' >&2
+    exit 1
+  fi
+fi

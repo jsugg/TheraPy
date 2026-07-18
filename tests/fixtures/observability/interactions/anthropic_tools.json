@@ -1,0 +1,242 @@
+{
+  "broad_twin": {
+    "component": "llm",
+    "duration_ms": 2500,
+    "event.name": "llm.attempt",
+    "finish_class": "tool_use",
+    "input_size_bucket": "1k-4k",
+    "input_tokens": 412,
+    "operation": "tool",
+    "outcome": "success",
+    "output_size_bucket": "0-1k",
+    "output_tokens": 96,
+    "provider": "anthropic",
+    "requested_model_policy": "claude-opus-4-8",
+    "retry_count": 0,
+    "span_id": "9ab2f3f8fe013ef0",
+    "status_class": "2xx",
+    "trace_id": "a00e6744d7c924953eb3aa8d297acea0",
+    "ttft_ms": 350
+  },
+  "case": "anthropic_tools",
+  "record": {
+    "actual_model": "claude-opus-4-8",
+    "build_version": "0.1.0",
+    "completed_at": "2026-07-15T12:00:02.500000+00:00",
+    "config_version": "c1",
+    "error": null,
+    "interaction_id": "itx-anthropic-tools",
+    "language": "es",
+    "modality": "voice",
+    "operation": "tool",
+    "policy_version": "p2",
+    "prompt_template_version": "v3",
+    "provider": "anthropic",
+    "provider_native": {
+      "ordered_events": [
+        {
+          "message": {
+            "id": "msg_fixture_01",
+            "usage": {
+              "input_tokens": 412,
+              "output_tokens": 0
+            }
+          },
+          "type": "message_start"
+        },
+        {
+          "content_block": {
+            "text": "",
+            "type": "text"
+          },
+          "index": 0,
+          "type": "content_block_start"
+        },
+        {
+          "type": "ping"
+        },
+        {
+          "delta": {
+            "text": "OBS-CANARY-COM",
+            "type": "text_delta"
+          },
+          "index": 0,
+          "type": "content_block_delta"
+        },
+        {
+          "delta": {
+            "text": "PLETION-d74c3a",
+            "type": "text_delta"
+          },
+          "index": 0,
+          "type": "content_block_delta"
+        },
+        {
+          "index": 0,
+          "type": "content_block_stop"
+        },
+        {
+          "content_block": {
+            "id": "toolu_fixture",
+            "name": "lookup_research",
+            "type": "tool_use"
+          },
+          "index": 1,
+          "type": "content_block_start"
+        },
+        {
+          "delta": {
+            "partial_json": "{\"query\": \"",
+            "type": "input_json_delta"
+          },
+          "index": 1,
+          "type": "content_block_delta"
+        },
+        {
+          "delta": {
+            "partial_json": "OBS-CANARY-TOOL-ARGUMENTS-1b887e\"}",
+            "type": "input_json_delta"
+          },
+          "index": 1,
+          "type": "content_block_delta"
+        },
+        {
+          "index": 1,
+          "type": "content_block_stop"
+        },
+        {
+          "delta": {
+            "stop_reason": "end_turn"
+          },
+          "type": "message_delta",
+          "usage": {
+            "output_tokens": 96
+          }
+        },
+        {
+          "type": "message_stop"
+        }
+      ],
+      "request": {
+        "body_request_id": "req_body_fixture_02",
+        "model": "claude-opus-4-8",
+        "tools": [
+          {
+            "description": "OBS-CANARY-TOOL-DEFINITION-0a796d",
+            "name": "lookup_research"
+          }
+        ]
+      },
+      "response_request_id": "req_hdr_fixture_02",
+      "sdk_retry": {
+        "attempt": 0,
+        "parsed_delay_seconds": null
+      },
+      "terminal_error": null,
+      "terminal_response": {
+        "stop_reason": "tool_use",
+        "usage": {
+          "input_tokens": 512,
+          "output_tokens": 64
+        }
+      }
+    },
+    "request": {
+      "context_order": [
+        "system",
+        "memory",
+        "retrieval",
+        "messages"
+      ],
+      "memory_notes": [
+        "OBS-CANARY-MEMORY-NOTE-e85b4b"
+      ],
+      "messages": [
+        {
+          "content": "OBS-CANARY-TYPED-TRANSCRIPT-a41f07",
+          "role": "user"
+        }
+      ],
+      "parameters": {
+        "max_tokens": 500,
+        "temperature": 1.0
+      },
+      "response_schema": null,
+      "retrieved_documents": [
+        {
+          "anchor": "p4.b2",
+          "rank": 1,
+          "score": 0.83,
+          "source_id": "doc-77",
+          "source_type": "research",
+          "text": "OBS-CANARY-RETRIEVAL-PASSAGE-f96a5c"
+        }
+      ],
+      "system_instructions": "OBS-CANARY-SYSTEM-PROMPT-c63d29",
+      "tools": [
+        {
+          "arguments": null,
+          "authorization_outcome": "allowed",
+          "definition": {
+            "description": "OBS-CANARY-TOOL-DEFINITION-0a796d",
+            "input_schema": {
+              "properties": {
+                "query": {
+                  "type": "string"
+                }
+              },
+              "type": "object"
+            },
+            "name": "lookup_research"
+          }
+        }
+      ],
+      "transcript": [
+        {
+          "language": "es",
+          "modality": "voice",
+          "role": "user",
+          "text": "OBS-CANARY-VOICE-TRANSCRIPT-b52e18"
+        }
+      ],
+      "truncation": {
+        "applied": false,
+        "dropped_messages": 0
+      }
+    },
+    "requested_model": "claude-opus-4-8",
+    "response": {
+      "completion": "OBS-CANARY-COMPLETION-d74c3a",
+      "finish_reason": "tool_use",
+      "messages": [],
+      "tool_calls": [
+        {
+          "arguments": {
+            "query": "OBS-CANARY-TOOL-ARGUMENTS-1b887e"
+          },
+          "id": "toolu_fixture",
+          "name": "lookup_research"
+        }
+      ],
+      "tool_results": [
+        {
+          "content": "OBS-CANARY-TOOL-RESULT-2c798f",
+          "is_error": false,
+          "tool_call_id": "toolu_fixture"
+        }
+      ],
+      "usage": {
+        "input_tokens": 512,
+        "output_tokens": 64
+      }
+    },
+    "session_id": "sess-anthropic-tools",
+    "span_id": "9ab2f3f8fe013ef0",
+    "started_at": "2026-07-15T12:00:00.000000+00:00",
+    "status": "succeeded",
+    "stream": [],
+    "trace_id": "a00e6744d7c924953eb3aa8d297acea0",
+    "turn_id": 3
+  },
+  "scenario": "tools"
+}

@@ -9,11 +9,11 @@ from __future__ import annotations
 
 import hashlib
 import sqlite3
-from collections.abc import Iterator, Sequence
+from collections.abc import Generator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import Any, TypedDict
+from typing import Any, Literal, TypedDict
 
 import numpy as np
 
@@ -29,10 +29,34 @@ from therapy.knowledge.user_model import (
     GraphEdge,
     GraphNode,
     UserModel,
-    _tokens,
     render_context,
+    tokens,
 )
 from therapy.memory.store import MemoryStore, RowDict
+
+type ContextStage = Literal["graph", "episode", "insight", "research", "embed"]
+
+
+@contextmanager
+def _context_stage(stage: ContextStage) -> Generator[None, None, None]:
+    """Time one bounded context-assembly stage without selected content."""
+    import time
+
+    from therapy.observability.telemetry import record_metric
+
+    started = time.monotonic()
+    outcome = "success"
+    try:
+        yield
+    except Exception:
+        outcome = "error"
+        raise
+    finally:
+        record_metric(
+            "therapy_context_stage_seconds",
+            time.monotonic() - started,
+            {"stage": stage, "outcome": outcome},
+        )
 
 MEMORY_MARKER = "# Longitudinal context (refreshed per turn)"
 
@@ -109,7 +133,7 @@ class ContextAssembler:
         self._db_path = model.data_dir / "therapy.db"
 
     @contextmanager
-    def _connect(self) -> Iterator[sqlite3.Connection]:
+    def _connect(self) -> Generator[sqlite3.Connection, None, None]:
         connection = sqlite3.connect(self._db_path, timeout=30.0)
         connection.row_factory = sqlite3.Row
         try:
@@ -190,46 +214,123 @@ class ContextAssembler:
                         result[entity_id] = normalized
         return result
 
+    @staticmethod
+    def _record_items(source: str, count: int) -> None:
+        """Bounded per-source context evidence (plan O3.2): count buckets
+        only; exact selected/rendered context stays restricted."""
+        from therapy.observability.model import count_bucket
+        from therapy.observability.telemetry import record_metric
+
+        record_metric(
+            "therapy_context_items_total",
+            1,
+            {"source": source, "bucket": count_bucket(count)},
+        )
+        record_metric(
+            "therapy_context_selected_items", count, {"source": source}
+        )
+
+    @staticmethod
+    def _record_filtered(source: str, reason: str, count: int) -> None:
+        """Record aggregate context exclusions without selected content."""
+        if count < 1:
+            return
+        from therapy.observability.telemetry import record_metric
+
+        record_metric(
+            "therapy_context_filtered_items_total",
+            count,
+            {"source": source, "reason": reason},
+        )
+
     def assemble(self, topic: str, session_id: str) -> TurnContext:
         """Refresh semantic/episodic memory and adjacent insight for one turn."""
+        import time as time_module
+
+        from therapy.observability.telemetry import record_metric
+
         if not session_id:
             raise ValueError("session_id is required")
-        if not topic.strip():
-            graph = self.model.assemble_context("")
-            return {
-                "note": self._render(graph, [], None),
-                "graph": graph,
-                "episodes": [],
-                "insight": None,
-                "resolution": None,
-                "research": "",
+        assemble_started = time_module.monotonic()
+        outcome = "success"
+        try:
+            if not topic.strip():
+                with _context_stage("graph"):
+                    graph = self.model.assemble_context("")
+                note = self._render(graph, [], None)
+                graph_count = sum(
+                    len(graph[key])
+                    for key in (
+                        "identity",
+                        "preferences",
+                        "goals",
+                        "threads",
+                        "walk_nodes",
+                    )
+                )
+                self._record_items("graph", graph_count)
+                self._record_items("edge", len(graph["walk_edges"]))
+                self._record_items("episode", 0)
+                self._record_items("insight", 0)
+                self._record_items("research", 0)
+                if note is not None:
+                    record_metric("therapy_context_rendered_chars", len(note))
+                return {
+                    "note": note,
+                    "graph": graph,
+                    "episodes": [],
+                    "insight": None,
+                    "resolution": None,
+                    "research": "",
+                }
+            with _context_stage("insight"):
+                resolution = self.insights.resolve_conversational(session_id, topic)
+            with _context_stage("embed"):
+                query = self.embedder.embed_query(topic)
+            with _context_stage("graph"):
+                graph = self._graph_context(topic, query)
+            with _context_stage("episode"):
+                episodes = self._episodes(topic, query)
+            adjacent_claim_ids = {
+                node["id"]
+                for key in ("identity", "preferences", "goals", "threads", "walk_nodes")
+                for node in graph[key]
             }
-        resolution = self.insights.resolve_conversational(session_id, topic)
-        query = self.embedder.embed_query(topic)
-        graph = self._graph_context(topic, query)
-        episodes = self._episodes(topic, query)
-        adjacent_claim_ids = {
-            node["id"]
-            for key in ("identity", "preferences", "goals", "threads", "walk_nodes")
-            for node in graph[key]
-        }
-        insight = (
-            None
-            if resolution is not None
-            else self.insights.next_for_topic(
-                topic, session_id, adjacent_claim_ids=adjacent_claim_ids
+            with _context_stage("insight"):
+                insight = (
+                    None
+                    if resolution is not None
+                    else self.insights.next_for_topic(
+                        topic, session_id, adjacent_claim_ids=adjacent_claim_ids
+                    )
+                )
+            with _context_stage("research"):
+                research = self.research.grounding_context(topic)
+            note = self._render(graph, episodes, insight, research, resolution)
+            self._record_items("graph", len(adjacent_claim_ids))
+            self._record_items("edge", len(graph["walk_edges"]))
+            self._record_items("episode", len(episodes))
+            self._record_items("insight", 1 if insight else 0)
+            self._record_items("research", 1 if research else 0)
+            if note is not None:
+                record_metric("therapy_context_rendered_chars", len(note))
+            return {
+                "note": note,
+                "graph": graph,
+                "episodes": episodes,
+                "insight": insight,
+                "resolution": resolution,
+                "research": research,
+            }
+        except Exception:
+            outcome = "error"
+            raise
+        finally:
+            record_metric(
+                "therapy_context_assembly_seconds",
+                time_module.monotonic() - assemble_started,
+                {"outcome": outcome},
             )
-        )
-        research = self.research.grounding_context(topic)
-        note = self._render(graph, episodes, insight, research, resolution)
-        return {
-            "note": note,
-            "graph": graph,
-            "episodes": episodes,
-            "insight": insight,
-            "resolution": resolution,
-            "research": research,
-        }
 
     def _allows_node(
         self, node: GraphNode, topic: str, semantic_similarity: float
@@ -249,14 +350,16 @@ class ContextAssembler:
             return True
         if raised:
             return semantic_similarity >= max(0.85, self.budget.node_threshold)
-        return bool(_tokens(topic) & _tokens(node["statement"]))
+        return bool(tokens(topic) & tokens(node["statement"]))
 
     def _graph_context(self, topic: str, query: np.ndarray) -> GraphContext:
+        all_nodes = self.model.nodes()
         candidates = [
             node
-            for node in self.model.nodes()
+            for node in all_nodes
             if node["status"] not in {"rejected", "superseded", "needs_revalidation"}
         ]
+        self._record_filtered("graph", "status", len(all_nodes) - len(candidates))
         vectors = self._vectors(
             "node", [(str(node["id"]), node["statement"]) for node in candidates]
         )
@@ -272,6 +375,9 @@ class ContextAssembler:
             for similarity, node in scored
             if self._allows_node(node, topic, similarity)
         }
+        self._record_filtered(
+            "graph", "boundary", len(candidates) - len(allowed_ids)
+        )
         candidates = [node for node in candidates if node["id"] in allowed_ids]
         semantic = [
             node
@@ -329,6 +435,9 @@ class ContextAssembler:
         standing_ids = {
             node["id"] for node in (*identity, *preferences, *goals, *threads)
         }
+        self._record_filtered(
+            "graph", "selection", len(allowed_ids - selected_ids)
+        )
         return {
             "identity": identity,
             "preferences": preferences,
@@ -340,7 +449,7 @@ class ContextAssembler:
         }
 
     def _episodes(self, topic: str, query: np.ndarray) -> list[EpisodicContext]:
-        rows = self.store.episodic_summaries()
+        all_rows = self.store.episodic_summaries()
         boundary_patterns = [
             value.casefold() for value in self.model.never_store_topics()
         ]
@@ -352,12 +461,13 @@ class ContextAssembler:
         )
         rows = [
             row
-            for row in rows
+            for row in all_rows
             if not any(
                 pattern in str(row["summary"] or "").casefold()
                 for pattern in boundary_patterns
             )
         ]
+        self._record_filtered("episode", "boundary", len(all_rows) - len(rows))
         vectors = self._vectors(
             "episode", [(str(row["id"]), str(row["summary"])) for row in rows]
         )
@@ -383,6 +493,7 @@ class ContextAssembler:
             for score, row in scored
             if score >= self.budget.episode_threshold
         ][: self.budget.max_episodes]
+        self._record_filtered("episode", "selection", len(rows) - len(episodes))
         return episodes
 
     def _render(
@@ -407,6 +518,12 @@ class ContextAssembler:
             )
         if research:
             sections.append("# Silent technique grounding\n" + research[:1_600])
+            if len(research) > 1_600:
+                from therapy.observability.telemetry import record_metric
+
+                record_metric(
+                    "therapy_context_truncations_total", 1, {"source": "research"}
+                )
         if insight is not None:
             sections.append(
                 "# Adjacent reflection to raise once\n"
@@ -425,6 +542,18 @@ class ContextAssembler:
         max_chars = self.budget.max_tokens * 4
         if len(note) <= max_chars:
             return note
+        from therapy.observability.telemetry import record_metric
+
+        for source, present in (
+            ("graph", bool(graph_note)),
+            ("episode", bool(episodes)),
+            ("insight", insight is not None or resolution is not None),
+            ("research", bool(research)),
+        ):
+            if present:
+                record_metric(
+                    "therapy_context_truncations_total", 1, {"source": source}
+                )
         clipped = note[: max_chars - 40]
         boundary = clipped.rfind("\n")
         if boundary > max_chars // 2:

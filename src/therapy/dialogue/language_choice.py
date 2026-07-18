@@ -87,10 +87,25 @@ class ReplyLanguage:
     def pinned(self) -> str | None:
         return self._pin
 
+    @staticmethod
+    def _transition(outcome: str) -> None:
+        """Finite reply-language transition evidence (plan O3.2) — only on
+        state change, never the language code itself as a free value."""
+        from therapy.observability.telemetry import record_metric
+
+        record_metric(
+            "therapy_language_transitions_total",
+            1,
+            {"kind": "reply_language", "outcome": outcome},
+        )
+
     def set_pin(self, code: str | None) -> str:
         """Pin the reply language (`None` = back to auto); returns the result."""
         if code is not None and code not in SUPPORTED_LANGUAGES:
+            self._transition("unsupported")
             raise ValueError(f"Unsupported reply language: {code!r}")
+        if code != self._pin:
+            self._transition("pinned" if code else "auto")
         self._pin = code
         return self.language
 
@@ -114,8 +129,11 @@ class ReplyLanguage:
         counts = word_language_counts(text)
         total = sum(counts.values())
         if total and (not self._established or total >= self.MIN_WORDS_TO_SWITCH):
+            previous = self._auto
             self._auto = dominant_language(text, self._auto)
             self._established = True
+            if self._auto != previous:
+                self._transition("changed")
         return self.language
 
 

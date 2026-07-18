@@ -36,6 +36,12 @@ distilled into user-model facts — new conversations open knowing the prior
 context, and a 📖 history view in the PWA browses past transcripts. See
 [`docs/SPEC.md`](docs/SPEC.md) for the full specification and roadmap.
 
+Latest dry-run result (2026-07-10, shipped image, fully-local pedrolucas/smollm3:3b-q4_k_m):
+all ten scenarios green — trilingual turns, typed-turn silence, barge-in,
+both SPEC §7 normative code-switched phrases, pin/unpin. Client-side TTFA
+9.2–32.5 s on a warm container (whisper, Kokoro, and the LLM share this
+CPU) — to be re-measured with the target provider during verification.
+
 ## Configuration
 
 Copy `.env.example` to `.env`. The LLM provider is swappable
@@ -80,65 +86,11 @@ no code was carried over.
 
 ## Development
 
-```sh
-uv sync            # install
-uv run pytest      # test
-uv run uvicorn therapy.server.app:app --reload   # dev server
-docker compose up  # containerized
-```
+Developer setup, the test and verification commands, and the build→observe→replay→evaluate
+workflow live in **[docs/dev-quick-start.md](docs/dev-quick-start.md)** — the canonical
+developer guide. Run `make help` for the full command list.
 
-Voice/text loop verification (no microphone needed — a scripted WebRTC
-client speaks synthesized es/en/pt utterances at the live server and checks
-language detection, reply-language choice per SPEC §7 (both normative
-code-switched phrases spoken, plus pin/unpin over the data channel),
-typed-turn silence, and barge-in, reporting client-side time-to-first-audio;
-exits non-zero if any scenario fails):
-
-```sh
-docker compose up -d
-docker compose exec therapy uv run --no-dev python scripts/verify_voice_text_loop.py
-docker compose logs therapy | grep TTFA   # server-side numbers (risk R1)
-```
-
-Latest dry-run result (2026-07-10, shipped image, fully-local pedrolucas/smollm3:3b-q4_k_m):
-all ten scenarios green — trilingual turns, typed-turn silence, barge-in,
-both SPEC §7 normative code-switched phrases, pin/unpin. Client-side TTFA
-9.2–32.5 s on a warm container (whisper, Kokoro, and the LLM share this
-CPU) — to be re-measured with the target provider during verification.
-
-Memory-continuity verification (continuity + data round-trip; runs a scripted
-two-session conversation against the live server, then exercises
-export/delete — **the delete step wipes the data volume**):
-
-```sh
-docker compose exec therapy uv run --no-dev python scripts/verify_memory_continuity.py
-```
-
-Longitudinal self-knowledge verification (offline/host-only; uses isolated test
-data and no live server, LLM, or network):
-
-```sh
-make verify-longitudinal-loop
-```
-
-PWA browser end-to-end (Playwright + headless Chromium — the only tests that
-load the real app in a browser): audits installability (active service
-worker, well-formed manifest, PNG icons that decode at their true sizes) and
-drives connect → typed turn → transcript render → Start/Resume label with a
-fake mic. Opt-in (slow) and runs against an isolated server, so it never
-touches the data volume:
-
-```sh
-docker compose exec therapy uv run playwright install chromium   # one-time
-docker compose exec therapy uv run pytest -m e2e
-```
-
-Personal data is local-first (SPEC §8) and yours to inspect or destroy:
-
-```sh
-docker compose exec therapy uv run --no-dev python -m therapy.memory export > therapy-data.json
-docker compose exec therapy uv run --no-dev python -m therapy.memory delete --yes
-```
+## Running it & reliability
 
 **Web interface (desktop):** open `http://localhost:8000` in any browser —
 localhost is a secure context, so the microphone works out of the box.
@@ -203,10 +155,6 @@ python3 scripts/hostwatch.py   # on the host; probes /health, restarts
 
 The PWA shell also degrades gracefully: service-worker fetches time out
 after 8 s and fall back to the cached shell rather than loading forever.
-
-Note for Intel Macs: `onnxruntime` (via `kokoro-onnx`) no longer publishes
-macOS x86_64 wheels, so `uv sync` fails there — use `docker compose up`
-instead (Linux wheels are available).
 
 ## License
 

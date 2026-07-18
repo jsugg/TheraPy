@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import json
 import random
+import time
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Literal, TypedDict, cast
@@ -22,15 +23,84 @@ from therapy.knowledge.schema import (
 )
 from therapy.knowledge.user_model import GraphQuote, UserModel
 from therapy.memory.summarizer import complete, render_transcript
+from therapy.observability.model import InteractionOperation
 
 EXTRACTOR_VERSION = "phase4-distill-v2"
 MAX_CANDIDATES = 100
 MAX_QUOTES_PER_CANDIDATE = 10
 MAX_EXTRACTION_ATTEMPTS = 3
 
-type RawCandidate = Mapping[str, object]
+type RawCandidate = dict[str, object]
 type Extractor = Callable[[str, list[str]], Awaitable[list[RawCandidate]]]
 type Judger = Callable[[Literal["node", "edge"], Mapping[str, object]], Awaitable[bool]]
+type DistillationAttemptOutcome = Literal["success", "invalid", "retry", "error"]
+type CandidateDisposition = Literal["candidate", "promoted", "proposed", "deferred"]
+
+
+def _required_int(value: object, field: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"{field} must be an integer")
+    return value
+
+
+def _record_attempt(outcome: DistillationAttemptOutcome) -> None:
+    """Record one content-free extraction attempt."""
+    from therapy.observability import telemetry
+
+    telemetry.record_metric(
+        "therapy_distillation_attempts_total", 1, {"outcome": outcome}
+    )
+
+
+def _record_candidates(disposition: CandidateDisposition, count: int) -> None:
+    """Record a positive aggregate candidate disposition."""
+    from therapy.observability import telemetry
+
+    telemetry.record_metric(
+        "therapy_distillation_candidate_count",
+        max(0, count),
+        {"disposition": disposition},
+    )
+    if count <= 0:
+        return
+    telemetry.record_metric(
+        "therapy_distillation_candidates_total",
+        count,
+        {"disposition": disposition},
+    )
+
+
+def _record_run(outcome: Literal["success", "error"], *, idempotent: bool) -> None:
+    """Record a content-free session distillation result."""
+    from therapy.observability import telemetry
+
+    telemetry.record_metric(
+        "therapy_distillation_runs_total",
+        1,
+        {"outcome": outcome, "idempotent": str(idempotent).lower()},
+    )
+
+
+def _record_validation_failure(category: Literal["schema", "json", "value"]) -> None:
+    """Record only the finite class of an untrusted extractor validation failure."""
+    from therapy.observability import telemetry
+
+    telemetry.record_metric(
+        "therapy_distillation_validation_failures_total",
+        1,
+        {"category": category},
+    )
+
+
+def _record_duration(outcome: Literal["success", "error"], started: float) -> None:
+    """Record one complete distillation duration."""
+    from therapy.observability import telemetry
+
+    telemetry.record_metric(
+        "therapy_distillation_seconds",
+        time.monotonic() - started,
+        {"outcome": outcome},
+    )
 
 
 class CandidateValidationError(ValueError):
@@ -85,11 +155,11 @@ class DistillResult:
     """Auditable outcome of one idempotent session distillation."""
 
     run_id: str
-    promoted_nodes: list[int] = field(default_factory=list)
-    promoted_edges: list[int] = field(default_factory=list)
-    proposed_nodes: list[int] = field(default_factory=list)
-    proposed_edges: list[int] = field(default_factory=list)
-    processed_observations: list[int] = field(default_factory=list)
+    promoted_nodes: list[int] = field(default_factory=lambda: [])
+    promoted_edges: list[int] = field(default_factory=lambda: [])
+    proposed_nodes: list[int] = field(default_factory=lambda: [])
+    proposed_edges: list[int] = field(default_factory=lambda: [])
+    processed_observations: list[int] = field(default_factory=lambda: [])
 
     @property
     def proposed_patterns(self) -> list[int]:
@@ -113,11 +183,18 @@ def parse_candidates(raw: str) -> list[dict[str, object]]:
         raise CandidateValidationError(f"invalid candidate JSON: {error.msg}") from error
     if not isinstance(parsed, list):
         raise CandidateValidationError("candidate root must be an array")
-    if len(parsed) > MAX_CANDIDATES:
+    parsed_items = cast(list[object], parsed)
+    if len(parsed_items) > MAX_CANDIDATES:
         raise CandidateValidationError(f"candidate count exceeds {MAX_CANDIDATES}")
-    if not all(isinstance(item, dict) for item in parsed):
-        raise CandidateValidationError("every candidate must be an object")
-    return cast(list[dict[str, object]], parsed)
+    candidates: list[RawCandidate] = []
+    for item in parsed_items:
+        if not isinstance(item, dict):
+            raise CandidateValidationError("every candidate must be an object")
+        raw_item = cast(dict[object, object], item)
+        if not all(isinstance(key, str) for key in raw_item):
+            raise CandidateValidationError("candidate field names must be strings")
+        candidates.append(cast(RawCandidate, raw_item))
+    return candidates
 
 
 def _bounded_text(value: object, field: str, limit: int = 4_000) -> str:
@@ -132,34 +209,54 @@ def _bounded_text(value: object, field: str, limit: int = 4_000) -> str:
 def _raw_quotes(value: object) -> list[str]:
     if value is None:
         return []
-    if not isinstance(value, list) or len(value) > MAX_QUOTES_PER_CANDIDATE:
+    if not isinstance(value, list):
+        raise CandidateValidationError(
+            f"quotes must be an array with at most {MAX_QUOTES_PER_CANDIDATE} items"
+        )
+    items = cast(list[object], value)
+    if len(items) > MAX_QUOTES_PER_CANDIDATE:
         raise CandidateValidationError(
             f"quotes must be an array with at most {MAX_QUOTES_PER_CANDIDATE} items"
         )
     quotes: list[str] = []
-    for item in value:
-        if not isinstance(item, dict) or set(item) - {"text", "language", "lang"}:
+    for item in items:
+        if not isinstance(item, dict):
             raise CandidateValidationError("quote objects may contain text/language only")
-        quotes.append(_bounded_text(item.get("text"), "quote.text", 8_000))
+        raw_item = cast(dict[object, object], item)
+        if not all(isinstance(key, str) for key in raw_item):
+            raise CandidateValidationError("quote field names must be strings")
+        quote = cast(dict[str, object], raw_item)
+        if set(quote) - {"text", "language", "lang"}:
+            raise CandidateValidationError("quote objects may contain text/language only")
+        quotes.append(_bounded_text(quote.get("text"), "quote.text", 8_000))
     return quotes
 
 
 def _raw_aliases(value: object) -> list[dict[str, str]]:
     if value is None:
         return []
-    if not isinstance(value, list) or len(value) > 20:
+    if not isinstance(value, list):
+        raise CandidateValidationError("aliases must be an array with at most 20 items")
+    items = cast(list[object], value)
+    if len(items) > 20:
         raise CandidateValidationError("aliases must be an array with at most 20 items")
     aliases: list[dict[str, str]] = []
-    for item in value:
+    for item in items:
         if isinstance(item, str):
             aliases.append({"text": _bounded_text(item, "alias", 1_000), "language": "und"})
             continue
-        if not isinstance(item, dict) or set(item) - {"text", "language"}:
+        if not isinstance(item, dict):
+            raise CandidateValidationError("alias must be string or text/language object")
+        raw_item = cast(dict[object, object], item)
+        if not all(isinstance(key, str) for key in raw_item):
+            raise CandidateValidationError("alias field names must be strings")
+        alias = cast(dict[str, object], raw_item)
+        if set(alias) - {"text", "language"}:
             raise CandidateValidationError("alias must be string or text/language object")
         aliases.append(
             {
-                "text": _bounded_text(item.get("text"), "alias.text", 1_000),
-                "language": str(item.get("language", "und"))[:32],
+                "text": _bounded_text(alias.get("text"), "alias.text", 1_000),
+                "language": str(alias.get("language", "und"))[:32],
             }
         )
     return aliases
@@ -303,7 +400,9 @@ async def extract_candidates(transcript: str, observations: list[str]) -> list[R
         body += "\n\nSession observations:\n" + "\n".join(
             f"- {item}" for item in observations
         )
-    raw = await complete(system, body, max_tokens=1_500)
+    raw = await complete(
+        system, body, max_tokens=1_500, operation=InteractionOperation.DISTILL
+    )
     return parse_candidates(raw)
 
 
@@ -321,7 +420,11 @@ async def judge_candidate(
         },
         ensure_ascii=False,
     )
-    answer = (await complete(JUDGMENT_PROMPT, body, max_tokens=8)).strip().casefold()
+    answer = (
+        await complete(
+            JUDGMENT_PROMPT, body, max_tokens=8, operation=InteractionOperation.JUDGE
+        )
+    ).strip().casefold()
     return answer == "yes"
 
 
@@ -336,18 +439,32 @@ async def _extract_with_retry(
     for attempt in range(MAX_EXTRACTION_ATTEMPTS):
         try:
             validated = validate_candidates(await extractor(transcript, observations))
-            return verify_quotes(validated, turns, session_id)
-        except (
-            CandidateValidationError,
-            json.JSONDecodeError,
-            TimeoutError,
-            ValueError,
-        ) as error:
+            verified = verify_quotes(validated, turns, session_id)
+        except TimeoutError as error:
+            _record_attempt("retry")
             last_error = error
-            if attempt + 1 == MAX_EXTRACTION_ATTEMPTS:
-                break
-            delay = (0.05 * (2**attempt)) + random.uniform(0.0, 0.03)
-            await asyncio.sleep(delay)
+        except CandidateValidationError as error:
+            _record_validation_failure("schema")
+            _record_attempt("invalid")
+            last_error = error
+        except json.JSONDecodeError as error:
+            _record_validation_failure("json")
+            _record_attempt("invalid")
+            last_error = error
+        except ValueError as error:
+            _record_validation_failure("value")
+            _record_attempt("invalid")
+            last_error = error
+        except Exception:
+            _record_attempt("error")
+            raise
+        else:
+            _record_attempt("success")
+            return verified
+        if attempt + 1 == MAX_EXTRACTION_ATTEMPTS:
+            break
+        delay = (0.05 * (2**attempt)) + random.uniform(0.0, 0.03)
+        await asyncio.sleep(delay)
     if last_error is None:
         raise RuntimeError("extractor retry loop ended without result")
     raise last_error
@@ -380,8 +497,10 @@ async def graduate(
                     (proposed_nodes if claim_kind == "node" else proposed_edges).append(
                         claim_id
                     )
+                    _record_candidates("proposed", 1)
             else:
                 model.defer_proposal(claim_kind, claim_id)
+                _record_candidates("deferred", 1)
     return proposed_nodes, proposed_edges
 
 
@@ -404,7 +523,7 @@ def promote(
 
 async def distill_session(
     model: UserModel,
-    turns: list[dict[str, object]],
+    turns: Sequence[Mapping[str, object]],
     session_id: str | None,
     *,
     extractor: Extractor | None = None,
@@ -412,28 +531,42 @@ async def distill_session(
     extractor_version: str = EXTRACTOR_VERSION,
 ) -> DistillResult:
     """Distill one session idempotently; failed validation consumes nothing."""
-    if session_id is None:
-        raise ValueError("session_id is required")
-    run_id = model.start_distillation_run(session_id, extractor_version)
-    existing = model.distillation_run(run_id)
-    if existing is not None and existing["state"] == "succeeded":
-        result = cast(dict[str, list[int]], existing.get("result", {}))
-        return DistillResult(
-            run_id=run_id,
-            promoted_nodes=[int(item) for item in result.get("node_ids", [])],
-            promoted_edges=[int(item) for item in result.get("edge_ids", [])],
-            processed_observations=[
-                int(row["id"])
-                for row in model.pending_observations(
-                    session_id, include_processed=True
-                )
-                if row.get("distillation_run_id") == run_id
-            ],
-        )
-    pending = model.pending_observations(session_id)
-    observation_texts = [str(row["text"]) for row in pending]
-    transcript = render_transcript(turns)
+    started = time.monotonic()
+    run_id: str | None = None
     try:
+        if session_id is None:
+            raise ValueError("session_id is required")
+        run_id = model.start_distillation_run(session_id, extractor_version)
+        existing = model.distillation_run(run_id)
+        if existing is not None and existing["state"] == "succeeded":
+            result = cast(dict[str, list[int]], existing.get("result", {}))
+            promoted_nodes = [
+                _required_int(item, "node_id")
+                for item in result.get("node_ids", [])
+            ]
+            promoted_edges = [
+                _required_int(item, "edge_id")
+                for item in result.get("edge_ids", [])
+            ]
+            idempotent_result = DistillResult(
+                run_id=run_id,
+                promoted_nodes=promoted_nodes,
+                promoted_edges=promoted_edges,
+                processed_observations=[
+                    _required_int(row["id"], "observation_id")
+                    for row in model.pending_observations(
+                        session_id, include_processed=True
+                    )
+                    if row.get("distillation_run_id") == run_id
+                ],
+            )
+            _record_candidates("promoted", len(promoted_nodes) + len(promoted_edges))
+            _record_run("success", idempotent=True)
+            _record_duration("success", started)
+            return idempotent_result
+        pending = model.pending_observations(session_id)
+        observation_texts = [str(row["text"]) for row in pending]
+        transcript = render_transcript(turns)
         verified = await _extract_with_retry(
             extractor or extract_candidates,
             transcript,
@@ -441,18 +574,25 @@ async def distill_session(
             turns,
             session_id,
         )
-        inbox_ids = [int(row["id"]) for row in pending]
+        _record_candidates("candidate", len(verified))
+        inbox_ids = [
+            _required_int(row["id"], "observation_id") for row in pending
+        ]
         run_id, node_ids, edge_ids = model.apply_distillation(
             session_id=session_id,
             extractor_version=extractor_version,
             candidates=cast(list[Mapping[str, object]], verified),
             inbox_ids=inbox_ids,
         )
+        _record_candidates("promoted", len(node_ids) + len(edge_ids))
         proposed_nodes, proposed_edges = await graduate(model, judger=judger)
     except Exception as error:
-        model.fail_distillation_run(run_id, error)
+        _record_run("error", idempotent=False)
+        _record_duration("error", started)
+        if run_id is not None:
+            model.fail_distillation_run(run_id, error)
         raise
-    return DistillResult(
+    result = DistillResult(
         run_id=run_id,
         promoted_nodes=node_ids,
         promoted_edges=edge_ids,
@@ -460,6 +600,9 @@ async def distill_session(
         proposed_edges=proposed_edges,
         processed_observations=inbox_ids,
     )
+    _record_run("success", idempotent=False)
+    _record_duration("success", started)
+    return result
 
 
 __all__ = [

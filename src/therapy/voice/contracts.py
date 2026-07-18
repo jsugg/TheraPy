@@ -31,12 +31,19 @@ def _is_json_value(value: object) -> bool:
     if value is None or isinstance(value, bool | int | float | str):
         return True
     if isinstance(value, list):
-        return all(_is_json_value(item) for item in value)
+        return all(_is_json_value(item) for item in cast(list[object], value))
     if isinstance(value, dict):
-        return all(
-            isinstance(key, str) and _is_json_value(item) for key, item in value.items()
-        )
+        raw_mapping = cast(dict[object, object], value)
+        if not all(isinstance(key, str) for key in raw_mapping):
+            return False
+        json_object = cast(dict[str, object], value)
+        return all(_is_json_value(item) for item in json_object.values())
     return False
+
+
+def _runtime_value(value: object) -> object:
+    """Prevent static field types from bypassing runtime boundary checks."""
+    return value
 
 
 @dataclass(frozen=True, slots=True)
@@ -50,17 +57,20 @@ class WebRTCOffer:
     request_data: JsonValue = None
 
     def __post_init__(self) -> None:
-        if not isinstance(self.sdp, str) or not self.sdp:
+        sdp = _runtime_value(self.sdp)
+        pc_id = _runtime_value(self.pc_id)
+        restart_pc = _runtime_value(self.restart_pc)
+        if not isinstance(sdp, str) or not sdp:
             raise InvalidOffer("sdp must be a non-empty string")
         if self.type != "offer":
             raise InvalidOffer("type must be 'offer'")
-        if self.pc_id is not None and (
-            not isinstance(self.pc_id, str) or not self.pc_id or len(self.pc_id) > 256
+        if pc_id is not None and (
+            not isinstance(pc_id, str) or not pc_id or len(pc_id) > 256
         ):
             raise InvalidOffer(
                 "pc_id must be a non-empty string of at most 256 characters"
             )
-        if not isinstance(self.restart_pc, bool):
+        if not isinstance(restart_pc, bool):
             raise InvalidOffer("restart_pc must be a boolean")
         if not _is_json_value(self.request_data):
             raise InvalidOffer("request_data must contain only JSON values")
@@ -70,7 +80,8 @@ class WebRTCOffer:
         """Validate an untrusted JSON value and build an owned offer."""
         if not isinstance(payload, dict):
             raise InvalidOffer("request body must be a JSON object")
-        if not all(isinstance(key, str) for key in payload):
+        raw_payload = cast(dict[object, object], payload)
+        if not all(isinstance(key, str) for key in raw_payload):
             raise InvalidOffer("offer field names must be strings")
         data = cast(dict[str, object], payload)
         allowed = {"sdp", "type", "pc_id", "restart_pc", "request_data", "requestData"}
@@ -114,12 +125,14 @@ class WebRTCAnswer:
     pc_id: str
 
     def __post_init__(self) -> None:
+        sdp = _runtime_value(self.sdp)
+        pc_id = _runtime_value(self.pc_id)
         if (
-            not isinstance(self.sdp, str)
-            or not self.sdp
+            not isinstance(sdp, str)
+            or not sdp
             or self.type != "answer"
-            or not isinstance(self.pc_id, str)
-            or not self.pc_id
+            or not isinstance(pc_id, str)
+            or not pc_id
         ):
             raise VoiceUnavailable("voice runtime returned an invalid WebRTC answer")
 
@@ -136,11 +149,13 @@ class SessionTarget:
     new_session: bool
 
     def __post_init__(self) -> None:
-        if self.session_id is not None and (
-            not isinstance(self.session_id, str) or not self.session_id
+        session_id = _runtime_value(self.session_id)
+        new_session = _runtime_value(self.new_session)
+        if session_id is not None and (
+            not isinstance(session_id, str) or not session_id
         ):
             raise ValueError("session_id must be a non-empty string or None")
-        if not isinstance(self.new_session, bool):
+        if not isinstance(new_session, bool):
             raise ValueError("new_session must be a boolean")
         if self.new_session != (self.session_id is None):
             raise ValueError(

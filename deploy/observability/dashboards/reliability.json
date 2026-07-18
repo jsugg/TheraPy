@@ -1,0 +1,676 @@
+{
+  "annotations": {
+    "list": []
+  },
+  "panels": [
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 0
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "process_cpu_utilization{service_name=\"therapy\"}",
+          "refId": "A"
+        }
+      ],
+      "title": "Process CPU utilization",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 0
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "process_memory_usage{service_name=\"therapy\"}",
+          "refId": "A"
+        }
+      ],
+      "title": "Process RSS",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 8
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "sum(rate(therapy_voice_connections_total[15m])) by (outcome, reason)",
+          "refId": "A"
+        }
+      ],
+      "title": "Voice connections by outcome",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 6,
+        "x": 12,
+        "y": 8
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "therapy_voice_active_connections",
+          "refId": "A"
+        }
+      ],
+      "title": "Active voice connections",
+      "type": "stat"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 16
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "histogram_quantile(0.95, sum(rate(therapy_event_loop_lag_seconds_bucket[5m])) by (le))",
+          "refId": "A"
+        }
+      ],
+      "title": "Event-loop lag p95",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 16
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "histogram_quantile(0.95, sum(rate(http_server_duration_milliseconds_bucket{service_name=\"therapy\"}[5m])) by (le, http_route))",
+          "refId": "A"
+        }
+      ],
+      "title": "HTTP server duration p95 by route",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 6,
+        "x": 0,
+        "y": 24
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "up{job=\"turn\"}",
+          "refId": "A"
+        }
+      ],
+      "title": "TURN relay up",
+      "type": "stat"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 9,
+        "x": 6,
+        "y": 24
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "sum by (__name__) ({__name__=~\"stun_binding_(request|response)_total\", job=\"turn\"})",
+          "refId": "A"
+        }
+      ],
+      "title": "STUN bindings (incl. synthetic healthcheck probe)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 9,
+        "x": 15,
+        "y": 24
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "sum by (__name__) ({__name__=~\"turn_.+\", job=\"turn\"})",
+          "refId": "A"
+        }
+      ],
+      "title": "TURN allocations/traffic (populates on first relay use)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 24,
+        "x": 0,
+        "y": 32
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "time() - process_start_time_seconds",
+          "refId": "A"
+        }
+      ],
+      "title": "Process uptime (restarts visible as resets)",
+      "type": "timeseries"
+    },
+    {
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 40
+      },
+      "panels": [],
+      "title": "\u00a79 service-level indicators",
+      "type": "row"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "description": "Definition: successful external /health and /ready probes divided by all such probes, evaluated only inside the owner-declared service window; deliberate host sleep/shutdown is excluded. Target: numeric objective unset until hostwatch service-window evidence exists.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 41
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "sum(rate(http_server_duration_milliseconds_count{service_name=\"therapy\", http_route=~\"/health|/ready\", http_status_code=~\"2..\"}[30m])) / clamp_min(sum(rate(http_server_duration_milliseconds_count{service_name=\"therapy\", http_route=~\"/health|/ready\"}[30m])), 0.000001)",
+          "refId": "A"
+        }
+      ],
+      "title": "SLI: external liveness/readiness success ratio",
+      "type": "stat"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "description": "Definition: client-confirmed connected states after successful SDP/pipeline start divided by all syntactically valid offers; rejected offers are excluded. Target: numeric objective unset pending baseline.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 41
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "sum(rate(therapy_webrtc_connection_total{outcome=\"connected\"}[30m])) / clamp_min(sum(rate(therapy_offers_total{outcome!=\"rejected\"}[30m])), 0.000001)",
+          "refId": "A"
+        }
+      ],
+      "title": "SLI: voice connection success ratio",
+      "type": "stat"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "description": "Definition: persisted assistant responses plus explicit classified failures divided by accepted, durably persisted user turns. Target: numeric objective unset pending baseline; no accepted turn may vanish.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 49
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "((sum(rate(therapy_persist_total{artifact=\"assistant\", outcome=\"success\"}[30m])) or vector(0)) + (sum(rate(therapy_conversation_turns_total{outcome=\"classified_failure\"}[30m])) or vector(0))) / clamp_min(sum(rate(therapy_persist_total{artifact=\"user\", outcome=\"success\"}[30m])), 0.000001)",
+          "refId": "A"
+        }
+      ],
+      "title": "SLI: turn completion ratio",
+      "type": "stat"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "description": "Definition: five-minute TTFA p95 divided by the one-hour p95 for the same provider and cold/warm mode; stage panels provide STT/context/LLM/TTS/network decomposition. Target: <= 2x rolling baseline; no absolute latency objective until baseline evidence supports one.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 49
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "histogram_quantile(0.95, sum(rate(therapy_turn_ttfa_seconds_bucket[5m])) by (le, provider, mode)) / clamp_min(histogram_quantile(0.95, sum(rate(therapy_turn_ttfa_seconds_bucket[1h])) by (le, provider, mode)), 0.001)",
+          "refId": "A"
+        }
+      ],
+      "title": "SLI: TTFA p95 / same-provider rolling baseline",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "description": "Definition: acknowledged persisted artifacts committed successfully divided by all acknowledged persistence attempts. Target: 100%; integrity, backup, and rollback failures must remain zero.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 57
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "sum(rate(therapy_persist_total{outcome=\"success\"}[30m])) / clamp_min(sum(rate(therapy_persist_total[30m])), 0.000001)",
+          "refId": "A"
+        }
+      ],
+      "title": "SLI: acknowledged persistence success ratio",
+      "type": "stat"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "description": "Definition: migration, backup, and sovereignty rollback error rate; periodic isolated export/restore verification is companion evidence. Target: exactly zero.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 57
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "(sum(rate(therapy_schema_migrations_total{outcome=\"error\"}[30m])) or vector(0)) + (sum(rate(therapy_backups_total{outcome=\"error\"}[30m])) or vector(0)) + (sum(rate(therapy_sovereignty_rollbacks_total{outcome=\"error\"}[30m])) or vector(0))",
+          "refId": "A"
+        }
+      ],
+      "title": "SLI: integrity/backup/rollback failures",
+      "type": "stat"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "description": "Definition: initiated LLM attempts durably journaled before dispatch divided by journaled plus pre-dispatch failed attempts. Target: 100%.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 65
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "sum(rate(therapy_llm_capture_records_total{status=\"journaled\"}[30m])) / clamp_min(sum(rate(therapy_llm_capture_records_total{status=~\"journaled|failed\"}[30m])), 0.000001)",
+          "refId": "A"
+        }
+      ],
+      "title": "SLI: capture journaled-vs-failed ratio",
+      "type": "stat"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "description": "Definition: journaled LLM attempts without explicit incomplete evidence divided by all journaled attempts; terminal completions and exact provider errors are complete. Target: 100%, with zero incomplete accepted evaluations.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 65
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "1 - (sum(rate(therapy_llm_capture_records_total{status=\"incomplete\"}[30m])) / clamp_min(sum(rate(therapy_llm_capture_records_total{status=\"journaled\"}[30m])), 0.000001))",
+          "refId": "A"
+        }
+      ],
+      "title": "SLI: evaluation evidence completeness ratio",
+      "type": "stat"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "description": "Definition: current time minus the oldest unexported restricted-record timestamp. Target: < 3600 seconds; the journal remains authoritative.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 73
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "time() - therapy_llm_capture_oldest_unexported_unixtime_seconds",
+          "refId": "A"
+        }
+      ],
+      "title": "SLI: restricted export backlog age",
+      "type": "stat"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "description": "Definition: enabled, unsuppressed due jobs reaching delivered, retry, or terminal finalized state divided by due jobs. Target: 100% inside the owner-agreed tolerance; the numeric tolerance is not set yet.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 73
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "sum(rate(therapy_proactivity_jobs_total{stage=~\"delivered|retry|finalized\"}[30m])) / clamp_min(sum(rate(therapy_proactivity_jobs_total{stage=\"due\"}[30m])), 0.000001)",
+          "refId": "A"
+        }
+      ],
+      "title": "SLI: proactivity terminal-state ratio",
+      "type": "stat"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "description": "Definition: forbidden content/infrastructure canary or unknown-scope attempts reaching the broad-plane guard; restricted-canary presence is verified separately. Target: exactly zero; this is a hard release gate.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 24,
+        "x": 0,
+        "y": 81
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "sum(rate(therapy_broad_span_drops_total{reason=~\"forbidden_attribute|unknown_scope\"}[30m]))",
+          "refId": "A"
+        }
+      ],
+      "title": "SLI: broad-plane routing violations",
+      "type": "stat"
+    }
+  ],
+  "refresh": "30s",
+  "schemaVersion": 39,
+  "tags": [
+    "therapy",
+    "observability"
+  ],
+  "templating": {
+    "list": []
+  },
+  "time": {
+    "from": "now-6h",
+    "to": "now"
+  },
+  "timezone": "browser",
+  "title": "5 - Reliability: liveness, readiness, relay, resources, supervisors",
+  "uid": "therapy-reliability"
+}

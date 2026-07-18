@@ -1,4 +1,4 @@
-"""Full PWA browser end-to-end (Playwright, headless Chromium).
+"""Full PWA browser end-to-end (Playwright, headless Chromium/Firefox).
 
 Covers what only a real browser can: PWA installability (the field-tested
 gap — the manifest, service worker and icons Chrome checks before offering
@@ -6,13 +6,16 @@ gap — the manifest, service worker and icons Chrome checks before offering
 typed turn, its transcript rendering, and the resume-label logic).
 
 Run: `docker compose exec therapy uv run pytest -m e2e`
-(a one-time `uv run playwright install chromium` populates the cache volume).
+(a one-time `uv run playwright install chromium firefox` populates the cache volume).
 """
 
 import re
-from typing import TYPE_CHECKING
+from collections.abc import Callable, Mapping
+from typing import TYPE_CHECKING, Protocol, cast
 
 import pytest
+
+from therapy.observability.interactions import JsonValue, require_json_object
 
 # Playwright ships only in the container test bed. Where it (and the realtime
 # stack these E2E exercise) isn't installed, keep the module importable and skip
@@ -21,17 +24,18 @@ import pytest
 # stays behind `TYPE_CHECKING` so the type checker only ever sees the real
 # Playwright types.
 if TYPE_CHECKING:
-    from playwright.sync_api import Page, expect
+    from playwright.sync_api import Page, Request, expect
 
     _HAS_PLAYWRIGHT = True
 else:
     try:
-        from playwright.sync_api import Page, expect
+        from playwright.sync_api import Page, Request, expect
 
         _HAS_PLAYWRIGHT = True
     except ImportError:
         _HAS_PLAYWRIGHT = False
         Page = object
+        Request = object
 
         def expect(*args, **kwargs):
             raise RuntimeError("playwright is not installed")
@@ -40,6 +44,25 @@ else:
 # The `e2e` marker is applied automatically by folder (tests/conftest.py); only
 # the runtime skip when Playwright is absent needs declaring here.
 pytestmark = pytest.mark.skipif(not _HAS_PLAYWRIGHT, reason="playwright not installed")
+
+
+class _CdpSession(Protocol):
+    """Typed subset of Playwright's partially typed CDP session."""
+
+    def send(
+        self, method: str, params: dict[str, object] | None = None
+    ) -> dict[str, object]: ...
+
+
+def _dispatch_event(
+    locator: object, event_type: str, event_init: Mapping[str, object]
+) -> None:
+    """Dispatch a typed event through Playwright's partially typed locator API."""
+    dispatch = getattr(locator, "dispatch_event", None)
+    assert callable(dispatch)
+    cast(Callable[[str, dict[str, object]], None], dispatch)(
+        event_type, dict(event_init)
+    )
 
 
 def test_chrome_reports_pwa_installable(page: Page, e2e_server: str) -> None:
@@ -63,7 +86,9 @@ def test_chrome_reports_pwa_installable(page: Page, e2e_server: str) -> None:
     # Chrome's own verdict — the check the earlier structural test skipped, so
     # it wrongly reported the app installable. Empty means Chrome would offer
     # install (the headless build just never fires the banner event).
-    cdp = page.context.new_cdp_session(page)
+    cdp_value = page.context.new_cdp_session(page)
+    assert callable(getattr(cdp_value, "send", None))
+    cdp = cast(_CdpSession, cdp_value)
     errors = cdp.send("Page.getInstallabilityErrors")["installabilityErrors"]
     assert errors == [], f"Chrome reports installability blockers: {errors}"
 
@@ -324,29 +349,33 @@ def test_hold_to_talk_handles_longpress_and_pointer_lifecycle(
     primary = {"pointerId": 1, "isPrimary": True, "button": 0}
 
     # Hold state machine: press holds, release releases.
-    talk.dispatch_event("pointerdown", primary)
+    _dispatch_event(talk, "pointerdown", primary)
     expect(talk).to_have_attribute("aria-pressed", "true")
     assert "is-holding" in (talk.get_attribute("class") or "")
-    talk.dispatch_event("pointerup", {"pointerId": 1})
+    _dispatch_event(talk, "pointerup", {"pointerId": 1})
     expect(talk).to_have_attribute("aria-pressed", "false")
 
     # Multi-touch: a SECOND finger's release must not end the first finger's hold.
-    talk.dispatch_event("pointerdown", primary)
+    _dispatch_event(talk, "pointerdown", primary)
     expect(talk).to_have_attribute("aria-pressed", "true")
-    talk.dispatch_event("pointerdown", {"pointerId": 2, "isPrimary": False, "button": 0})
-    talk.dispatch_event("pointerup", {"pointerId": 2})
+    _dispatch_event(
+        talk, "pointerdown", {"pointerId": 2, "isPrimary": False, "button": 0}
+    )
+    _dispatch_event(talk, "pointerup", {"pointerId": 2})
     expect(talk).to_have_attribute("aria-pressed", "true")  # still held
-    talk.dispatch_event("pointerup", {"pointerId": 1})
+    _dispatch_event(talk, "pointerup", {"pointerId": 1})
     expect(talk).to_have_attribute("aria-pressed", "false")
 
     # A genuinely cancelled gesture must fail safe by ending the hold (mute).
-    talk.dispatch_event("pointerdown", primary)
+    _dispatch_event(talk, "pointerdown", primary)
     expect(talk).to_have_attribute("aria-pressed", "true")
-    talk.dispatch_event("pointercancel", {"pointerId": 1})
+    _dispatch_event(talk, "pointercancel", {"pointerId": 1})
     expect(talk).to_have_attribute("aria-pressed", "false")
 
     # A non-primary contact / secondary mouse button must never start a hold.
-    talk.dispatch_event("pointerdown", {"pointerId": 3, "isPrimary": True, "button": 2})
+    _dispatch_event(
+        talk, "pointerdown", {"pointerId": 3, "isPrimary": True, "button": 2}
+    )
     expect(talk).to_have_attribute("aria-pressed", "false")
 
 
@@ -362,13 +391,16 @@ def test_composer_stays_sticky_at_viewport_bottom(
     assert composer.evaluate("el => getComputedStyle(el).bottom") == "0px"
 
 
-def _agent_turn(page: Page, e2e_server: str, text: str, *, finalize: bool) -> dict:
+def _agent_turn(
+    page: Page, e2e_server: str, text: str, *, finalize: bool
+) -> dict[str, JsonValue]:
     response = page.request.post(
         f"{e2e_server}/api/testing/agent/turn",
         data={"text": text, "language": "en", "finalize": finalize},
     )
     assert response.ok, response.text()
-    return response.json()
+    payload: object = response.json()
+    return require_json_object(payload, "agent turn response")
 
 
 def test_model_workspace_graph_pending_corpus_and_sovereignty(
@@ -393,8 +425,8 @@ def test_model_workspace_graph_pending_corpus_and_sovereignty(
     page.goto(f"{e2e_server}/#model")
     workspace = page.locator("#model-workspace")
     expect(workspace).to_be_visible(timeout=15_000)
-    expect(page.locator("#model-nodes .model-item")).to_have_count(3)
-    expect(page.locator("#model-edges .model-item")).to_have_count(1)
+    expect(page.locator("#model-nodes .model-item")).to_have_count(3, timeout=15_000)
+    expect(page.locator("#model-edges .model-item")).to_have_count(1, timeout=15_000)
     assert page_errors == []
 
     channel_settings = {
@@ -472,7 +504,7 @@ def test_model_workspace_graph_pending_corpus_and_sovereignty(
     brother_claim = page.locator("#model-nodes .model-item").filter(
         has_text="My brother is a sensitive ongoing thread."
     )
-    expect(brother_claim).to_contain_text("rejected")
+    expect(brother_claim).to_contain_text("rejected", timeout=15_000)
     page.once("dialog", lambda dialog: dialog.accept())
     brother_claim.get_by_role("button", name="Delete").click()
     expect(page.locator("#model-nodes")).not_to_contain_text(
@@ -563,9 +595,171 @@ def test_model_workspace_graph_pending_corpus_and_sovereignty(
     expect(page.locator("#model-nodes")).to_contain_text("Late meetings recur.")
 
 
-def test_registered_service_worker_handles_push_and_notification_click(
+def test_client_telemetry_queue_is_bounded_and_flushes(
+    telemetry_page: Page, e2e_server: str
+) -> None:
+    page = telemetry_page
+    page.goto(f"{e2e_server}/")
+
+    queue = page.evaluate(
+        """() => {
+          const realFetch = window.fetch;
+          window.__realFetch = realFetch;
+          window.fetch = (resource, options) => {
+            const url = typeof resource === "string" ? resource : resource.url;
+            if (url.endsWith("/api/telemetry/client")) return new Promise(() => {});
+            return realFetch(resource, options);
+          };
+          for (let index = 0; index < 60; index += 1) {
+            window.telemetry.enqueue({name: "shell_fetch", outcome: "success"});
+          }
+          return {
+            exists: typeof window.telemetry === "object",
+            size: window.telemetry.size,
+          };
+        }"""
+    )
+    assert queue == {"exists": True, "size": 50}
+
+    page.evaluate("() => { window.fetch = window.__realFetch || window.fetch; }")
+    page.reload()
+    requests: list[Request] = []
+    with page.expect_response(
+        lambda response: response.url.endswith("/api/telemetry/client")
+        and response.request.method == "POST"
+    ) as first_response:
+        status = page.evaluate(
+            """async () => {
+              const report = new Map([
+                ["pair", {
+                  type: "candidate-pair", selected: true,
+                  currentRoundTripTime: 0.0125,
+                  localCandidateId: "local", remoteCandidateId: "remote-secret",
+                }],
+                ["local", {
+                  type: "local-candidate", candidateType: "relay",
+                  address: "10.0.0.1", port: 4242,
+                }],
+                ["inbound", {
+                  type: "inbound-rtp", kind: "audio", jitter: 0.003,
+                  bytesReceived: 1000, packetsLost: 1, packetsReceived: 9,
+                  concealedSamples: 2, ssrc: 123456, codecId: "codec-secret",
+                }],
+              ]);
+              await sampleWebRtcStats({getStats: async () => report});
+              window.telemetry.enqueue({
+                name: "webrtc_sample", outcome: "success", rtt_ms: 12.5,
+                packet_loss_ratio: 2, candidate_type: "prflx",
+                text: "must not leave the page", url: "/private", id: "secret",
+              });
+              return await window.telemetry.flush();
+            }"""
+        )
+    assert status == 200
+    assert first_response.value.status == 200
+    requests.append(first_response.value.request)
+
+    with page.expect_response(
+        lambda response: response.url.endswith("/api/telemetry/client")
+        and response.request.method == "POST"
+    ) as second_response:
+        status = page.evaluate(
+            """async () => {
+              window.telemetry.enqueue({name: "shell_fetch", outcome: "fallback"});
+              return await window.telemetry.flush();
+            }"""
+        )
+    assert status == 200
+    assert second_response.value.status == 200
+    requests.append(second_response.value.request)
+
+    first_payload = requests[0].post_data_json
+    assert first_payload is not None
+    first_events = first_payload["events"]
+    assert {
+        "name": "webrtc_sample",
+        "outcome": "success",
+        "rtt_ms": 12.5,
+    } in first_events
+    assert {
+        "name": "webrtc_sample",
+        "outcome": "success",
+        "rtt_ms": 12.5,
+        "jitter_ms": 3,
+        "packet_loss_ratio": 0.1,
+        "concealed_samples": 2,
+        "candidate_type": "relay",
+    } in first_events
+    assert all(
+        forbidden not in (requests[0].post_data or "")
+        for forbidden in (
+            "10.0.0.1",
+            "remote-secret",
+            "codec-secret",
+            "must not leave the page",
+            "/private",
+        )
+    )
+    traceparents = [request.headers["traceparent"] for request in requests]
+    assert all(
+        re.fullmatch(r"00-[0-9a-f]{32}-[0-9a-f]{16}-01", value)
+        for value in traceparents
+    )
+    assert len(set(traceparents)) == 1
+
+
+def test_client_telemetry_records_service_worker_registration(
+    telemetry_page: Page, e2e_server: str
+) -> None:
+    page = telemetry_page
+    page.goto(f"{e2e_server}/")
+    page.wait_for_function(
+        "navigator.serviceWorker.ready.then(r => !!r.active)", timeout=20_000
+    )
+    page.wait_for_function("window.telemetry.size >= 1", timeout=10_000)
+
+    with page.expect_response(
+        lambda response: response.url.endswith("/api/telemetry/client")
+        and response.request.method == "POST"
+    ) as response_info:
+        status = page.evaluate("() => window.telemetry.flush()")
+    assert status == 200
+    payload = response_info.value.request.post_data_json
+    assert payload is not None
+    events = payload["events"]
+    assert {"name": "sw_lifecycle", "outcome": "success"} in events
+
+
+def test_traceparent_correlates_page_telemetry_with_offer(
     page: Page, e2e_server: str
 ) -> None:
+    page.goto(f"{e2e_server}/")
+    with page.expect_response(
+        lambda response: response.url.endswith("/api/telemetry/client")
+        and response.request.method == "POST"
+    ) as telemetry_info:
+        status = page.evaluate(
+            """async () => {
+              window.telemetry.enqueue({name: "shell_fetch", outcome: "success"});
+              return await window.telemetry.flush();
+            }"""
+        )
+    assert status == 200
+    traceparent = telemetry_info.value.request.headers["traceparent"]
+
+    with page.expect_request(
+        lambda request: "/api/offer" in request.url and request.method == "POST"
+    ) as offer_info:
+        page.locator("#connect").click()
+    assert offer_info.value.headers["traceparent"] == traceparent
+    expect(page.locator("#status")).to_have_text("listening", timeout=60_000)
+    page.evaluate("() => disconnectVoice()")
+
+
+def test_registered_service_worker_telemetry_handles_push_and_notification_click(
+    page: Page, e2e_server: str
+) -> None:
+    # Playwright exposes BrowserContext.service_workers only on Chromium.
     page.goto(f"{e2e_server}/")
     page.wait_for_function(
         "navigator.serviceWorker.ready.then(r => !!r.active)", timeout=20_000
@@ -578,6 +772,11 @@ def test_registered_service_worker_handles_push_and_notification_click(
     shown = worker.evaluate(
         """async () => {
           const calls = [];
+          const telemetry = [];
+          Object.defineProperty(self.clients, "matchAll", {
+            configurable: true,
+            value: async () => [{postMessage: (message) => telemetry.push(message)}],
+          });
           Object.defineProperty(self.registration, "showNotification", {
             configurable: true,
             value: async (title, options) => calls.push({title, options}),
@@ -592,22 +791,35 @@ def test_registered_service_worker_handles_push_and_notification_click(
           });
           self.dispatchEvent(event);
           await settled;
-          return calls;
+          return {calls, telemetry};
         }"""
     )
-    assert shown[0]["title"] == "TheraPy"
-    assert shown[0]["options"]["body"] == (
+    assert shown["calls"][0]["title"] == "TheraPy"
+    assert shown["calls"][0]["options"]["body"] == (
         "A reflection is available whenever you want it."
     )
     assert "private reflection text" not in str(shown)
+    assert shown["telemetry"] == [
+        {
+            "type": "telemetry",
+            "event": {"name": "push_lifecycle", "outcome": "received"},
+        },
+        {
+            "type": "telemetry",
+            "event": {"name": "push_lifecycle", "outcome": "shown"},
+        },
+    ]
 
     click = worker.evaluate(
         """async () => {
-          const result = {closed: false, navigated: null, focused: false};
+          const result = {
+            closed: false, navigated: null, focused: false, telemetry: [],
+          };
           const client = {
             url: self.location.origin + "/",
             navigate: async (url) => { result.navigated = url; },
             focus: async () => { result.focused = true; },
+            postMessage: (message) => { result.telemetry.push(message); },
           };
           Object.defineProperty(self.clients, "matchAll", {
             configurable: true, value: async () => [client],
@@ -628,3 +840,185 @@ def test_registered_service_worker_handles_push_and_notification_click(
     assert click["closed"] is True
     assert click["focused"] is True
     assert click["navigated"].endswith("/#model")
+    assert click["telemetry"] == [
+        {
+            "type": "telemetry",
+            "event": {"name": "push_lifecycle", "outcome": "clicked"},
+        }
+    ]
+
+
+def test_service_worker_posts_telemetry_directly_with_no_open_window(
+    page: Page, e2e_server: str
+) -> None:
+    """O4 audit F-07: a push that wakes the worker with zero window clients
+    must still deliver bounded diagnostics (single-event direct POST)."""
+    import json
+
+    page.goto(f"{e2e_server}/")
+    active = page.evaluate(
+        """async () => {
+          const registrations = await navigator.serviceWorker.getRegistrations();
+          await Promise.all(registrations.map((registration) => registration.unregister()));
+          const registration = await navigator.serviceWorker.register("/sw.js");
+          if (!registration.active) {
+            const worker = registration.installing || registration.waiting;
+            if (worker) {
+              await new Promise((resolve, reject) => {
+                const timer = setTimeout(
+                  () => reject(new Error("service worker activation timed out")),
+                  20_000,
+                );
+                worker.addEventListener("statechange", () => {
+                  if (worker.state === "activated") {
+                    clearTimeout(timer);
+                    resolve();
+                  }
+                });
+                if (worker.state === "activated") {
+                  clearTimeout(timer);
+                  resolve();
+                }
+              });
+            }
+          }
+          return !!registration.active;
+        }"""
+    )
+    assert active
+    worker = page.context.service_workers[-1]
+
+    posts = worker.evaluate(
+        """async () => {
+          const posts = [];
+          const realFetch = self.fetch;
+          self.fetch = async (resource, options) => {
+            posts.push({url: String(resource), body: options && options.body});
+            return new Response("{}", {status: 200});
+          };
+          Object.defineProperty(self.clients, "matchAll", {
+            configurable: true, value: async () => [],
+          });
+          Object.defineProperty(self.registration, "showNotification", {
+            configurable: true, value: async () => {},
+          });
+          let settled;
+          const event = new Event("push");
+          Object.defineProperties(event, {
+            data: {value: {json: () => ({title: "TheraPy"})}},
+            waitUntil: {value: (promise) => { settled = Promise.resolve(promise); }},
+          });
+          self.dispatchEvent(event);
+          await settled;
+          self.fetch = realFetch;
+          return posts;
+        }"""
+    )
+    assert [post["url"] for post in posts] == [
+        "/api/telemetry/client",
+        "/api/telemetry/client",
+    ]
+    batches = [json.loads(post["body"]) for post in posts]
+    assert all(batch["schema_version"] == 1 for batch in batches)
+    assert all(len(batch["events"]) == 1 for batch in batches)
+    assert [batch["events"][0]["outcome"] for batch in batches] == [
+        "received",
+        "shown",
+    ]
+
+
+def test_http_error_shell_responses_are_not_cached_or_counted_success(
+    page: Page, e2e_server: str
+) -> None:
+    """O4 audit F-07: a resolved 4xx/5xx is not shell success and is never
+    cached; an ok response is cached."""
+    page.goto(f"{e2e_server}/")
+    page.wait_for_function(
+        "navigator.serviceWorker.ready.then(r => !!r.active)", timeout=20_000
+    )
+    worker = page.context.service_workers[0]
+
+    result = worker.evaluate(
+        """async () => {
+          const dispatchShellFetch = async (path, response) => {
+            const realFetch = self.fetch;
+            self.fetch = async () => response;
+            let responded;
+            const event = new Event("fetch");
+            Object.defineProperties(event, {
+              request: {value: new Request(self.location.origin + path)},
+              respondWith: {value: (p) => { responded = Promise.resolve(p); }},
+            });
+            self.dispatchEvent(event);
+            const res = await responded;
+            self.fetch = realFetch;
+            return res;
+          };
+          const errorRes = await dispatchShellFetch(
+            "/error-probe.css", new Response("boom", {status: 500})
+          );
+          const okRes = await dispatchShellFetch(
+            "/ok-probe.css", new Response("ok", {status: 200})
+          );
+          // cache.put runs without await on the ok path; poll briefly.
+          let okCached = null;
+          for (let i = 0; i < 20 && !okCached; i += 1) {
+            await new Promise((r) => setTimeout(r, 100));
+            okCached = await caches.match(self.location.origin + "/ok-probe.css");
+          }
+          const errorCached = await caches.match(
+            self.location.origin + "/error-probe.css"
+          );
+          return {
+            errorStatus: errorRes.status,
+            okStatus: okRes.status,
+            errorCached: !!errorCached,
+            okCached: !!okCached,
+          };
+        }"""
+    )
+    assert result == {
+        "errorStatus": 500,
+        "okStatus": 200,
+        "errorCached": False,
+        "okCached": True,
+    }
+
+
+def test_registration_outcome_and_waituntil_rejection_are_observable(
+    page: Page, e2e_server: str
+) -> None:
+    page.goto(f"{e2e_server}/")
+    page.wait_for_function(
+        "navigator.serviceWorker.ready.then(r => !!r.active)", timeout=20_000
+    )
+    # Successful registration queues a page-side sw_lifecycle event.
+    page.wait_for_function("window.telemetry.size >= 1", timeout=10_000)
+
+    worker = page.context.service_workers[0]
+    messages = worker.evaluate(
+        """async () => {
+          const messages = [];
+          Object.defineProperty(self.clients, "matchAll", {
+            configurable: true,
+            value: async () => [{postMessage: (m) => messages.push(m)}],
+          });
+          Object.defineProperty(self.registration, "showNotification", {
+            configurable: true,
+            value: async () => { throw new Error("notification blocked"); },
+          });
+          let settled;
+          const event = new Event("push");
+          Object.defineProperties(event, {
+            data: {value: {json: () => ({title: "TheraPy"})}},
+            waitUntil: {value: (promise) => {
+              settled = Promise.resolve(promise).catch(() => "rejected");
+            }},
+          });
+          self.dispatchEvent(event);
+          const outcome = await settled;
+          return {outcome, events: messages.map((m) => m.event)};
+        }"""
+    )
+    assert messages["outcome"] == "rejected"
+    assert {"name": "sw_lifecycle", "outcome": "failed"} in messages["events"]

@@ -5,25 +5,29 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import logging
 import os
 import re
 import shutil
 import sqlite3
-from collections.abc import Iterator
+import time
+from collections.abc import Callable, Generator
 from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TypedDict
+from typing import Literal, ParamSpec, TypedDict, TypeVar
 from uuid import uuid4
 
 import numpy as np
 
 from therapy.knowledge.embeddings import EmbeddingBackend, FastEmbedBackend
 from therapy.knowledge.research_ingest import (
+    SUPPORTED_EXTENSIONS,
     ExtractedSource,
     OCRBackend,
     SourceBlock,
     extract_source,
+    validate_input,
 )
 from therapy.knowledge.schema import migrate_database
 
@@ -33,6 +37,102 @@ _MAX_CHUNK_CHARS = 800
 _MAX_TITLE_CHARS = 300
 _MAX_REF_CHARS = 1_000
 _SAFE_FILENAME_RE = re.compile(r"[^a-zA-Z0-9._-]+")
+
+type ResearchStage = Literal[
+    "validate", "extract", "ocr", "artifact", "db", "embed", "index"
+]
+type ResearchOutcome = Literal["success", "error", "timeout", "rejected"]
+type DivergenceKind = Literal["db_without_file", "file_without_db"]
+type ArtifactOperation = Literal["write", "delete"]
+
+_P = ParamSpec("_P")
+_R = TypeVar("_R")
+
+
+def _record_metric(name: str, value: float, attributes: dict[str, str]) -> None:
+    """Record a bounded broad metric without importing telemetry at startup."""
+    from therapy.observability import telemetry
+
+    telemetry.record_metric(name, value, attributes)
+
+
+def _exception_outcome(error: BaseException) -> ResearchOutcome:
+    """Collapse failures into the research manifest's finite outcome set."""
+    if isinstance(error, TimeoutError):
+        return "timeout"
+    if isinstance(error, ValueError):
+        return "rejected"
+    return "error"
+
+
+@contextmanager
+def _research_stage(stage: ResearchStage) -> Generator[None, None, None]:
+    """Time one content-free research stage with a finite outcome."""
+    started = time.monotonic()
+    outcome: ResearchOutcome = "success"
+    try:
+        yield
+    except Exception as error:
+        outcome = _exception_outcome(error)
+        raise
+    finally:
+        _record_metric(
+            "therapy_research_stage_seconds",
+            time.monotonic() - started,
+            {"stage": stage, "outcome": outcome},
+        )
+
+
+def _source_format(filename: str) -> str:
+    """Map a filename to a finite format without exposing the filename."""
+    return SUPPORTED_EXTENSIONS.get(Path(filename).suffix.casefold(), "unknown")
+
+
+def _record_divergence(
+    kind: DivergenceKind,
+    operation: ArtifactOperation,
+    *,
+    count: int = 1,
+) -> None:
+    """Emit one content-free artifact/DB consistency signal."""
+    if count < 1:
+        return
+    _record_metric("therapy_research_divergence_total", float(count), {"kind": kind})
+    from therapy.observability import logging as observability_logging
+
+    observability_logging.emit_event(
+        "research_artifact_divergence",
+        component="research",
+        operation=f"artifact_{operation}",
+        outcome=kind,
+        severity=logging.ERROR,
+        error_type="artifact_consistency",
+        count=count,
+    )
+
+
+def _traced_storage(
+    component: str, operation: str
+) -> Callable[[Callable[_P, _R]], Callable[_P, _R]]:
+    """Bounded db.operation instrumentation (obs plan O3.3); no SQL/paths."""
+    import functools
+
+    def decorate(func: Callable[_P, _R]) -> Callable[_P, _R]:
+        @functools.wraps(func)
+        def wrapper(*args: _P.args, **kwargs: _P.kwargs) -> _R:
+            from therapy.observability.telemetry import (
+                record_storage_result,
+                storage_operation,
+            )
+
+            with storage_operation(component, operation):
+                result = func(*args, **kwargs)
+            record_storage_result(component, operation, result)
+            return result
+
+        return wrapper
+
+    return decorate
 
 
 class IngestResult(TypedDict):
@@ -121,7 +221,7 @@ class ResearchKB:
         self.embedder = embedder or FastEmbedBackend(self.data_dir)
 
     @contextmanager
-    def _connect(self) -> Iterator[sqlite3.Connection]:
+    def _connect(self) -> Generator[sqlite3.Connection, None, None]:
         connection = sqlite3.connect(self.db_path, timeout=30.0)
         connection.row_factory = sqlite3.Row
         try:
@@ -147,21 +247,35 @@ class ResearchKB:
         return self.artifact_dir / f"{digest}{safe_suffix}"
 
     def _write_artifact(self, digest: str, filename: str, data: bytes) -> Path:
-        destination = self._artifact_path(digest, filename)
-        if destination.exists():
+        with _research_stage("artifact"):
+            destination = self._artifact_path(digest, filename)
+            if destination.exists():
+                return destination
+            temporary = destination.with_name(f".{destination.name}.{uuid4().hex}.tmp")
+            descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            try:
+                with os.fdopen(descriptor, "wb") as handle:
+                    handle.write(data)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                temporary.replace(destination)
+            finally:
+                temporary.unlink(missing_ok=True)
             return destination
-        temporary = destination.with_name(f".{destination.name}.{uuid4().hex}.tmp")
-        descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-        try:
-            with os.fdopen(descriptor, "wb") as handle:
-                handle.write(data)
-                handle.flush()
-                os.fsync(handle.fileno())
-            temporary.replace(destination)
-        finally:
-            temporary.unlink(missing_ok=True)
-        return destination
 
+    def _artifact_has_db_record(self, artifact: Path) -> bool:
+        """Return whether the preserved artifact is referenced by any document."""
+        relative_path = str(artifact.relative_to(self.data_dir))
+        with self._connect() as connection:
+            return (
+                connection.execute(
+                    "SELECT 1 FROM research_documents WHERE artifact_path = ? LIMIT 1",
+                    (relative_path,),
+                ).fetchone()
+                is not None
+            )
+
+    @_traced_storage("research", "ingest_bytes")
     def ingest_bytes(
         self,
         data: bytes,
@@ -174,104 +288,195 @@ class ResearchKB:
         ocr_backend: OCRBackend | None = None,
     ) -> IngestResult:
         """Validate, extract/OCR, preserve, and semantically index one source."""
-        title, reference = self._validate_metadata(
-            source_title or Path(filename).stem,
-            source_ref or filename,
-        )
-        digest = hashlib.sha256(data).hexdigest()
-        with self._connect() as connection:
-            existing = connection.execute(
-                "SELECT id, status FROM research_documents "
-                "WHERE content_hash = ? AND corpus_state = 'active'",
-                (digest,),
-            ).fetchone()
-            if existing is not None and not force:
-                counts = connection.execute(
-                    """
-                    SELECT COUNT(*) AS total, COALESCE(SUM(needs_review), 0) AS review
-                    FROM research_blocks WHERE doc_id = ?
-                    """,
-                    (existing["id"],),
-                ).fetchone()
-                return IngestResult(
-                    document_id=int(existing["id"]),
-                    deduplicated=True,
-                    status=str(existing["status"]),
-                    blocks=int(counts["total"]),
-                    review_blocks=int(counts["review"]),
+        started = time.monotonic()
+        outcome: ResearchOutcome = "success"
+        deduplicated = False
+        result: IngestResult | None = None
+        source_format = _source_format(filename)
+        try:
+            result = self._ingest_bytes(
+                data,
+                filename,
+                declared_type,
+                source_title=source_title,
+                source_ref=source_ref,
+                force=force,
+                ocr_backend=ocr_backend,
+            )
+            deduplicated = result["deduplicated"]
+            return result
+        except Exception as error:
+            outcome = _exception_outcome(error)
+            raise
+        finally:
+            _record_metric(
+                "therapy_research_ingests_total",
+                1,
+                {
+                    "format": source_format,
+                    "outcome": outcome,
+                    "deduplicated": str(deduplicated).lower(),
+                },
+            )
+            _record_metric(
+                "therapy_research_ingest_seconds",
+                time.monotonic() - started,
+                {"format": source_format, "outcome": outcome},
+            )
+            _record_metric(
+                "therapy_research_source_bytes", len(data), {"format": source_format}
+            )
+            if result is not None:
+                _record_metric(
+                    "therapy_research_blocks", result["blocks"], {"kind": "total"}
                 )
-        extracted = extract_source(
-            data,
-            filename,
-            declared_type,
-            ocr_backend=ocr_backend,
+                _record_metric(
+                    "therapy_research_blocks",
+                    result["review_blocks"],
+                    {"kind": "review"},
+                )
+
+    def _ingest_bytes(
+        self,
+        data: bytes,
+        filename: str,
+        declared_type: str | None,
+        *,
+        source_title: str | None,
+        source_ref: str | None,
+        force: bool,
+        ocr_backend: OCRBackend | None,
+    ) -> IngestResult:
+        with _research_stage("validate"):
+            title, reference = self._validate_metadata(
+                source_title or Path(filename).stem,
+                source_ref or filename,
+            )
+            validate_input(data, filename, declared_type)
+        digest = hashlib.sha256(data).hexdigest()
+        duplicate: IngestResult | None = None
+        with _research_stage("db"):
+            with self._connect() as connection:
+                existing = connection.execute(
+                    "SELECT id, status FROM research_documents "
+                    "WHERE content_hash = ? AND corpus_state = 'active'",
+                    (digest,),
+                ).fetchone()
+                if existing is not None and not force:
+                    counts = connection.execute(
+                        """
+                        SELECT COUNT(*) AS total,
+                               COALESCE(SUM(needs_review), 0) AS review
+                        FROM research_blocks WHERE doc_id = ?
+                        """,
+                        (existing["id"],),
+                    ).fetchone()
+                    duplicate = IngestResult(
+                        document_id=int(existing["id"]),
+                        deduplicated=True,
+                        status=str(existing["status"]),
+                        blocks=int(counts["total"]),
+                        review_blocks=int(counts["review"]),
+                    )
+        if duplicate is not None:
+            self._ensure_current_index()
+            return duplicate
+        with _research_stage("extract"):
+            extracted = extract_source(
+                data,
+                filename,
+                declared_type,
+                ocr_backend=ocr_backend,
+            )
+        _record_metric(
+            "therapy_research_pages",
+            len({block.page for block in extracted.blocks if block.page is not None}),
+            {"format": extracted.format},
         )
         artifact = self._write_artifact(digest, filename, data)
         now = _utc_now()
-        with self._connect() as connection:
-            with connection:
-                if existing is None:
-                    cursor = connection.execute(
-                        """
-                        INSERT INTO research_documents (
-                            source_title, source_ref, filename, media_type, format,
-                            content_hash, original_size, artifact_path,
-                            extracted_markdown, status, ocr_metadata_json,
-                            ingested_at, updated_at
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                        """,
-                        (
-                            title,
-                            reference,
-                            filename,
-                            extracted.media_type,
-                            extracted.format,
-                            digest,
-                            len(data),
-                            str(artifact.relative_to(self.data_dir)),
-                            extracted.markdown,
-                            extracted.status,
-                            json.dumps(extracted.ocr_metadata, sort_keys=True),
-                            now,
-                            now,
-                        ),
-                    )
-                    if cursor.lastrowid is None:
-                        raise RuntimeError("SQLite did not return a document ID")
-                    document_id = int(cursor.lastrowid)
-                else:
-                    document_id = int(existing["id"])
-                    connection.execute(
-                        "DELETE FROM research_blocks WHERE doc_id = ?", (document_id,)
-                    )
-                    connection.execute(
-                        "DELETE FROM research_index WHERE doc_id = ?", (document_id,)
-                    )
-                    connection.execute(
-                        """
-                        UPDATE research_documents SET source_title = ?, source_ref = ?,
-                            filename = ?, media_type = ?, format = ?, original_size = ?,
-                            artifact_path = ?, extracted_markdown = ?, status = ?,
-                            ocr_metadata_json = ?, index_model_name = NULL,
-                            index_model_revision = NULL, index_dimension = NULL,
-                            chunk_policy_version = NULL, updated_at = ? WHERE id = ?
-                        """,
-                        (
-                            title,
-                            reference,
-                            filename,
-                            extracted.media_type,
-                            extracted.format,
-                            len(data),
-                            str(artifact.relative_to(self.data_dir)),
-                            extracted.markdown,
-                            extracted.status,
-                            json.dumps(extracted.ocr_metadata, sort_keys=True),
-                            now,
-                            document_id,
-                        ),
-                    )
-                self._insert_blocks(connection, document_id, extracted)
+        try:
+            with _research_stage("db"):
+                with self._connect() as connection:
+                    with connection:
+                        if existing is None:
+                            cursor = connection.execute(
+                                """
+                                INSERT INTO research_documents (
+                                    source_title, source_ref, filename, media_type,
+                                    format, content_hash, original_size,
+                                    artifact_path, extracted_markdown, status,
+                                    ocr_metadata_json, ingested_at, updated_at
+                                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                """,
+                                (
+                                    title,
+                                    reference,
+                                    filename,
+                                    extracted.media_type,
+                                    extracted.format,
+                                    digest,
+                                    len(data),
+                                    str(artifact.relative_to(self.data_dir)),
+                                    extracted.markdown,
+                                    extracted.status,
+                                    json.dumps(extracted.ocr_metadata, sort_keys=True),
+                                    now,
+                                    now,
+                                ),
+                            )
+                            if cursor.lastrowid is None:
+                                raise RuntimeError(
+                                    "SQLite did not return a document ID"
+                                )
+                            document_id = int(cursor.lastrowid)
+                        else:
+                            document_id = int(existing["id"])
+                            connection.execute(
+                                "DELETE FROM research_blocks WHERE doc_id = ?",
+                                (document_id,),
+                            )
+                            connection.execute(
+                                "DELETE FROM research_index WHERE doc_id = ?",
+                                (document_id,),
+                            )
+                            connection.execute(
+                                """
+                                UPDATE research_documents SET source_title = ?,
+                                    source_ref = ?, filename = ?, media_type = ?,
+                                    format = ?, original_size = ?, artifact_path = ?,
+                                    extracted_markdown = ?, status = ?,
+                                    ocr_metadata_json = ?, index_model_name = NULL,
+                                    index_model_revision = NULL, index_dimension = NULL,
+                                    chunk_policy_version = NULL, updated_at = ?
+                                WHERE id = ?
+                                """,
+                                (
+                                    title,
+                                    reference,
+                                    filename,
+                                    extracted.media_type,
+                                    extracted.format,
+                                    len(data),
+                                    str(artifact.relative_to(self.data_dir)),
+                                    extracted.markdown,
+                                    extracted.status,
+                                    json.dumps(extracted.ocr_metadata, sort_keys=True),
+                                    now,
+                                    document_id,
+                                ),
+                            )
+                        self._insert_blocks(connection, document_id, extracted)
+        except Exception:
+            try:
+                referenced = self._artifact_has_db_record(artifact)
+            except (sqlite3.Error, ValueError):
+                referenced = True
+            if not referenced and artifact.exists():
+                _record_divergence("file_without_db", "write")
+            raise
+        if not artifact.exists():
+            _record_divergence("db_without_file", "write")
         self.reindex(document_id)
         return IngestResult(
             document_id=document_id,
@@ -330,8 +535,19 @@ class ResearchKB:
         )
         return result["document_id"]
 
+    @_traced_storage("research", "reindex")
     def reindex(self, document_id: int | None = None) -> int:
         """Deterministically rebuild current-model chunks, excluding unreviewed OCR."""
+        outcome: ResearchOutcome = "success"
+        try:
+            return self._reindex(document_id)
+        except Exception as error:
+            outcome = _exception_outcome(error)
+            raise
+        finally:
+            _record_metric("therapy_research_reindex_total", 1, {"outcome": outcome})
+
+    def _reindex(self, document_id: int | None) -> int:
         metadata = self.embedder.metadata
         with self._connect() as connection:
             query = (
@@ -341,77 +557,116 @@ class ResearchKB:
             )
             params = (document_id,) if document_id is not None else ()
             doc_ids = [int(row["id"]) for row in connection.execute(query, params)]
+        _record_metric("therapy_research_reindex_documents", len(doc_ids), {})
         indexed = 0
         for doc_id in doc_ids:
-            with self._connect() as connection:
-                rows = connection.execute(
-                    """
-                    SELECT id, anchor, text FROM research_blocks
-                    WHERE doc_id = ? AND needs_review = 0 ORDER BY id
-                    """,
-                    (doc_id,),
-                ).fetchall()
-            items = [
-                (int(row["id"]), str(row["anchor"]), order, chunk)
-                for row in rows
-                for order, chunk in enumerate(_split_chunk(str(row["text"])))
-            ]
-            vectors = self.embedder.embed_documents([item[3] for item in items])
-            if len(vectors) != len(items):
-                raise RuntimeError("embedding backend returned wrong batch length")
-            now = _utc_now()
-            with self._connect() as connection:
-                with connection:
-                    connection.execute(
-                        "DELETE FROM research_index WHERE doc_id = ?", (doc_id,)
-                    )
-                    for item, vector in zip(items, vectors, strict=True):
-                        normalized = np.asarray(vector, dtype=np.float32)
-                        if (
-                            normalized.shape != (metadata.dimension,)
-                            or not np.isfinite(normalized).all()
-                        ):
-                            raise RuntimeError(
-                                "embedding backend returned invalid research vector"
-                            )
-                        connection.execute(
-                            """
-                            INSERT INTO research_index (
-                                doc_id, block_id, chunk_ord, anchor, text,
-                                content_hash, vector, model_name, model_revision,
-                                dimension, chunk_policy_version, indexed_at
-                            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                            """,
-                            (
-                                doc_id,
-                                item[0],
-                                item[2],
-                                item[1],
-                                item[3],
-                                hashlib.sha256(item[3].encode()).hexdigest(),
-                                normalized.tobytes(),
-                                metadata.name,
-                                metadata.revision,
-                                metadata.dimension,
-                                CHUNK_POLICY_VERSION,
-                                now,
-                            ),
-                        )
-                    connection.execute(
+            from therapy.observability.telemetry import broad_span
+
+            with broad_span(
+                "research.reindex.document",
+                component="research",
+                operation="reindex_document",
+            ) as span:
+                with self._connect() as connection:
+                    rows = connection.execute(
                         """
-                        UPDATE research_documents SET index_model_name = ?,
-                            index_model_revision = ?, index_dimension = ?,
-                            chunk_policy_version = ?, updated_at = ? WHERE id = ?
+                        SELECT id, anchor, text, needs_review
+                        FROM research_blocks WHERE doc_id = ? ORDER BY id
                         """,
-                        (
-                            metadata.name,
-                            metadata.revision,
-                            metadata.dimension,
-                            CHUNK_POLICY_VERSION,
-                            now,
-                            doc_id,
-                        ),
+                        (doc_id,),
+                    ).fetchall()
+                items = [
+                    (int(row["id"]), str(row["anchor"]), order, chunk)
+                    for row in rows
+                    if not int(row["needs_review"])
+                    for order, chunk in enumerate(_split_chunk(str(row["text"])))
+                ]
+                set_attribute = getattr(span, "set_attribute", None)
+                if callable(set_attribute):
+                    set_attribute("research.document_count", 1)
+                    set_attribute("research.block_count", len(rows))
+                    set_attribute("research.chunk_count", len(items))
+                    set_attribute(
+                        "research.excluded_review_count",
+                        sum(int(row["needs_review"]) for row in rows),
                     )
+                _record_metric(
+                    "therapy_research_reindex_blocks", len(rows), {"kind": "total"}
+                )
+                _record_metric(
+                    "therapy_research_reindex_blocks",
+                    len(items),
+                    {"kind": "indexed"},
+                )
+                _record_metric(
+                    "therapy_research_reindex_blocks",
+                    sum(int(row["needs_review"]) for row in rows),
+                    {"kind": "review_excluded"},
+                )
+                with _research_stage("embed"):
+                    vectors = self.embedder.embed_documents([item[3] for item in items])
+                    if len(vectors) != len(items):
+                        raise RuntimeError(
+                            "embedding backend returned wrong batch length"
+                        )
+                now = _utc_now()
+                with _research_stage("index"):
+                    with self._connect() as connection:
+                        with connection:
+                            connection.execute(
+                                "DELETE FROM research_index WHERE doc_id = ?",
+                                (doc_id,),
+                            )
+                            for item, vector in zip(items, vectors, strict=True):
+                                normalized = np.asarray(vector, dtype=np.float32)
+                                if (
+                                    normalized.shape != (metadata.dimension,)
+                                    or not np.isfinite(normalized).all()
+                                ):
+                                    raise RuntimeError(
+                                        "embedding backend returned invalid "
+                                        "research vector"
+                                    )
+                                connection.execute(
+                                    """
+                                    INSERT INTO research_index (
+                                        doc_id, block_id, chunk_ord, anchor, text,
+                                        content_hash, vector, model_name,
+                                        model_revision, dimension,
+                                        chunk_policy_version, indexed_at
+                                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                    """,
+                                    (
+                                        doc_id,
+                                        item[0],
+                                        item[2],
+                                        item[1],
+                                        item[3],
+                                        hashlib.sha256(item[3].encode()).hexdigest(),
+                                        normalized.tobytes(),
+                                        metadata.name,
+                                        metadata.revision,
+                                        metadata.dimension,
+                                        CHUNK_POLICY_VERSION,
+                                        now,
+                                    ),
+                                )
+                            connection.execute(
+                                """
+                                UPDATE research_documents SET index_model_name = ?,
+                                    index_model_revision = ?, index_dimension = ?,
+                                    chunk_policy_version = ?, updated_at = ?
+                                WHERE id = ?
+                                """,
+                                (
+                                    metadata.name,
+                                    metadata.revision,
+                                    metadata.dimension,
+                                    CHUNK_POLICY_VERSION,
+                                    now,
+                                    doc_id,
+                                ),
+                            )
             indexed += len(items)
         return indexed
 
@@ -432,9 +687,13 @@ class ResearchKB:
                     CHUNK_POLICY_VERSION,
                 ),
             ).fetchall()
+        _record_metric("therapy_research_unindexed_documents", len(stale), {})
         for row in stale:
             self.reindex(int(row["id"]))
+        if stale:
+            _record_metric("therapy_research_unindexed_documents", 0, {})
 
+    @_traced_storage("research", "query")
     def query(
         self,
         text: str,
@@ -443,6 +702,27 @@ class ResearchKB:
         threshold: float = DEFAULT_RELEVANCE_THRESHOLD,
     ) -> list[SearchResult]:
         """Return bounded multilingual semantic results above relevance floor."""
+        started = time.monotonic()
+        outcome = "error"
+        try:
+            results = self._query(text, k, threshold=threshold)
+            outcome = "hit" if results else "no_hit"
+            return results
+        finally:
+            _record_metric("therapy_research_queries_total", 1, {"outcome": outcome})
+            _record_metric(
+                "therapy_research_query_seconds",
+                time.monotonic() - started,
+                {"outcome": outcome},
+            )
+
+    def _query(
+        self,
+        text: str,
+        k: int,
+        *,
+        threshold: float,
+    ) -> list[SearchResult]:
         if not text.strip() or len(text) > 2_000:
             raise ValueError("query must be 1-2000 characters")
         if not 0 <= k <= 20:
@@ -453,65 +733,80 @@ class ResearchKB:
             return []
         self._ensure_current_index()
         metadata = self.embedder.metadata
-        query_vector = np.asarray(self.embedder.embed_query(text), dtype=np.float32)
-        if query_vector.shape != (metadata.dimension,):
-            raise RuntimeError("embedding backend returned invalid query dimension")
-        with self._connect() as connection:
-            rows = connection.execute(
-                """
-                SELECT i.text, i.vector, i.anchor, i.doc_id,
-                       d.source_title, d.source_ref, b.page, b.heading
-                FROM research_index AS i
-                JOIN research_documents AS d ON d.id = i.doc_id
-                JOIN research_blocks AS b ON b.id = i.block_id
-                WHERE d.corpus_state = 'active' AND i.model_name = ?
-                  AND i.model_revision = ? AND i.dimension = ?
-                  AND i.chunk_policy_version = ?
-                ORDER BY i.id
-                """,
-                (
-                    metadata.name,
-                    metadata.revision,
-                    metadata.dimension,
-                    CHUNK_POLICY_VERSION,
-                ),
-            ).fetchall()
-        scored: list[tuple[float, sqlite3.Row]] = []
-        query_norm = float(np.linalg.norm(query_vector))
-        for row in rows:
-            vector = np.frombuffer(row["vector"], dtype=np.float32)
-            if vector.shape != (metadata.dimension,):
-                continue
-            denominator = query_norm * float(np.linalg.norm(vector))
-            score = (
-                float(np.dot(query_vector, vector) / denominator)
-                if denominator
-                else 0.0
+        with _research_stage("embed"):
+            query_vector = np.asarray(self.embedder.embed_query(text), dtype=np.float32)
+            if query_vector.shape != (metadata.dimension,):
+                raise RuntimeError("embedding backend returned invalid query dimension")
+        with _research_stage("index"):
+            with self._connect() as connection:
+                rows = connection.execute(
+                    """
+                    SELECT i.text, i.vector, i.anchor, i.doc_id,
+                           d.source_title, d.source_ref, b.page, b.heading
+                    FROM research_index AS i
+                    JOIN research_documents AS d ON d.id = i.doc_id
+                    JOIN research_blocks AS b ON b.id = i.block_id
+                    WHERE d.corpus_state = 'active' AND i.model_name = ?
+                      AND i.model_revision = ? AND i.dimension = ?
+                      AND i.chunk_policy_version = ?
+                    ORDER BY i.id
+                    """,
+                    (
+                        metadata.name,
+                        metadata.revision,
+                        metadata.dimension,
+                        CHUNK_POLICY_VERSION,
+                    ),
+                ).fetchall()
+            _record_metric("therapy_research_query_candidates", len(rows), {})
+            scored: list[tuple[float, sqlite3.Row]] = []
+            query_norm = float(np.linalg.norm(query_vector))
+            for row in rows:
+                vector = np.frombuffer(row["vector"], dtype=np.float32)
+                if vector.shape != (metadata.dimension,):
+                    continue
+                denominator = query_norm * float(np.linalg.norm(vector))
+                score = (
+                    float(np.dot(query_vector, vector) / denominator)
+                    if denominator
+                    else 0.0
+                )
+                if score >= threshold:
+                    scored.append((score, row))
+            scored.sort(
+                key=lambda item: (
+                    -item[0],
+                    int(item[1]["doc_id"]),
+                    str(item[1]["anchor"]),
+                )
             )
-            if score >= threshold:
-                scored.append((score, row))
-        scored.sort(
-            key=lambda item: (-item[0], int(item[1]["doc_id"]), str(item[1]["anchor"]))
-        )
-        return [
-            SearchResult(
-                document_id=int(row["doc_id"]),
-                text=str(row["text"]),
-                source_title=str(row["source_title"]),
-                source_ref=str(row["source_ref"]),
-                anchor=str(row["anchor"]),
-                page=int(row["page"]) if row["page"] is not None else None,
-                heading=str(row["heading"]) if row["heading"] is not None else None,
-                score=score,
-                citation=_citation(
-                    str(row["source_title"]),
-                    int(row["page"]) if row["page"] is not None else None,
-                    str(row["heading"]) if row["heading"] is not None else None,
-                    str(row["anchor"]),
-                ),
-            )
-            for score, row in scored[:k]
-        ]
+            results = [
+                SearchResult(
+                    document_id=int(row["doc_id"]),
+                    text=str(row["text"]),
+                    source_title=str(row["source_title"]),
+                    source_ref=str(row["source_ref"]),
+                    anchor=str(row["anchor"]),
+                    page=int(row["page"]) if row["page"] is not None else None,
+                    heading=(
+                        str(row["heading"]) if row["heading"] is not None else None
+                    ),
+                    score=score,
+                    citation=_citation(
+                        str(row["source_title"]),
+                        int(row["page"]) if row["page"] is not None else None,
+                        str(row["heading"]) if row["heading"] is not None else None,
+                        str(row["anchor"]),
+                    ),
+                )
+                for score, row in scored[:k]
+            ]
+            _record_metric("therapy_research_query_results", len(results), {})
+            if results:
+                _record_metric(
+                    "therapy_research_query_top_score", results[0]["score"], {}
+                )
+            return results
 
     def ground(self, topic: str) -> str | None:
         """Return one labeled untrusted passage for silent technique grounding."""
@@ -679,21 +974,36 @@ class ResearchKB:
             ).fetchone()
             if row is None:
                 return False
+            artifact: Path | None = None
+            if row["artifact_path"]:
+                artifact = (self.data_dir / str(row["artifact_path"])).resolve()
+                if not artifact.exists():
+                    _record_divergence("db_without_file", "delete")
             with connection:
                 connection.execute(
                     "DELETE FROM research_documents WHERE id = ?", (document_id,)
                 )
-        if row["artifact_path"]:
-            path = (self.data_dir / str(row["artifact_path"])).resolve()
-            if path.is_relative_to(self.artifact_dir.resolve()):
-                path.unlink(missing_ok=True)
+        if artifact is not None:
+            try:
+                with _research_stage("artifact"):
+                    if artifact.is_relative_to(self.artifact_dir.resolve()):
+                        artifact.unlink(missing_ok=True)
+            except Exception:
+                if artifact.exists():
+                    _record_divergence("file_without_db", "delete")
+                raise
+            if artifact.exists():
+                _record_divergence("file_without_db", "delete")
         return True
 
     def export_all(self) -> dict[str, object]:
         """Export corpus metadata, blocks, and preserved source artifacts."""
         documents: list[dict[str, object]] = []
         for summary in self.documents():
-            document = self.document(int(summary["id"]))
+            summary_id = summary["id"]
+            if isinstance(summary_id, bool) or not isinstance(summary_id, int):
+                raise RuntimeError("research document id is not an integer")
+            document = self.document(summary_id)
             if document is None:
                 continue
             artifact_path = document.get("artifact_path")
@@ -712,10 +1022,27 @@ class ResearchKB:
     def delete_all(self) -> None:
         """Erase corpus rows and all preserved owner source artifacts."""
         with self._connect() as connection:
+            paths = [
+                (self.data_dir / str(row["artifact_path"])).resolve()
+                for row in connection.execute(
+                    "SELECT artifact_path FROM research_documents "
+                    "WHERE artifact_path IS NOT NULL"
+                )
+            ]
+            missing = sum(not path.exists() for path in paths)
+            _record_divergence("db_without_file", "delete", count=missing)
             with connection:
                 connection.execute("DELETE FROM research_documents")
-        shutil.rmtree(self.data_dir / "research", ignore_errors=True)
-        self.artifact_dir.mkdir(parents=True, exist_ok=True)
+        research_root = self.data_dir / "research"
+        try:
+            with _research_stage("artifact"):
+                if research_root.exists():
+                    shutil.rmtree(research_root)
+                self.artifact_dir.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            if research_root.exists():
+                _record_divergence("file_without_db", "delete")
+            raise
 
 
 __all__ = [

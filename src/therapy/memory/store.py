@@ -14,13 +14,16 @@ import shutil
 import sqlite3
 import uuid
 import wave
-from collections.abc import Iterator
+from collections.abc import Callable, Generator
 from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import ParamSpec, TypeVar, cast
 
 JsonScalar = str | int | None
 RowDict = dict[str, JsonScalar]
+P = ParamSpec("P")
+R = TypeVar("R")
 
 
 def _utc_now() -> str:
@@ -30,12 +33,43 @@ def _utc_now() -> str:
 
 def _row_dict(row: sqlite3.Row) -> RowDict:
     """Convert a SQLite row into a JSON-serializable dictionary."""
-    return dict(row)
+    raw = cast(dict[object, object], dict(row))
+    if not all(
+        isinstance(key, str) and (value is None or isinstance(value, str | int))
+        for key, value in raw.items()
+    ):
+        raise TypeError("SQLite row contains a non-JSON scalar")
+    return cast(RowDict, raw)
 
 
 def resume_window_secs() -> float:
     """How long after its last activity a session is still resumable."""
     return float(os.environ.get("THERAPY_RESUME_WINDOW_SECS", "900"))
+
+
+
+def _traced_storage(
+    component: str, operation: str
+) -> Callable[[Callable[P, R]], Callable[P, R]]:
+    """Bounded db.operation instrumentation (obs plan O3.3); no SQL/paths."""
+    import functools
+
+    def decorate(func: Callable[P, R]) -> Callable[P, R]:
+        @functools.wraps(func)
+        def wrapper(*args: P.args, **kwargs: P.kwargs) -> R:
+            from therapy.observability.telemetry import (
+                record_storage_result,
+                storage_operation,
+            )
+
+            with storage_operation(component, operation):
+                result = func(*args, **kwargs)
+            record_storage_result(component, operation, result)
+            return result
+
+        return wrapper
+
+    return decorate
 
 
 class MemoryStore:
@@ -55,7 +89,7 @@ class MemoryStore:
         self._init_schema()
 
     @contextmanager
-    def _connect(self) -> Iterator[sqlite3.Connection]:
+    def _connect(self) -> Generator[sqlite3.Connection, None, None]:
         """Open a configured SQLite connection for one method call."""
         connection = sqlite3.connect(self._db_path, timeout=30.0)
         connection.row_factory = sqlite3.Row
@@ -107,6 +141,7 @@ class MemoryStore:
                 with connection:
                     connection.execute("ALTER TABLE sessions ADD COLUMN recap TEXT")
 
+    @_traced_storage("memory", "create_session")
     def create_session(self) -> str:
         """Create a session row and return its UUID4 hex id."""
         session_id = uuid.uuid4().hex
@@ -118,6 +153,7 @@ class MemoryStore:
                 )
         return session_id
 
+    @_traced_storage("memory", "end_session")
     def end_session(self, session_id: str, summary: str | None = None) -> None:
         """Mark a session ended and store its summary."""
         with self._connect() as connection:
@@ -196,20 +232,32 @@ class MemoryStore:
             ).fetchone()
         return row is not None
 
+    @_traced_storage("memory", "delete_session")
     def delete_session(self, session_id: str) -> bool:
         """Delete one session, its turns (FK cascade), and its audio archive.
 
         Returns:
             True when a session row was deleted, False for an unknown id.
         """
-        with self._connect() as connection:
-            with connection:
-                cursor = connection.execute(
-                    "DELETE FROM sessions WHERE id = ?", (session_id,)
-                )
-        shutil.rmtree(self._audio_dir / session_id, ignore_errors=True)
+        from therapy.observability.telemetry import broad_span
+
+        # Distinct db-delete/audio-delete children (plan O3.1) — the two can
+        # fail independently and the waterfall must show which.
+        with broad_span(
+            "session_delete.db_delete", component="memory", operation="delete"
+        ):
+            with self._connect() as connection:
+                with connection:
+                    cursor = connection.execute(
+                        "DELETE FROM sessions WHERE id = ?", (session_id,)
+                    )
+        with broad_span(
+            "session_delete.audio_delete", component="memory", operation="delete"
+        ):
+            shutil.rmtree(self._audio_dir / session_id, ignore_errors=True)
         return cursor.rowcount > 0
 
+    @_traced_storage("memory", "reopen_session")
     def reopen_session(self, session_id: str) -> None:
         """Clear finalization fields so an interrupted session can continue."""
         with self._connect() as connection:
@@ -223,6 +271,7 @@ class MemoryStore:
                     (session_id,),
                 )
 
+    @_traced_storage("memory", "add_turn")
     def add_turn(
         self,
         session_id: str,
@@ -325,6 +374,7 @@ class MemoryStore:
                 )
         return cursor.rowcount > 0
 
+    @_traced_storage("memory", "ensure_title")
     def ensure_title(self, session_id: str, title: str) -> None:
         """Fill in an auto-generated title only where none exists yet.
 
@@ -338,6 +388,7 @@ class MemoryStore:
                     (title, session_id),
                 )
 
+    @_traced_storage("memory", "ensure_recap")
     def ensure_recap(self, session_id: str, recap: str) -> None:
         """Fill user-facing recap once, independently of internal summary."""
         with self._connect() as connection:
@@ -402,7 +453,7 @@ class MemoryStore:
 
     def export_all(self) -> dict[str, object]:
         """Return a JSON-serializable snapshot of sessions and turns."""
-        sessions = []
+        sessions: list[dict[str, object]] = []
         for session in self.sessions():
             session_export: dict[str, object] = dict(session)
             session_export["turns"] = self.session_turns(str(session["id"]))

@@ -7,6 +7,7 @@ import json
 import os
 import sys
 from pathlib import Path
+from typing import cast
 
 from therapy.data import DataSovereignty
 from therapy.knowledge.research import ResearchKB
@@ -73,9 +74,13 @@ def main(argv: list[str] | None = None) -> int:
             if not args.yes:
                 print("Refusing destructive restore without --yes.", file=sys.stderr)
                 return 2
-            snapshot = json.loads(args.input.read_text(encoding="utf-8"))
-            if not isinstance(snapshot, dict):
+            snapshot_value: object = json.loads(args.input.read_text(encoding="utf-8"))
+            if not isinstance(snapshot_value, dict):
                 raise ValueError("restore snapshot root must be an object")
+            raw_snapshot = cast(dict[object, object], snapshot_value)
+            if not all(isinstance(key, str) for key in raw_snapshot):
+                raise ValueError("restore snapshot field names must be strings")
+            snapshot = cast(dict[str, object], snapshot_value)
             _print_json(DataSovereignty().restore_snapshot(snapshot))
             return 0
         if args.command == "delete":
@@ -125,7 +130,7 @@ def main(argv: list[str] | None = None) -> int:
             _print_json({"deleted": args.document_id})
             return 0
     except (OSError, ValueError, RuntimeError, json.JSONDecodeError) as exc:
-        print(f"error: {exc}", file=sys.stderr)
+        print(f"error: {type(exc).__name__}", file=sys.stderr)
         return 1
     return 1
 

@@ -1,0 +1,109 @@
+{
+  "schema_version": 1,
+  "notes": [
+    "Synthetic STT/TTS evaluation fixtures (plan O0.2 item 4).",
+    "Audio is generated on demand (Kokoro TTS or scripted recording) and is never committed; only these definitions and expected results are.",
+    "WER/CER claims are valid only for cases whose review.status is 'approved' by the owner (plan O3.4 item 2). Seed cases start as 'seeded'.",
+    "reference_transcript is the exact reviewed reference; language_group uses the bounded enum from therapy.observability.model."
+  ],
+  "cases": [
+    {
+      "id": "stt-en-01",
+      "kind": "speech",
+      "language_group": "en",
+      "reference_transcript": "I wanted to talk about how the week went and what kept me up at night.",
+      "synthesis": {"engine": "kokoro", "voice": "af_heart", "speed": 1.0},
+      "review": {"status": "seeded", "reviewer": null}
+    },
+    {
+      "id": "stt-en-02",
+      "kind": "speech",
+      "language_group": "en",
+      "reference_transcript": "Could you remind me what I said about my sister's visit last Tuesday?",
+      "synthesis": {"engine": "kokoro", "voice": "am_michael", "speed": 1.05},
+      "review": {"status": "seeded", "reviewer": null}
+    },
+    {
+      "id": "stt-es-01",
+      "kind": "speech",
+      "language_group": "es",
+      "reference_transcript": "Esta semana dormí mejor, pero el lunes me costó concentrarme en el trabajo.",
+      "synthesis": {"engine": "kokoro", "voice": "ef_dora", "speed": 1.0},
+      "review": {"status": "seeded", "reviewer": null}
+    },
+    {
+      "id": "stt-es-02",
+      "kind": "speech",
+      "language_group": "es",
+      "reference_transcript": "¿Podemos repasar lo que hablamos sobre poner límites con mi jefe?",
+      "synthesis": {"engine": "kokoro", "voice": "em_alex", "speed": 0.95},
+      "review": {"status": "seeded", "reviewer": null}
+    },
+    {
+      "id": "stt-pt-01",
+      "kind": "speech",
+      "language_group": "pt",
+      "reference_transcript": "Hoje consegui caminhar meia hora e me senti bem menos ansioso depois.",
+      "synthesis": {"engine": "kokoro", "voice": "pm_alex", "speed": 1.0},
+      "review": {"status": "seeded", "reviewer": null}
+    },
+    {
+      "id": "stt-pt-02",
+      "kind": "speech",
+      "language_group": "pt",
+      "reference_transcript": "Quero falar sobre a conversa difícil que tive com a minha mãe ontem.",
+      "synthesis": {"engine": "kokoro", "voice": "pf_dora", "speed": 1.0},
+      "review": {"status": "seeded", "reviewer": null}
+    },
+    {
+      "id": "stt-codeswitch-01",
+      "kind": "code_switch",
+      "language_group": "code_switch",
+      "reference_transcript": "Ayer tuve una reunión muy estresante, you know, y no supe cómo decir que no.",
+      "segments": [
+        {"language": "es", "text": "Ayer tuve una reunión muy estresante,"},
+        {"language": "en", "text": "you know,"},
+        {"language": "es", "text": "y no supe cómo decir que no."}
+      ],
+      "synthesis": {"engine": "kokoro", "voice": "ef_dora", "speed": 1.0},
+      "review": {"status": "seeded", "reviewer": null}
+    },
+    {
+      "id": "stt-codeswitch-02",
+      "kind": "code_switch",
+      "language_group": "code_switch",
+      "reference_transcript": "I told him que necesito más tempo para mim, and he actually listened.",
+      "segments": [
+        {"language": "en", "text": "I told him"},
+        {"language": "es", "text": "que necesito más"},
+        {"language": "pt", "text": "tempo para mim,"},
+        {"language": "en", "text": "and he actually listened."}
+      ],
+      "synthesis": {"engine": "kokoro", "voice": "af_heart", "speed": 1.0},
+      "review": {"status": "seeded", "reviewer": null}
+    },
+    {
+      "id": "stt-silence-01",
+      "kind": "silence",
+      "language_group": "none",
+      "reference_transcript": "",
+      "audio_spec": {"seconds": 6.0, "content": "digital_silence"},
+      "expected": {"no_speech": true, "empty_transcript": true},
+      "review": {"status": "seeded", "reviewer": null}
+    },
+    {
+      "id": "stt-silence-02",
+      "kind": "silence",
+      "language_group": "none",
+      "reference_transcript": "",
+      "audio_spec": {"seconds": 8.0, "content": "room_tone_noise", "rms_dbfs": -48},
+      "expected": {"no_speech": true, "empty_transcript": true},
+      "review": {"status": "seeded", "reviewer": null}
+    }
+  ],
+  "tts_listening_phrases": [
+    {"id": "tts-en-01", "language_group": "en", "text": "Let's take a moment to notice what went well today."},
+    {"id": "tts-es-01", "language_group": "es", "text": "Vamos a repasar juntos cómo te sentiste esta semana."},
+    {"id": "tts-pt-01", "language_group": "pt", "text": "Vamos revisar juntos como você se sentiu esta semana."}
+  ]
+}

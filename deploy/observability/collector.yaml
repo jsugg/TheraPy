@@ -1,0 +1,110 @@
+# Pinned collector-contrib config (obs plan O1.2 item 4, O2.4).
+#
+# Two ISOLATED pipelines — broad (LGTM) and restricted (Phoenix) — each with
+# its own receiver port and a file_storage-backed sending queue (WAL). The
+# WAL is strictly a second remote-transport buffer: the application's
+# pre-dispatch SQLite journal remains the source of truth and never depends
+# on this process. All ports are compose-internal; nothing is published to
+# the host.
+
+extensions:
+  file_storage/broad:
+    directory: /var/lib/otelcol/broad
+    create_directory: true
+  file_storage/restricted:
+    directory: /var/lib/otelcol/restricted
+    create_directory: true
+  health_check:
+    endpoint: 0.0.0.0:13133
+
+receivers:
+  otlp/broad:
+    protocols:
+      http:
+        endpoint: 0.0.0.0:4318
+  otlp/restricted:
+    protocols:
+      http:
+        endpoint: 0.0.0.0:4319
+  # TURN relay metrics (compose-internal 9641, never published to the host).
+  # coturn runs WITHOUT --prometheus-username-labels; the broad denylist
+  # below deletes `username` as defense in depth regardless.
+  prometheus/turn:
+    config:
+      scrape_configs:
+        - job_name: turn
+          scrape_interval: 30s
+          static_configs:
+            - targets: [turn:9641]
+
+processors:
+  # Defense in depth: the app's routing scrub is primary; the collector
+  # deletes concrete-target/query/address attributes if they ever appear.
+  attributes/broad_denylist:
+    actions:
+      - {key: http.target, action: delete}
+      - {key: http.url, action: delete}
+      - {key: url.query, action: delete}
+      - {key: url.full, action: delete}
+      - {key: url.path, action: delete}
+      - {key: client.address, action: delete}
+      - {key: user_agent.original, action: delete}
+      - {key: exception.message, action: delete}
+      - {key: exception.stacktrace, action: delete}
+      - {key: session.id, action: delete}
+      - {key: enduser.id, action: delete}
+      - {key: username, action: delete}
+  batch/broad:
+    send_batch_size: 256
+    timeout: 5s
+  batch/restricted:
+    send_batch_size: 64
+    timeout: 2s
+  memory_limiter:
+    check_interval: 5s
+    limit_mib: 192
+    spike_limit_mib: 48
+
+exporters:
+  otlphttp/lgtm:
+    endpoint: http://lgtm:4318
+    sending_queue:
+      enabled: true
+      storage: file_storage/broad
+      queue_size: 2000
+    retry_on_failure:
+      enabled: true
+      max_elapsed_time: 300s
+  otlphttp/phoenix:
+    endpoint: http://phoenix:6006
+    sending_queue:
+      enabled: true
+      storage: file_storage/restricted
+      queue_size: 2000
+    retry_on_failure:
+      enabled: true
+      max_elapsed_time: 300s
+
+service:
+  extensions: [file_storage/broad, file_storage/restricted, health_check]
+  telemetry:
+    metrics:
+      readers:
+        - periodic:
+            exporter:
+              otlp:
+                protocol: http/protobuf
+                endpoint: http://lgtm:4318
+  pipelines:
+    traces/broad:
+      receivers: [otlp/broad]
+      processors: [memory_limiter, attributes/broad_denylist, batch/broad]
+      exporters: [otlphttp/lgtm]
+    metrics/broad:
+      receivers: [otlp/broad, prometheus/turn]
+      processors: [memory_limiter, attributes/broad_denylist, batch/broad]
+      exporters: [otlphttp/lgtm]
+    traces/restricted:
+      receivers: [otlp/restricted]
+      processors: [memory_limiter, batch/restricted]
+      exporters: [otlphttp/phoenix]

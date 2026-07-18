@@ -1,8 +1,8 @@
 # TheraPy dev tasks. Run `make` (or `make help`) to list targets.
 #
-# Source (incl. the PWA static assets) and tests are bind-mounted into the
-# container, so UI/code/test edits are live — no image rebuild needed except
-# when dependencies change (then `make rebuild`).
+# Source (incl. the PWA static assets), tests, and scripts are bind-mounted into
+# the container, so UI/code/test/script edits are live — no image rebuild needed
+# except when dependencies change (then `make rebuild`).
 #
 #   UI edit (JS/CSS/HTML) → just reload the browser
 #   Python edit           → `make restart`
@@ -18,6 +18,8 @@ EXEC    := $(COMPOSE) exec -T $(SVC)
 RUN     := $(EXEC) uv run
 VENV    := .venv/bin
 ARGS    ?=
+# Coverage floor for `make coverage` / `make check`; ratchet upward as gaps close.
+COV_MIN ?= 85
 
 .DEFAULT_GOAL := help
 
@@ -79,7 +81,7 @@ integration: test-integration
 
 .PHONY: test-e2e e2e
 test-e2e: ## ALL browser e2e (auto-installs Chromium if missing)
-	$(RUN) playwright install chromium >/dev/null
+	$(RUN) playwright install --with-deps chromium firefox >/dev/null # WebKit deps are unavailable in the pinned image.
 	$(RUN) pytest -m e2e $(ARGS)
 
 e2e: test-e2e
@@ -92,9 +94,46 @@ test-fast: ## Quick framework-free run on the host slim venv
 lint: ## Ruff lint (host)
 	$(VENV)/ruff check .
 
+.PHONY: typecheck
+typecheck: ## Pyright in the Linux container (the supported runtime)
+	$(RUN) pyright --warnings
+
 .PHONY: verify-longitudinal-loop
 verify-longitudinal-loop: ## Verify longitudinal self-knowledge loop (host, isolated data)
 	$(VENV)/python scripts/verify_longitudinal_loop.py
 
+.PHONY: coverage
+coverage: ## Full in-container suite + coverage report + COV_MIN fail-under gate
+	$(RUN) pytest --cov=therapy --cov-report=term-missing \
+		--cov-report=xml --cov-fail-under=$(COV_MIN) -p no:cacheprovider $(ARGS)
+
 .PHONY: check
-check: lint test-fast ## Fast pre-push gate: lint + framework-free tests (host)
+check: lint typecheck coverage ## Pre-push gate: lint + strict types + suite w/ coverage floor
+
+.PHONY: hooks
+hooks: ## Install the repo git hooks (.githooks) into this clone
+	git config core.hooksPath .githooks
+	chmod +x .githooks/*
+	@echo "Installed: core.hooksPath=.githooks (bypass any hook with --no-verify)."
+
+# --- observability gate tooling (obs plan §11) -------------------------------
+
+.PHONY: obs-canary-scan
+obs-canary-scan: ## Routing/secret canary gate over the fixture corpus
+	$(VENV)/python scripts/observability/canary_scan.py fixtures
+
+.PHONY: obs-fixture-hash
+obs-fixture-hash: ## Reproducible identity of the observability fixture corpus
+	$(VENV)/python scripts/observability/fixture_hash.py
+
+.PHONY: obs-baseline
+obs-baseline: ## Telemetry-off/on workload baseline against a running instance
+	$(VENV)/python scripts/observability/baseline.py --label off
+
+.PHONY: obs-dashboards
+obs-dashboards: ## Regenerate the six Grafana dashboards deterministically
+	$(VENV)/python scripts/observability/gen_dashboards.py
+
+.PHONY: obs-fixtures
+obs-fixtures: ## Regenerate golden interaction fixtures + canaries
+	$(VENV)/python scripts/observability/gen_interaction_fixtures.py

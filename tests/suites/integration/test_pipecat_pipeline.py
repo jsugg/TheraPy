@@ -1,4 +1,5 @@
 import asyncio
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 
 import pytest
@@ -11,7 +12,7 @@ pytest.importorskip("pipecat")
 
 from therapy.integrations.pipecat.pipeline import (
     LANGUAGE_ENUM,
-    _generate_session_artifacts,
+    generate_session_artifacts,
     make_llm_service,
 )
 from therapy.knowledge.distill import DistillResult
@@ -43,7 +44,7 @@ def test_llm_factory_uses_deterministic_external_boundary_in_test_mode(
 ) -> None:
     monkeypatch.setenv("THERAPY_TEST_MODE", "1")
 
-    assert type(make_llm_service()).__name__ == "_DeterministicTestLLM"
+    assert type(make_llm_service()).__name__ == "DeterministicTestLLM"
 
 
 def test_summary_failure_does_not_block_other_finalization_artifacts(
@@ -51,26 +52,28 @@ def test_summary_failure_does_not_block_other_finalization_artifacts(
 ) -> None:
     calls: list[str] = []
 
-    async def broken_summary(_turns: list[dict[str, object]]) -> str:
+    async def broken_summary(_turns: Sequence[Mapping[str, object]]) -> str:
         calls.append("summary")
         raise RuntimeError("summary unavailable")
 
     async def distill(
-        _model: UserModel, _turns: list[dict[str, object]], _session_id: str
+        _model: UserModel,
+        _turns: Sequence[Mapping[str, object]],
+        _session_id: str,
     ) -> DistillResult:
         calls.append("distill")
         return DistillResult(run_id="run", promoted_nodes=[7])
 
-    async def recap(_turns: list[dict[str, object]]) -> str:
+    async def recap(_turns: Sequence[Mapping[str, object]]) -> str:
         calls.append("recap")
         return "Useful recap"
 
-    async def title(_turns: list[dict[str, object]]) -> str:
+    async def title(_turns: Sequence[Mapping[str, object]]) -> str:
         calls.append("title")
         return "Useful title"
 
     artifacts = asyncio.run(
-        _generate_session_artifacts(
+        generate_session_artifacts(
             [{"role": "user", "text": "hello"}],
             UserModel(tmp_path),
             "s1",

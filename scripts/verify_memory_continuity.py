@@ -24,6 +24,8 @@ import subprocess
 import sys
 import time
 from fractions import Fraction
+from importlib.metadata import PackageNotFoundError, version
+from typing import Literal, cast
 
 import httpx
 import numpy as np
@@ -31,10 +33,49 @@ from aiortc import RTCPeerConnection, RTCSessionDescription
 from aiortc.mediastreams import MediaStreamTrack
 from av import AudioFrame
 
+from therapy.observability.interactions import JsonValue, require_json_object
+
 SERVER = "http://localhost:8000"
 RATE = 48_000
 FRAME_SAMPLES = RATE // 50  # 20 ms
 FACT_TOKEN = "Nebulosa"  # distinctive enough to be unambiguous in replies
+SCRIPT_NAME = "verify_memory_continuity"
+SCENARIOS = frozenset({"memory-continuity"})
+
+type VerificationResult = Literal["pass", "fail"]
+
+
+def _object_list(value: object, label: str) -> list[dict[str, JsonValue]]:
+    """Validate a protocol field as a list of JSON objects."""
+    if not isinstance(value, list):
+        raise TypeError(f"{label} must be a list")
+    return [
+        require_json_object(item, f"{label}[{index}]")
+        for index, item in enumerate(cast(list[object], value))
+    ]
+
+
+def build_verification_record(
+    *, scenario: str, duration_s: float, result: VerificationResult
+) -> dict[str, str | float]:
+    """Build the final bounded verification record."""
+    if scenario not in SCENARIOS:
+        raise ValueError("unsupported verification scenario")
+    try:
+        build = version("therapy")
+    except PackageNotFoundError:
+        build = "unknown"
+    return {
+        "record": "verification",
+        "script": SCRIPT_NAME,
+        "build": build,
+        "scenario": scenario,
+        "duration_s": duration_s,
+        "result": result,
+        "environment": "test",
+    }
+
+
 SESSION_A_TURNS = [
     f"Hola, te quería contar algo: acabo de adoptar una perrita y le puse {FACT_TOKEN}.",
     f"Sí, {FACT_TOKEN} es una cachorra mestiza, la encontré cerca del trabajo.",
@@ -75,15 +116,17 @@ class TypedClient:
         self.pc = RTCPeerConnection()
         self.pc.addTrack(SilentMic())
         self.channel = self.pc.createDataChannel("chat", ordered=True)
-        self.transcripts: list[dict] = []
+        self.transcripts: list[dict[str, JsonValue]] = []
+        self.session_state: dict[str, JsonValue] | None = None
         self.event = asyncio.Event()
         self.channel.on("message", self._on_message)
 
     def _on_message(self, raw: str) -> None:
         try:
-            message = json.loads(raw)
+            payload: object = json.loads(raw)
         except json.JSONDecodeError:
             return
+        message = require_json_object(payload, "data-channel message")
         if message.get("type") == "transcript":
             self.transcripts.append(message)
             self.event.set()
@@ -91,9 +134,11 @@ class TypedClient:
             self.session_state = message
             self.event.set()
 
-    async def request_session_state(self, timeout: float = 30.0) -> dict:
+    async def request_session_state(
+        self, timeout: float = 30.0
+    ) -> dict[str, JsonValue]:
         """Ask for the server-truth chat state, like the PWA on channel open."""
-        self.session_state: dict | None = None
+        self.session_state = None
         self.channel.send(json.dumps({"type": "client_ready"}))
         deadline = time.monotonic() + timeout
         while self.session_state is None:
@@ -125,9 +170,14 @@ class TypedClient:
                 timeout=60,
             )
             response.raise_for_status()
-            answer = response.json()
+            answer_payload: object = response.json()
+            answer = require_json_object(answer_payload, "offer answer")
+        answer_sdp = answer.get("sdp")
+        answer_type = answer.get("type")
+        if not isinstance(answer_sdp, str) or not isinstance(answer_type, str):
+            raise TypeError("offer answer must contain string sdp and type")
         await self.pc.setRemoteDescription(
-            RTCSessionDescription(sdp=answer["sdp"], type=answer["type"])
+            RTCSessionDescription(sdp=answer_sdp, type=answer_type)
         )
         for _ in range(1200):
             if self.channel.readyState == "open":
@@ -143,7 +193,8 @@ class TypedClient:
         while True:
             for message in self.transcripts[seen:]:
                 if message.get("role") == "assistant":
-                    return str(message.get("text", ""))
+                    response_text = message.get("text")
+                    return response_text if isinstance(response_text, str) else ""
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 sys.exit(f"FAIL: no assistant reply within {timeout}s")
@@ -157,14 +208,16 @@ class TypedClient:
         await self.pc.close()
 
 
-async def list_sessions() -> list[dict]:
+async def list_sessions() -> list[dict[str, JsonValue]]:
     async with httpx.AsyncClient() as client:
         response = await client.get(f"{SERVER}/api/sessions", timeout=30)
         response.raise_for_status()
-        return response.json()["sessions"]
+        payload: object = response.json()
+        root = require_json_object(payload, "sessions response")
+        return _object_list(root.get("sessions"), "sessions response.sessions")
 
 
-async def wait_for_summary(deadline_s: float = 240.0) -> dict:
+async def wait_for_summary(deadline_s: float = 240.0) -> dict[str, JsonValue]:
     """Wait until the NEWEST session is ended and summarized.
 
     Older summarized sessions (e.g. dry runs) may exist — only the session
@@ -175,14 +228,18 @@ async def wait_for_summary(deadline_s: float = 240.0) -> dict:
         while time.monotonic() < deadline:
             response = await client.get(f"{SERVER}/api/sessions", timeout=30)
             response.raise_for_status()
-            sessions = response.json()["sessions"]
+            payload: object = response.json()
+            root = require_json_object(payload, "sessions response")
+            sessions = _object_list(
+                root.get("sessions"), "sessions response.sessions"
+            )
             if sessions and sessions[0]["ended_at"] and sessions[0]["summary"]:
                 return sessions[0]
             await asyncio.sleep(3.0)
     sys.exit(f"FAIL: newest session not summarized within {deadline_s}s")
 
 
-def run_cli(*args: str) -> subprocess.CompletedProcess:
+def run_cli(*args: str) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         [sys.executable, "-m", "therapy.memory", *args],
         capture_output=True,
@@ -209,13 +266,18 @@ async def main() -> None:
     #     id, no new session row, still answering. This reconnect also
     #     exercises cancelling session A's in-flight finalization.
     before = await list_sessions()
+    if not before or not isinstance(before[0].get("id"), str):
+        raise RuntimeError("session A is missing from the sessions response")
+    before_id = cast(str, before[0]["id"])
     a2 = TypedClient()
     await a2.connect(new_session=False)
     state = await a2.request_session_state()
+    resumed_turns = state.get("turns")
     replayed = (
         state.get("resumed") is True
-        and state.get("session_id") == before[0]["id"]
-        and len(state.get("turns") or []) >= 4  # 2 user + 2 assistant from A
+        and state.get("session_id") == before_id
+        and isinstance(resumed_turns, list)
+        and len(resumed_turns) >= 4  # 2 user + 2 assistant from A
     )
     results.append(
         "[replay] client received the resumed transcript ✓"
@@ -226,19 +288,24 @@ async def main() -> None:
     print(f"[resume] assistant: {reply[:100]!r}", flush=True)
     await a2.close()
     after = await list_sessions()
-    if len(after) == len(before) and after[0]["id"] == before[0]["id"]:
+    after_id_value = after[0].get("id") if after else None
+    after_id = after_id_value if isinstance(after_id_value, str) else "<missing>"
+    if len(after) == len(before) and after_id == before_id:
         results.append("[resume] reconnect continued the same session ✓")
     else:
         results.append(
             f"[resume] FAIL — sessions {len(before)}→{len(after)}, "
-            f"newest {before[0]['id'][:8]}→{after[0]['id'][:8]}"
+            f"newest {before_id[:8]}→{after_id[:8]}"
         )
 
     # 2. Background summarization must finish before B connects — continuity
     #    is injected at connect time.
     summarized = await wait_for_summary()
-    print(f"[summary] {str(summarized['summary'])[:160]!r}", flush=True)
-    ok = FACT_TOKEN.lower() in str(summarized["summary"]).lower()
+    summary = summarized.get("summary")
+    if not isinstance(summary, str):
+        raise TypeError("summarized session must contain a string summary")
+    print(f"[summary] {summary[:160]!r}", flush=True)
+    ok = FACT_TOKEN.lower() in summary.lower()
     results.append(
         f"[summary] session A summarized; fact token "
         f"{'present ✓' if ok else 'MISSING (relying on facts table)'}"
@@ -264,8 +331,12 @@ async def main() -> None:
     if export.returncode != 0:
         results.append(f"[export] FAIL — exit {export.returncode}: {export.stderr[:200]}")
     else:
-        snapshot = json.loads(export.stdout)
-        n_sessions = len(snapshot["sessions"])
+        snapshot_payload: object = json.loads(export.stdout)
+        snapshot = require_json_object(snapshot_payload, "memory export")
+        exported_sessions = _object_list(
+            snapshot.get("sessions"), "memory export.sessions"
+        )
+        n_sessions = len(exported_sessions)
         found = FACT_TOKEN.lower() in export.stdout.lower()
         results.append(
             f"[export] {n_sessions} session(s); fact "
@@ -276,12 +347,17 @@ async def main() -> None:
     refused = run_cli("delete")
     guarded = refused.returncode == 2
     deleted = run_cli("delete", "--yes")
-    post = json.loads(run_cli("export").stdout)
+    post_payload: object = json.loads(run_cli("export").stdout)
+    post = require_json_object(post_payload, "post-delete export")
+    post_sessions = _object_list(post.get("sessions"), "post-delete sessions")
     async with httpx.AsyncClient() as client:
-        api_sessions = (await client.get(f"{SERVER}/api/sessions", timeout=30)).json()[
-            "sessions"
-        ]
-    empty = deleted.returncode == 0 and not post["sessions"] and not api_sessions
+        api_response = await client.get(f"{SERVER}/api/sessions", timeout=30)
+        api_payload: object = api_response.json()
+        api_root = require_json_object(api_payload, "post-delete sessions response")
+        api_sessions = _object_list(
+            api_root.get("sessions"), "post-delete sessions response.sessions"
+        )
+    empty = deleted.returncode == 0 and not post_sessions and not api_sessions
     results.append(
         f"[delete] guard {'✓' if guarded else 'FAIL'} | "
         f"wipe {'verified empty ✓' if empty else 'FAIL — data remains'}"
@@ -295,5 +371,26 @@ async def main() -> None:
     print("\nPASS — continuity, export, and delete all verified.")
 
 
+def _run_with_record() -> None:
+    """Run the verifier and always leave its machine record last on stdout."""
+    started = time.monotonic()
+    result: VerificationResult = "fail"
+    try:
+        asyncio.run(main())
+    except SystemExit as exc:
+        if exc.code in (None, 0):
+            result = "pass"
+        raise
+    else:
+        result = "pass"
+    finally:
+        record = build_verification_record(
+            scenario="memory-continuity",
+            duration_s=time.monotonic() - started,
+            result=result,
+        )
+        print(json.dumps(record), flush=True)
+
+
 if __name__ == "__main__":
-    asyncio.run(main())
+    _run_with_record()

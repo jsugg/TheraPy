@@ -16,9 +16,12 @@ viable path — the regression check for "connecting → disconnected" on mobile
 
 import argparse
 import asyncio
+import json
 import sys
 import time
 from fractions import Fraction
+from importlib.metadata import PackageNotFoundError, version
+from typing import Literal
 
 import httpx
 import numpy as np
@@ -33,6 +36,31 @@ from av import AudioFrame
 
 RATE = 48_000
 FRAME_SAMPLES = RATE // 50  # 20 ms
+SCRIPT_NAME = "verify_relay_connectivity"
+SCENARIOS = frozenset({"direct", "relay-only"})
+
+type VerificationResult = Literal["pass", "fail"]
+
+
+def build_verification_record(
+    *, scenario: str, duration_s: float, result: VerificationResult
+) -> dict[str, str | float]:
+    """Build the final bounded verification record."""
+    if scenario not in SCENARIOS:
+        raise ValueError("unsupported verification scenario")
+    try:
+        build = version("therapy")
+    except PackageNotFoundError:
+        build = "unknown"
+    return {
+        "record": "verification",
+        "script": SCRIPT_NAME,
+        "build": build,
+        "scenario": scenario,
+        "duration_s": duration_s,
+        "result": result,
+        "environment": "test",
+    }
 
 
 class SilentMic(MediaStreamTrack):
@@ -93,8 +121,10 @@ async def main() -> None:
     channel = pc.createDataChannel("chat", ordered=True)
 
     @pc.on("iceconnectionstatechange")
-    def on_ice() -> None:
+    def _on_ice() -> None:
         print(f"ICE: {pc.iceConnectionState}", flush=True)
+
+    _ = _on_ice
 
     await pc.setLocalDescription(await pc.createOffer())
     while pc.iceGatheringState != "complete":
@@ -134,5 +164,27 @@ async def main() -> None:
     sys.exit(f"FAIL: timeout (conn={pc.connectionState}, channel={channel.readyState})")
 
 
+def _run_with_record() -> None:
+    """Run the verifier and always leave its machine record last on stdout."""
+    started = time.monotonic()
+    result: VerificationResult = "fail"
+    scenario = "relay-only" if "--relay-only" in sys.argv[1:] else "direct"
+    try:
+        asyncio.run(main())
+    except SystemExit as exc:
+        if exc.code in (None, 0):
+            result = "pass"
+        raise
+    else:
+        result = "pass"
+    finally:
+        record = build_verification_record(
+            scenario=scenario,
+            duration_s=time.monotonic() - started,
+            result=result,
+        )
+        print(json.dumps(record), flush=True)
+
+
 if __name__ == "__main__":
-    asyncio.run(main())
+    _run_with_record()

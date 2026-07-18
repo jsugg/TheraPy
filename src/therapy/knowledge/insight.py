@@ -10,25 +10,44 @@ from __future__ import annotations
 import json
 import re
 import sqlite3
-from collections.abc import Awaitable, Callable, Iterator
+from collections.abc import Awaitable, Callable, Generator, Mapping, Sequence
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any, Literal, TypedDict, cast
+from typing import Literal, TypedDict, cast
 from uuid import uuid4
 
 from therapy.knowledge.user_model import (
     GRADUATION_MIN_SESSIONS,
     ClaimKind,
     UserModel,
-    _tokens,
+    tokens,
 )
 from therapy.memory.summarizer import complete, render_transcript
+from therapy.observability.model import InteractionOperation
 
 type Recapper = Callable[[str], Awaitable[str]]
 type InsightState = Literal[
     "queued", "delivered", "snoozed", "confirmed", "rejected", "dismissed"
 ]
+type InsightMetricState = Literal[
+    "proposed", "delivered", "snoozed", "dismissed", "confirmed", "rejected"
+]
+
+
+def _required_int(value: object, field: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"{field} must be an integer")
+    return value
+
+
+def _record_transition(state: InsightMetricState) -> None:
+    """Record one content-free insight state transition."""
+    from therapy.observability import telemetry
+
+    telemetry.record_metric(
+        "therapy_insight_transitions_total", 1, {"state": state}
+    )
 
 
 class InsightRecord(TypedDict):
@@ -126,8 +145,10 @@ def cross_session_patterns(model: UserModel) -> list[dict[str, object]]:
     ]
     recurring.sort(
         key=lambda node: (
-            int(node["n_auditable_sessions"]),
-            int(node["n_auditable_occurrences"]),
+            _required_int(node["n_auditable_sessions"], "auditable_sessions"),
+            _required_int(
+                node["n_auditable_occurrences"], "auditable_occurrences"
+            ),
         ),
         reverse=True,
     )
@@ -143,7 +164,7 @@ class InsightService:
         self._db_path = self.data_dir / "therapy.db"
 
     @contextmanager
-    def _connect(self) -> Iterator[sqlite3.Connection]:
+    def _connect(self) -> Generator[sqlite3.Connection, None, None]:
         connection = sqlite3.connect(self._db_path, timeout=30.0)
         connection.row_factory = sqlite3.Row
         try:
@@ -153,6 +174,16 @@ class InsightService:
         finally:
             connection.close()
 
+    def _record_queue_depth(self) -> None:
+        """Record the number of records currently eligible for delivery."""
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT count(*) AS count FROM pending_insights WHERE state = 'queued'"
+            ).fetchone()
+        from therapy.observability import telemetry
+
+        telemetry.record_metric("therapy_insight_queue_depth", int(row["count"]), {})
+
     def sync_proposals(self) -> int:
         """Materialize graph proposal events into durable queue records."""
         created = 0
@@ -160,7 +191,7 @@ class InsightService:
             if event["event_type"] != "longitudinal_judgment":
                 continue
             kind = cast(ClaimKind, event["claim_kind"])
-            claim_id = int(event["claim_id"])
+            claim_id = _required_int(event["claim_id"], "claim_id")
             claim = (
                 self.model.get_node(claim_id)
                 if kind == "node"
@@ -190,7 +221,7 @@ class InsightService:
                             uuid4().hex,
                             kind,
                             claim_id,
-                            int(event["id"]),
+                            _required_int(event["id"], "event_id"),
                             claim["statement"],
                             json.dumps(snapshot, separators=(",", ":")),
                             event["created_at"],
@@ -198,7 +229,11 @@ class InsightService:
                             now,
                         ),
                     )
-                    created += int(cursor.rowcount > 0)
+                    inserted = cursor.rowcount > 0
+                    created += int(inserted)
+            if inserted:
+                _record_transition("proposed")
+                self._record_queue_depth()
         return created
 
     def list(self, *, state: InsightState | None = None) -> list[InsightRecord]:
@@ -223,13 +258,15 @@ class InsightService:
         now = _utc_now()
         with self._connect() as connection:
             with connection:
-                connection.execute(
+                cursor = connection.execute(
                     """
                     UPDATE pending_insights SET state = 'queued', updated_at = ?
                     WHERE state = 'snoozed' AND snoozed_until <= ?
                     """,
                     (now, now),
                 )
+        if cursor.rowcount:
+            self._record_queue_depth()
         return self.list(state="queued")
 
     def next_for_topic(
@@ -253,12 +290,12 @@ class InsightService:
             ).fetchone()
         if outstanding is not None:
             return None
-        topic_tokens = _tokens(topic)
+        topic_tokens = tokens(topic)
         selected = next(
             (
                 insight
                 for insight in self._eligible_queue()
-                if topic_tokens & _tokens(insight["statement_snapshot"])
+                if topic_tokens & tokens(insight["statement_snapshot"])
                 or (
                     adjacent_claim_ids is not None
                     and insight["claim_id"] in adjacent_claim_ids
@@ -284,6 +321,8 @@ class InsightService:
                 if cursor.rowcount != 1:
                     return None
                 self._history(connection, selected["id"], "delivered", session_id)
+        _record_transition("delivered")
+        self._record_queue_depth()
         count = selected["evidence_snapshot"]["auditable_sessions"]
         reflection = (
             f"I have noticed this across {count} conversations: "
@@ -379,6 +418,8 @@ class InsightService:
                 updated = connection.execute(
                     "SELECT * FROM pending_insights WHERE id = ?", (insight["id"],)
                 ).fetchone()
+        _record_transition(cast(InsightMetricState, target))
+        self._record_queue_depth()
         return self._shape(updated)
 
     def snooze(self, insight_id: str, *, days: int = 7) -> bool:
@@ -398,7 +439,11 @@ class InsightService:
                 )
                 if cursor.rowcount:
                     self._history(connection, insight_id, "snoozed", None)
-        return cursor.rowcount > 0
+        changed = cursor.rowcount > 0
+        if changed:
+            _record_transition("snoozed")
+            self._record_queue_depth()
+        return changed
 
     def resolve(
         self,
@@ -460,6 +505,8 @@ class InsightService:
                 updated = connection.execute(
                     "SELECT * FROM pending_insights WHERE id = ?", (insight_id,)
                 ).fetchone()
+        _record_transition(target)
+        self._record_queue_depth()
         return self._shape(updated)
 
     def resolve_claim(
@@ -494,7 +541,11 @@ class InsightService:
                 if target == "confirmed"
                 else self.model.reject_edge
             )
-        return callback(claim_id)
+        changed = callback(claim_id)
+        if changed:
+            _record_transition(target)
+            self._record_queue_depth()
+        return changed
 
     def dismiss_claim(self, claim_kind: ClaimKind, claim_id: int) -> int:
         """Dismiss active queue snapshots superseded by an authoritative edit."""
@@ -522,7 +573,11 @@ class InsightService:
                 )
                 if cursor.rowcount:
                     self._history(connection, insight_id, "dismissed", None)
-        return cursor.rowcount > 0
+        changed = cursor.rowcount > 0
+        if changed:
+            _record_transition("dismissed")
+            self._record_queue_depth()
+        return changed
 
     def history(self, insight_id: str) -> list[dict[str, object]]:
         """Return delivery/snooze/resolution audit history."""
@@ -564,7 +619,7 @@ def pending_insights(model: UserModel) -> list[InsightRecord]:
 
 def should_raise_now(insight: InsightRecord, topic: str) -> bool:
     """Return lexical adjacency result; semantic retrieval augments this in context."""
-    return bool(_tokens(insight["statement_snapshot"]) & _tokens(topic))
+    return bool(tokens(insight["statement_snapshot"]) & tokens(topic))
 
 
 def next_insight_for_topic(
@@ -575,7 +630,7 @@ def next_insight_for_topic(
 
 
 async def session_recap(
-    turns: list[dict[str, Any]], *, recapper: Recapper | None = None
+    turns: Sequence[Mapping[str, object]], *, recapper: Recapper | None = None
 ) -> str:
     """Generate owner-facing recap independently from internal summary."""
     if not turns:
@@ -584,7 +639,12 @@ async def session_recap(
     return (
         await recapper(transcript)
         if recapper is not None
-        else await complete(RECAP_PROMPT, transcript, max_tokens=160)
+        else await complete(
+            RECAP_PROMPT,
+            transcript,
+            max_tokens=160,
+            operation=InteractionOperation.RECAP,
+        )
     )
 
 

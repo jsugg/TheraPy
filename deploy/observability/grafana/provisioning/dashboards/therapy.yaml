@@ -1,0 +1,15 @@
+# Grafana dashboard provider for the six required TheraPy dashboards
+# (obs plan §9). Mounted into grafana/otel-lgtm by the `observability`
+# compose profile; source JSON lives in deploy/observability/dashboards.
+apiVersion: 1
+providers:
+  - name: therapy
+    orgId: 1
+    folder: TheraPy
+    type: file
+    disableDeletion: false
+    updateIntervalSeconds: 30
+    allowUiUpdates: true
+    options:
+      path: /var/lib/grafana/dashboards/therapy
+      foldersFromFilesStructure: false

@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import asdict
 from pathlib import Path
-from typing import TypedDict
+from typing import Literal, TypedDict
 
 import numpy as np
 
@@ -101,7 +102,9 @@ class ScriptedLLM:
         return []
 
     @staticmethod
-    async def judge(_kind: str, _claim: dict[str, object]) -> bool:
+    async def judge(
+        _kind: Literal["node", "edge"], _claim: Mapping[str, object]
+    ) -> bool:
         return True
 
     @staticmethod

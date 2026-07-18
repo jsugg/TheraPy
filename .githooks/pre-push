@@ -1,0 +1,81 @@
+#!/bin/sh
+# TheraPy pre-push — the real gate: lint + strict types + FULL in-container test
+# suite + coverage floor. The container is the authoritative test bed: pipecat
+# and pyright live only there, so host 'make test-fast' silently skips the five
+# pipecat suites — exactly the least-covered code (live-voice pipeline). This
+# gate refuses to give that false green. Bypass in emergencies: git push --no-verify
+set -eu
+
+cd "$(git rev-parse --show-toplevel)"
+
+# Context-aware attribution predicate (shared with pre-commit/commit-msg). Sourced
+# only if present, so deleting it turns the message checks off without breaking push.
+attr_lib=".githooks/lib/no-attribution.sh"
+attr_on=0
+[ -f "$attr_lib" ] && { . "$attr_lib"; attr_on=1; }
+
+# 0) No-branding / no-attribution wall on everything about to leave the machine:
+#    ref names (branches AND tags), annotated tag messages, and every outgoing
+#    commit message — this re-checks commits made with --no-verify or created
+#    by other tooling. Cheapest gate, so it runs first.
+zero='0000000000000000000000000000000000000000'
+fail=0
+while IFS=' ' read -r local_ref local_oid remote_ref remote_oid; do
+  [ -n "$local_ref" ] || continue
+  [ "$local_oid" = "$zero" ] && continue   # deleting a remote ref — nothing outgoing
+  # 0a) ref name: a tool named as the LEADING segment (claude/x, gpt/y) is agent
+  #     branding; a tool word deeper in the slug (feat/anthropic-adapter) is fine.
+  refname=${remote_ref#refs/heads/}; refname=${refname#refs/tags/}
+  if printf '%s\n' "$refname" \
+       | grep -Eiq '^(ai|llm|gpt|bot|copilot|claude|anthropic|codex|openai|chatgpt|gemini|cursor|codeium|devin)([/_.-]|$)'; then
+    echo "pre-push: ref '$remote_ref' names a tool as its leading segment (no-branding rule)." >&2
+    fail=1
+  fi
+  # 0b) annotated tag message — same attribution predicate as commit messages.
+  case "$remote_ref" in
+    refs/tags/*)
+      if [ "$attr_on" = 1 ]; then
+        taghits=$(git for-each-ref --format='%(contents)' "$local_ref" | attr_scan)
+        if [ -n "$taghits" ]; then
+          echo "pre-push: tag '$remote_ref' message reads like tool attribution:" >&2
+          printf '%s\n' "$taghits" | sed 's/^/    /' >&2
+          fail=1
+        fi
+      fi ;;
+  esac
+  # 0c) outgoing commit messages (only commits the remote doesn't have).
+  if [ "$remote_oid" = "$zero" ]; then
+    commits=$(git rev-list "$local_oid" --not --remotes)
+  else
+    commits=$(git rev-list "$remote_oid..$local_oid")
+  fi
+  if [ "$attr_on" = 1 ]; then
+    for c in $commits; do
+      chits=$(git log -1 --format=%B "$c" | attr_scan)
+      if [ -n "$chits" ]; then
+        echo "pre-push: commit $c message reads like tool attribution:" >&2
+        printf '%s\n' "$chits" | sed 's/^/    /' >&2
+        fail=1
+      fi
+    done
+  fi
+done
+if [ "$fail" -ne 0 ]; then
+  echo "pre-push: fix the ref/commit/tag above (amend/rebase/rename) and push again." >&2
+  exit 1
+fi
+
+# Cheap host lint first — fail fast before the heavier container gates.
+make lint
+
+# Types + suite + coverage need the running stack.
+if ! docker compose ps --status running --format '{{.Service}}' 2>/dev/null | grep -qx therapy; then
+  echo "pre-push: 'therapy' container is not running — run 'make up' first." >&2
+  echo "          (pre-push runs the container test bed; a host-only run would" >&2
+  echo "           skip the live-voice pipecat suites — the least-covered code.)" >&2
+  exit 1
+fi
+
+make typecheck   # pyright strict, warnings-as-errors, in-container
+make coverage    # full unit+integration suite in-container + COV_MIN fail-under
+                 # (e2e stays opt-in: run 'make test-e2e' deliberately)

@@ -7,14 +7,24 @@ during field testing (docs/SPEC.md Hardening 7-9), and this keeps the browser
 tests deterministic besides.
 """
 
+from __future__ import annotations
+
 import socket
 import subprocess
 import sys
 import time
 import urllib.request
 from collections.abc import Iterator
+from pathlib import Path
+from typing import TYPE_CHECKING, cast
 
 import pytest
+
+if TYPE_CHECKING:
+    from playwright.sync_api import Page, Playwright
+
+
+_TELEMETRY_BROWSERS = ("chromium", "firefox")
 
 
 def _free_port() -> int:
@@ -35,13 +45,19 @@ def e2e_server(tmp_path_factory: pytest.TempPathFactory) -> Iterator[str]:
         "THERAPY_DATA_DIR": str(data_dir),
         "THERAPY_RESUME_WINDOW_SECS": "900",
         "THERAPY_TEST_MODE": "1",
+        "THERAPY_ENVIRONMENT": "test",
+        "THERAPY_CLIENT_TELEMETRY": "1",
+        # The E2E server owns an isolated journal. A shared Phoenix dependency
+        # adds no browser-path evidence and makes the suite nondeterministic.
+        "THERAPY_INTERACTION_BACKEND": "journal",
     }
     proc = subprocess.Popen(
         [
-            sys.executable, "-m", "uvicorn", "therapy.server.app:app",
-            "--host", "127.0.0.1", "--port", str(port),
+            # the owned launcher: logging/OTel bootstrap BEFORE the app
+            # imports (obs plan O1.1); uvicorn host/port come from env
+            sys.executable, "-m", "therapy.server",
         ],
-        env=env,
+        env={**env, "THERAPY_HOST": "127.0.0.1", "THERAPY_PORT": str(port)},
     )
     base_url = f"http://127.0.0.1:{port}"
     try:
@@ -61,7 +77,9 @@ def _os_environ() -> dict[str, str]:
     return dict(os.environ)
 
 
-def _await_health(base_url: str, proc: subprocess.Popen, timeout: float = 120.0) -> None:
+def _await_health(
+    base_url: str, proc: subprocess.Popen[bytes], timeout: float = 120.0
+) -> None:
     deadline = time.time() + timeout
     while time.time() < deadline:
         if proc.poll() is not None:
@@ -77,13 +95,24 @@ def _await_health(base_url: str, proc: subprocess.Popen, timeout: float = 120.0)
 
 
 @pytest.fixture(scope="session")
-def browser_type_launch_args(browser_type_launch_args: dict) -> dict:
+def browser_type_launch_args(
+    browser_type_launch_args: object,
+) -> dict[str, object]:
     # Fake mic so getUserMedia resolves headlessly without a real device and
     # without a permission dialog.
+    assert isinstance(browser_type_launch_args, dict)
+    raw_launch_args = cast(dict[object, object], browser_type_launch_args)
+    assert all(isinstance(key, str) for key in raw_launch_args)
+    launch_args = cast(dict[str, object], raw_launch_args)
+    existing_args = launch_args.get("args", [])
+    assert isinstance(existing_args, list)
+    raw_existing_args = cast(list[object], existing_args)
+    assert all(isinstance(arg, str) for arg in raw_existing_args)
+    typed_existing_args = cast(list[str], raw_existing_args)
     return {
-        **browser_type_launch_args,
+        **launch_args,
         "args": [
-            *browser_type_launch_args.get("args", []),
+            *typed_existing_args,
             "--use-fake-device-for-media-stream",
             "--use-fake-ui-for-media-stream",
             "--autoplay-policy=no-user-gesture-required",
@@ -92,5 +121,29 @@ def browser_type_launch_args(browser_type_launch_args: dict) -> dict:
 
 
 @pytest.fixture
-def browser_context_args(browser_context_args: dict) -> dict:
-    return {**browser_context_args, "permissions": ["microphone", "notifications"]}
+def browser_context_args(browser_context_args: object) -> dict[str, object]:
+    assert isinstance(browser_context_args, dict)
+    raw_context_args = cast(dict[object, object], browser_context_args)
+    assert all(isinstance(key, str) for key in raw_context_args)
+    context_args = cast(dict[str, object], raw_context_args)
+    return {**context_args, "permissions": ["microphone", "notifications"]}
+
+
+@pytest.fixture(params=_TELEMETRY_BROWSERS, ids=_TELEMETRY_BROWSERS)
+def telemetry_page(
+    request: pytest.FixtureRequest,
+    playwright: Playwright,
+) -> Iterator[Page]:
+    """Isolated Chromium/Firefox page for content-free telemetry tests."""
+    browser_name = cast(str, request.param)
+    browser_type = getattr(playwright, browser_name)
+    if not Path(browser_type.executable_path).is_file():
+        pytest.skip(f"Playwright {browser_name} browser is not installed")
+
+    browser = browser_type.launch(headless=True)
+    context = browser.new_context()
+    try:
+        yield context.new_page()
+    finally:
+        context.close()
+        browser.close()

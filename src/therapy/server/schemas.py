@@ -126,3 +126,86 @@ class ProactivityChannelPatch(APIRequest):
     schedule_day: int = Field(default=6, ge=0, le=6)
     frequency: Literal["daily", "weekly"] = "weekly"
     topic: str | None = Field(default=None, max_length=500)
+
+
+class ClientTelemetryEvent(APIRequest):
+    """One strict first-party browser event (obs plan O4.1).
+
+    Names/enums are finite; numbers are finite and range-bound; free text,
+    URLs, IDs, stacks, SDP, and media/device data are unrepresentable.
+    Strict mode: lax coercions (numeric strings, booleans as numbers,
+    integral floats as ints) are rejected at this untrusted boundary
+    (O4 audit F-03).
+    """
+
+    model_config = ConfigDict(strict=True)
+
+    name: Literal[
+        "media_permission",
+        "signaling_state",
+        "ice_state",
+        "data_channel_state",
+        "peer_state",
+        "transcript_echo_timeout",
+        "playback_failure",
+        "disconnect",
+        "webrtc_sample",
+        "sw_lifecycle",
+        "shell_fetch",
+        "cache_fallback",
+        "cache_recovery",
+        "push_lifecycle",
+    ]
+    outcome: Literal[
+        "success",
+        "error",
+        "timeout",
+        "fallback",
+        "recovered",
+        "denied",
+        "granted",
+        "received",
+        "shown",
+        "clicked",
+        "connected",
+        "disconnected",
+        "failed",
+        "installed",
+        "activated",
+        "refreshed",
+        "deactivated",
+    ] = "success"
+    duration_ms: float | None = Field(
+        default=None, ge=0, le=600_000, allow_inf_nan=False
+    )
+    rtt_ms: float | None = Field(default=None, ge=0, le=60_000, allow_inf_nan=False)
+    jitter_ms: float | None = Field(
+        default=None, ge=0, le=10_000, allow_inf_nan=False
+    )
+    packet_loss_ratio: float | None = Field(
+        default=None, ge=0.0, le=1.0, allow_inf_nan=False
+    )
+    bitrate_kbps: float | None = Field(
+        default=None, ge=0, le=1_000_000, allow_inf_nan=False
+    )
+    bytes_delta: int | None = Field(default=None, ge=0, le=10_000_000_000)
+    concealed_samples: int | None = Field(default=None, ge=0, le=1_000_000_000)
+    candidate_type: Literal["relay", "host", "srflx"] | None = None
+    dropped_events: int = Field(default=0, ge=0, le=10_000)
+
+
+class ClientTelemetryBatch(APIRequest):
+    """Bounded batch: schema v1, at most 20 events (obs plan O4.1)."""
+
+    model_config = ConfigDict(strict=True)
+
+    schema_version: Literal[1]
+    events: list[ClientTelemetryEvent] = Field(min_length=1, max_length=20)
+
+    @field_validator("schema_version", mode="before")
+    @classmethod
+    def reject_boolean_version(cls, value: object) -> object:
+        """`Literal[1]` admits `True` (bool subclasses int) even in strict mode."""
+        if isinstance(value, bool):
+            raise ValueError("schema_version must be the integer 1")
+        return value

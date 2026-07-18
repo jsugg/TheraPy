@@ -2,6 +2,13 @@ services:
   therapy:
     build: .
     restart: unless-stopped
+    # Bounded broad-log retention (obs plan O1.5): the `local` driver replaces
+    # Docker's unbounded json-file default. Stdout stays authoritative.
+    logging:
+      driver: local
+      options:
+        max-size: "20m"
+        max-file: "5"
     ports:
       - "8000:8000"
     env_file:
@@ -19,15 +26,20 @@ services:
       - therapy-data:/data
       # Model weights (whisper, kokoro, silero) — survive rebuilds.
       - model-cache:/root/.cache
-      # Live dev mounts — source (incl. PWA static) and tests, read-only over the
-      # baked copies. UI/code/test edits are picked up without an image rebuild:
-      # a browser reload serves fresh static, pytest reads current code + tests,
-      # and the server picks up Python edits on its next restart (`make restart`).
+      # Live dev mounts — source, checks, and local type stubs, read-only
+      # over the baked copies. UI/code/test/script edits are picked up without an
+      # image rebuild: a browser reload serves fresh static, pytest and Pyright
+      # read current files, and the server picks up Python edits on its next
+      # restart (`make restart`).
       # `therapy` is an editable install at /app/src, and the venv lives at
       # /app/.venv (NOT under these paths, so it is never shadowed). A rebuild is
       # only needed when dependencies change.
       - ./src:/app/src:ro
       - ./tests:/app/tests:ro
+      - ./scripts:/app/scripts:ro
+      - ./typings:/app/typings:ro
+      - ./pyproject.toml:/app/pyproject.toml:ro
+      - ./uv.lock:/app/uv.lock:ro
     # Liveness beyond process-liveness: a wedged event loop still has a live
     # PID but stops answering /health. The in-container watchdog (Dockerfile
     # CMD) restarts uvicorn on hang; this healthcheck surfaces the state to
@@ -50,9 +62,80 @@ services:
   # IPs, and container→tailnet UDP is not guaranteed). The client allocates a
   # relay via turn:<page-host>:3478; the pipeline reaches the relay directly
   # on this compose network — no dependence on host↔container NAT quirks.
+  # Restricted interaction backend selected by the O0.3 ADR
+  # (.local/working-notes/evidence/observability-backend-spike.md). Opt-in profile; loopback
+  # UI/OTLP only; synthetic 30-day retention; derived store — the owned
+  # journal remains the source of truth. The image's gRPC collector port
+  # (4317) is deliberately NOT published (v18 binds [::] regardless of host
+  # setting). Analytics/external resources are disabled.
+  phoenix:
+    image: arizephoenix/phoenix:version-18.0.0-nonroot
+    profiles: ["llm-observability"]
+    restart: unless-stopped
+    logging:
+      driver: local
+      options:
+        max-size: "10m"
+        max-file: "3"
+    ports:
+      - "127.0.0.1:6006:6006"
+    environment:
+      PHOENIX_TELEMETRY_ENABLED: "false"
+      PHOENIX_ALLOW_EXTERNAL_RESOURCES: "false"
+      PHOENIX_DEFAULT_RETENTION_POLICY_DAYS: "30"
+      PHOENIX_WORKING_DIR: /mnt/data
+    volumes:
+      - phoenix-data:/mnt/data
+    mem_limit: 1g
+
+  # --- opt-in broad-plane dev/test stack (obs plan O2.4; NOT production) ---
+  # `docker compose --profile observability up -d` starts a pinned isolated
+  # collector (two pipelines + file_storage WAL) and the disposable
+  # grafana/otel-lgtm all-in-one. UI is loopback-only; OTLP stays internal.
+  # First run only — both images are non-root, so seed volume ownership:
+  #   docker run --rm -v therapy_collector-wal:/w alpine chown -R 10001:10001 /w
+  #   docker run --rm -v therapy_phoenix-data:/d alpine chown -R 65532:65532 /d
+  collector:
+    image: otel/opentelemetry-collector-contrib:0.156.0
+    profiles: ["observability"]
+    restart: unless-stopped
+    logging:
+      driver: local
+      options:
+        max-size: "10m"
+        max-file: "3"
+    command: ["--config=/etc/otelcol/collector.yaml"]
+    volumes:
+      - ./deploy/observability/collector.yaml:/etc/otelcol/collector.yaml:ro
+      - collector-wal:/var/lib/otelcol
+    mem_limit: 256m
+
+  lgtm:
+    image: grafana/otel-lgtm:0.29.0
+    profiles: ["observability"]
+    restart: unless-stopped
+    logging:
+      driver: local
+      options:
+        max-size: "10m"
+        max-file: "3"
+    ports:
+      - "127.0.0.1:3000:3000" # Grafana UI only; OTLP/scrape stay internal
+    volumes:
+      - lgtm-data:/data
+      - ./deploy/observability/grafana/provisioning/dashboards/therapy.yaml:/otel-lgtm/grafana/conf/provisioning/dashboards/therapy.yaml:ro
+      - ./deploy/observability/grafana/provisioning/alerting:/otel-lgtm/grafana/conf/provisioning/alerting:ro
+      - ./deploy/observability/dashboards:/var/lib/grafana/dashboards/therapy:ro
+    mem_limit: 1500m
+
   turn:
     image: coturn/coturn:4.6
     restart: unless-stopped
+    logging:
+      driver: local
+      options:
+        max-size: "10m"
+        max-file: "3"
     command:
       - --listening-port=3478
       - --lt-cred-mech
@@ -61,6 +144,8 @@ services:
       - --no-cli
       - --no-tls
       - --no-dtls
+      - --prometheus
+      - --prometheus-port=9641
       # Relay sockets stay on the compose network (reachable by the pipeline);
       # only the control port is published to the host.
       - --min-port=49160
@@ -68,8 +153,20 @@ services:
     ports:
       - "3478:3478/udp"
       - "3478:3478/tcp"
+    # Real STUN binding round-trip against the listener — not a port-open
+    # check. turnutils_stunclient is the strongest probe the pinned image
+    # ships (no wget/nc; full TURN allocation would need credentials in argv).
+    healthcheck:
+      test: ["CMD", "turnutils_stunclient", "-p", "3478", "127.0.0.1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
     mem_limit: 256m
 
 volumes:
   therapy-data:
   model-cache:
+  phoenix-data:
+  collector-wal:
+  lgtm-data:

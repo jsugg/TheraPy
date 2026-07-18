@@ -18,7 +18,8 @@ from __future__ import annotations
 import json
 import logging
 import os
-from typing import TYPE_CHECKING
+from collections.abc import Mapping, Sequence
+from typing import TYPE_CHECKING, cast
 
 if TYPE_CHECKING:
     from therapy.knowledge.user_model import GraphContextProvider
@@ -47,24 +48,39 @@ def crisis_contacts() -> list[dict[str, str]]:
     if len(raw) > 10_000:
         raise CrisisConfigurationError("THERAPY_CRISIS_CONTACTS exceeds 10 KB")
     try:
-        parsed = json.loads(raw)
+        parsed: object = json.loads(raw)
     except json.JSONDecodeError as exc:
         raise CrisisConfigurationError(
             f"THERAPY_CRISIS_CONTACTS is invalid JSON: {exc.msg}"
         ) from exc
-    if not isinstance(parsed, list) or len(parsed) > 20:
+    if not isinstance(parsed, list):
+        raise CrisisConfigurationError(
+            "THERAPY_CRISIS_CONTACTS must be a JSON array with at most 20 entries"
+        )
+    entries = cast(list[object], parsed)
+    if len(entries) > 20:
         raise CrisisConfigurationError(
             "THERAPY_CRISIS_CONTACTS must be a JSON array with at most 20 entries"
         )
     contacts: list[dict[str, str]] = []
     seen: set[tuple[str, str]] = set()
-    for index, entry in enumerate(parsed):
-        if not isinstance(entry, dict) or set(entry) != {"label", "value"}:
+    for index, entry in enumerate(entries):
+        if not isinstance(entry, dict):
             raise CrisisConfigurationError(
                 f"crisis contact {index} must contain only label and value"
             )
-        label = entry["label"]
-        value = entry["value"]
+        raw_contact = cast(dict[object, object], entry)
+        if not all(isinstance(key, str) for key in raw_contact):
+            raise CrisisConfigurationError(
+                f"crisis contact {index} must contain only label and value"
+            )
+        contact = cast(dict[str, object], entry)
+        if set(contact) != {"label", "value"}:
+            raise CrisisConfigurationError(
+                f"crisis contact {index} must contain only label and value"
+            )
+        label = contact["label"]
+        value = contact["value"]
         if not isinstance(label, str) or not isinstance(value, str):
             raise CrisisConfigurationError(
                 f"crisis contact {index} label/value must be strings"
@@ -95,7 +111,10 @@ def crisis_resources() -> str:
     try:
         contacts = crisis_contacts()
     except CrisisConfigurationError as exc:
-        logger.error("Invalid crisis contact configuration: %s", exc)
+        logger.error(
+            "Invalid crisis contact configuration failure_type=%s",
+            type(exc).__name__,
+        )
         contacts = []
     if contacts:
         return "; ".join(f"{c['label']}: {c['value']}" for c in contacts)
@@ -153,12 +172,41 @@ but you never bring up a topic they have asked you not to raise.
 """
 
 
+def _count_prompt_build(outcome: str, sections: int) -> None:
+    """Bounded prompt-assembly evidence (plan O3.2): outcome and section
+    count bucket only; the exact rendered prompt stays restricted."""
+    from therapy.observability.model import count_bucket
+    from therapy.observability.telemetry import record_metric
+
+    record_metric(
+        "therapy_prompt_builds_total",
+        1,
+        {"outcome": outcome, "sections": count_bucket(sections)},
+    )
+
+
 def build_system_prompt() -> str:
     """Render the system prompt with runtime configuration."""
-    return _SYSTEM_PROMPT_TEMPLATE.format(crisis_resources=crisis_resources())
+    try:
+        rendered = _SYSTEM_PROMPT_TEMPLATE.format(crisis_resources=crisis_resources())
+    except Exception:
+        _count_prompt_build("fallback", 0)
+        raise
+    _count_prompt_build("success", 1)
+    return rendered
 
 
-def continuity_note(summaries: list[dict], facts: list[dict]) -> str | None:
+def _required_mapping_text(item: Mapping[str, object], key: str) -> str:
+    value = item.get(key)
+    if not isinstance(value, str):
+        raise TypeError(f"{key} must be text")
+    return value
+
+
+def continuity_note(
+    summaries: Sequence[Mapping[str, object]],
+    facts: Sequence[Mapping[str, object]],
+) -> str | None:
     """Prior-session context for a new conversation (SPEC §8).
 
     Older history reaches the LLM only as distilled summaries plus the
@@ -166,16 +214,21 @@ def continuity_note(summaries: list[dict], facts: list[dict]) -> str | None:
     there is no history yet, so first sessions carry no empty scaffolding.
     """
     if not summaries and not facts:
+        _count_prompt_build("success", 0)
         return None
+    _count_prompt_build("success", len(summaries) + len(facts))
     parts = ["# What you remember"]
     if facts:
         parts.append(
             "About the user (accumulated across conversations):\n"
-            + "\n".join(f"- {fact['statement']}" for fact in facts)
+            + "\n".join(
+                f"- {_required_mapping_text(fact, 'statement')}" for fact in facts
+            )
         )
     if summaries:
         rendered = "\n".join(
-            f"- [{summary['started_at'][:10]}] {summary['summary']}"
+            f"- [{_required_mapping_text(summary, 'started_at')[:10]}] "
+            f"{_required_mapping_text(summary, 'summary')}"
             for summary in summaries
         )
         parts.append("Previous conversations, oldest first:\n" + rendered)
@@ -188,7 +241,10 @@ def continuity_note(summaries: list[dict], facts: list[dict]) -> str | None:
 
 
 def graph_continuity_note(
-    model: GraphContextProvider, *, topic: str = "", summaries: list[dict] | None = None
+    model: GraphContextProvider,
+    *,
+    topic: str = "",
+    summaries: Sequence[Mapping[str, object]] | None = None,
 ) -> str | None:
     """Graph-aware continuity for a new conversation (SPEC §8, W3).
 
@@ -206,7 +262,8 @@ def graph_continuity_note(
     parts = [note] if note else []
     if summaries:
         rendered = "\n".join(
-            f"- [{summary['started_at'][:10]}] {summary['summary']}"
+            f"- [{_required_mapping_text(summary, 'started_at')[:10]}] "
+            f"{_required_mapping_text(summary, 'summary')}"
             for summary in summaries
         )
         parts.append("# Previous conversations, oldest first\n" + rendered)
@@ -227,7 +284,9 @@ def resume_note() -> str:
     )
 
 
-def rehydrate_messages(turns: list[dict], limit: int = 40) -> list[dict]:
+def rehydrate_messages(
+    turns: Sequence[Mapping[str, object]], limit: int = 40
+) -> list[dict[str, str]]:
     """Verbatim chat messages rebuilt from a resumed session's stored turns.
 
     Within one session the conversation reaches the LLM verbatim (the
@@ -236,7 +295,10 @@ def rehydrate_messages(turns: list[dict], limit: int = 40) -> list[dict]:
     blow up the context on reconnect.
     """
     return [
-        {"role": str(turn["role"]), "content": str(turn["text"])}
+        {
+            "role": _required_mapping_text(turn, "role"),
+            "content": _required_mapping_text(turn, "text"),
+        }
         for turn in turns[-limit:]
         if turn.get("text")
     ]

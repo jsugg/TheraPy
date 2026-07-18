@@ -11,7 +11,7 @@ import json
 import os
 import re
 import sqlite3
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Generator, Mapping, Sequence
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -52,6 +52,54 @@ _MAX_STATEMENT_CHARS = 4_000
 _MAX_QUOTE_CHARS = 8_000
 
 type ClaimKind = Literal["node", "edge"]
+type GraphMutationOperation = Literal[
+    "add_node",
+    "add_edge",
+    "edit",
+    "delete",
+    "purge",
+    "revalidate",
+    "distill_apply",
+]
+type GraphMutationOutcome = Literal["success", "error", "timeout", "rejected"]
+type SuppressionTableClass = Literal["node", "edge", "file", "turn"]
+
+
+def _record_graph_mutation(
+    operation: GraphMutationOperation, outcome: GraphMutationOutcome
+) -> None:
+    """Record a content-free graph mutation outcome."""
+    from therapy.observability import telemetry
+
+    telemetry.record_metric(
+        "therapy_graph_mutations_total",
+        1,
+        {"operation": operation, "outcome": outcome},
+    )
+
+
+def _record_suppression(table_class: SuppressionTableClass, count: int = 1) -> None:
+    """Record never-store suppression by bounded storage class only."""
+    if count <= 0:
+        return
+    from therapy.observability import telemetry
+
+    telemetry.record_metric(
+        "therapy_never_store_suppressions_total",
+        count,
+        {"table_class": table_class},
+    )
+
+
+def _graph_error_outcome(error: BaseException) -> Literal["error", "timeout"]:
+    """Classify timeouts without inspecting or exposing exception text."""
+    if isinstance(error, TimeoutError):
+        return "timeout"
+    if isinstance(error, sqlite3.OperationalError) and getattr(
+        error, "sqlite_errorcode", None
+    ) in {sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED}:
+        return "timeout"
+    return "error"
 
 
 class GraphQuote(TypedDict):
@@ -163,7 +211,7 @@ def _utc_now() -> str:
     return datetime.now(UTC).isoformat(timespec="microseconds")
 
 
-def _tokens(text: str) -> set[str]:
+def tokens(text: str) -> set[str]:
     return {token.casefold() for token in _TOKEN_RE.findall(text)}
 
 
@@ -200,7 +248,7 @@ class UserModel:
         self.migrate_v1_facts()
 
     @contextmanager
-    def _connect(self) -> Iterator[sqlite3.Connection]:
+    def _connect(self) -> Generator[sqlite3.Connection, None, None]:
         connection = sqlite3.connect(self._db_path, timeout=30.0)
         connection.row_factory = sqlite3.Row
         try:
@@ -323,46 +371,68 @@ class UserModel:
             raise ValueError(f"Unknown boundary kind: {kind!r}")
         value = value.strip()
         if not value or len(value) > 1_000:
+            if kind == "never_store":
+                _record_graph_mutation("purge", "rejected")
             raise ValueError("Boundary value must contain 1..1000 characters")
-        with self._connect() as connection:
-            with connection:
-                connection.execute(
-                    """
-                    INSERT INTO boundaries (kind, value, created_at)
-                    VALUES (?, ?, ?)
-                    ON CONFLICT(kind, value) DO NOTHING
-                    """,
-                    (kind, value, _utc_now()),
-                )
-                counts = {
-                    "graph_claims_removed": 0,
-                    "inbox_rows_removed": 0,
-                    "summaries_removed": 0,
-                    "research_documents_removed": 0,
-                }
-                if kind == "never_store":
-                    counts = self._purge_boundary(connection, value)
+        suppression_counts: dict[SuppressionTableClass, int] = {
+            "node": 0,
+            "edge": 0,
+            "file": 0,
+            "turn": 0,
+        }
+        try:
+            with self._connect() as connection:
+                with connection:
                     connection.execute(
                         """
-                        INSERT INTO privacy_purge_events (
-                            boundary_digest, graph_claims_removed,
-                            inbox_rows_removed, summaries_removed,
-                            research_documents_removed, created_at
-                        ) VALUES (?, ?, ?, ?, ?, ?)
+                        INSERT INTO boundaries (kind, value, created_at)
+                        VALUES (?, ?, ?)
+                        ON CONFLICT(kind, value) DO NOTHING
                         """,
-                        (
-                            self._digest(f"boundary:{value}"),
-                            counts["graph_claims_removed"],
-                            counts["inbox_rows_removed"],
-                            counts["summaries_removed"],
-                            counts["research_documents_removed"],
-                            _utc_now(),
-                        ),
+                        (kind, value, _utc_now()),
                     )
+                    counts = {
+                        "graph_claims_removed": 0,
+                        "inbox_rows_removed": 0,
+                        "summaries_removed": 0,
+                        "research_documents_removed": 0,
+                    }
+                    if kind == "never_store":
+                        counts = self._purge_boundary(
+                            connection, value, suppression_counts
+                        )
+                        connection.execute(
+                            """
+                            INSERT INTO privacy_purge_events (
+                                boundary_digest, graph_claims_removed,
+                                inbox_rows_removed, summaries_removed,
+                                research_documents_removed, created_at
+                            ) VALUES (?, ?, ?, ?, ?, ?)
+                            """,
+                            (
+                                self._digest(f"boundary:{value}"),
+                                counts["graph_claims_removed"],
+                                counts["inbox_rows_removed"],
+                                counts["summaries_removed"],
+                                counts["research_documents_removed"],
+                                _utc_now(),
+                            ),
+                        )
+        except Exception as error:
+            if kind == "never_store":
+                _record_graph_mutation("purge", _graph_error_outcome(error))
+            raise
+        if kind == "never_store":
+            for table_class, count in suppression_counts.items():
+                _record_suppression(table_class, count)
+            _record_graph_mutation("purge", "success")
         return counts
 
     def _purge_boundary(
-        self, connection: sqlite3.Connection, value: str
+        self,
+        connection: sqlite3.Connection,
+        value: str,
+        suppression_counts: dict[SuppressionTableClass, int],
     ) -> dict[str, int]:
         pattern = value.casefold()
         node_ids = {
@@ -499,6 +569,14 @@ class UserModel:
                     )
                     summaries_removed += 1
         research_removed = self._purge_research(connection, pattern)
+        suppression_counts.update(
+            {
+                "node": len(node_ids),
+                "edge": len(edge_ids),
+                "file": research_removed,
+                "turn": len(inbox_ids) + summaries_removed,
+            }
+        )
         return {
             "graph_claims_removed": len(node_ids) + len(edge_ids),
             "inbox_rows_removed": len(inbox_ids),
@@ -591,7 +669,10 @@ class UserModel:
     ) -> int | None:
         """Append session-scoped freeform observation unless blocked."""
         text = text.strip()
-        if not text or len(text) > _MAX_QUOTE_CHARS or self.is_never_store(text):
+        if not text or len(text) > _MAX_QUOTE_CHARS:
+            return None
+        if self.is_never_store(text):
+            _record_suppression("turn")
             return None
         with self._connect() as connection:
             with connection:
@@ -770,21 +851,30 @@ class UserModel:
         evidence_key: str | None = None,
     ) -> int | None:
         """Insert/reinforce inferred claim; source authority stays application-owned."""
-        if source == "user-stated":
-            raise ValueError("Use add_user_statement for trusted direct knowledge")
-        if source not in {"conversation", "ser"}:
-            raise ValueError(f"Unknown source: {source!r}")
-        return self._upsert_node(
-            type_,
-            statement,
-            source=source,
-            quotes=quotes or [],
-            session_id=session_id,
-            never_initiate=never_initiate,
-            extractor_version=extractor_version,
-            evidence_key=evidence_key,
-            direct=False,
-        )
+        try:
+            if source == "user-stated":
+                raise ValueError("Use add_user_statement for trusted direct knowledge")
+            if source not in {"conversation", "ser"}:
+                raise ValueError(f"Unknown source: {source!r}")
+            node_id = self._upsert_node(
+                type_,
+                statement,
+                source=source,
+                quotes=quotes or [],
+                session_id=session_id,
+                never_initiate=never_initiate,
+                extractor_version=extractor_version,
+                evidence_key=evidence_key,
+                direct=False,
+            )
+        except (PermissionError, ValueError):
+            _record_graph_mutation("add_node", "rejected")
+            raise
+        except Exception as error:
+            _record_graph_mutation("add_node", _graph_error_outcome(error))
+            raise
+        _record_graph_mutation("add_node", "success" if node_id is not None else "rejected")
+        return node_id
 
     def add_user_statement(
         self,
@@ -796,17 +886,26 @@ class UserModel:
         never_initiate: bool = False,
     ) -> int | None:
         """Store explicit owner statement as confirmed through trusted path."""
-        return self._upsert_node(
-            type_,
-            statement,
-            source="user-stated",
-            quotes=[quote] if quote is not None else [],
-            session_id=session_id,
-            never_initiate=never_initiate,
-            extractor_version="direct-user-stated-v1",
-            evidence_key=None,
-            direct=True,
-        )
+        try:
+            node_id = self._upsert_node(
+                type_,
+                statement,
+                source="user-stated",
+                quotes=[quote] if quote is not None else [],
+                session_id=session_id,
+                never_initiate=never_initiate,
+                extractor_version="direct-user-stated-v1",
+                evidence_key=None,
+                direct=True,
+            )
+        except (PermissionError, ValueError):
+            _record_graph_mutation("add_node", "rejected")
+            raise
+        except Exception as error:
+            _record_graph_mutation("add_node", _graph_error_outcome(error))
+            raise
+        _record_graph_mutation("add_node", "success" if node_id is not None else "rejected")
+        return node_id
 
     def _upsert_node(
         self,
@@ -825,6 +924,7 @@ class UserModel:
         try:
             statement = self._validate_content(statement, quotes)
         except PermissionError:
+            _record_suppression("node")
             return None
         with self._connect() as connection:
             with connection:
@@ -964,22 +1064,31 @@ class UserModel:
         evidence_key: str | None = None,
     ) -> int | None:
         """Insert/reinforce inferred edge; empty statements are forbidden."""
-        if source == "user-stated":
-            raise ValueError("Use add_user_edge for trusted direct knowledge")
-        if source not in {"conversation", "ser"}:
-            raise ValueError(f"Unknown source: {source!r}")
-        return self._upsert_edge(
-            src,
-            dst,
-            type_,
-            statement,
-            source=source,
-            quotes=quotes or [],
-            session_id=session_id,
-            extractor_version=extractor_version,
-            evidence_key=evidence_key,
-            direct=False,
-        )
+        try:
+            if source == "user-stated":
+                raise ValueError("Use add_user_edge for trusted direct knowledge")
+            if source not in {"conversation", "ser"}:
+                raise ValueError(f"Unknown source: {source!r}")
+            edge_id = self._upsert_edge(
+                src,
+                dst,
+                type_,
+                statement,
+                source=source,
+                quotes=quotes or [],
+                session_id=session_id,
+                extractor_version=extractor_version,
+                evidence_key=evidence_key,
+                direct=False,
+            )
+        except (PermissionError, ValueError):
+            _record_graph_mutation("add_edge", "rejected")
+            raise
+        except Exception as error:
+            _record_graph_mutation("add_edge", _graph_error_outcome(error))
+            raise
+        _record_graph_mutation("add_edge", "success" if edge_id is not None else "rejected")
+        return edge_id
 
     def add_user_edge(
         self,
@@ -992,18 +1101,27 @@ class UserModel:
         quote: GraphQuote | None = None,
     ) -> int | None:
         """Store explicit owner relationship as confirmed through trusted path."""
-        return self._upsert_edge(
-            src,
-            dst,
-            type_,
-            statement,
-            source="user-stated",
-            quotes=[quote] if quote is not None else [],
-            session_id=session_id,
-            extractor_version="direct-user-stated-v1",
-            evidence_key=None,
-            direct=True,
-        )
+        try:
+            edge_id = self._upsert_edge(
+                src,
+                dst,
+                type_,
+                statement,
+                source="user-stated",
+                quotes=[quote] if quote is not None else [],
+                session_id=session_id,
+                extractor_version="direct-user-stated-v1",
+                evidence_key=None,
+                direct=True,
+            )
+        except (PermissionError, ValueError):
+            _record_graph_mutation("add_edge", "rejected")
+            raise
+        except Exception as error:
+            _record_graph_mutation("add_edge", _graph_error_outcome(error))
+            raise
+        _record_graph_mutation("add_edge", "success" if edge_id is not None else "rejected")
+        return edge_id
 
     def _upsert_edge(
         self,
@@ -1023,6 +1141,7 @@ class UserModel:
         try:
             statement = self._validate_content(statement, quotes)
         except PermissionError:
+            _record_suppression("edge")
             return None
         with self._connect() as connection:
             with connection:
@@ -1155,6 +1274,31 @@ class UserModel:
         candidates: Sequence[Mapping[str, object]],
         inbox_ids: Sequence[int],
     ) -> tuple[str, list[int], list[int]]:
+        """Apply one distillation transaction with a bounded mutation outcome."""
+        try:
+            result = self._apply_distillation(
+                session_id=session_id,
+                extractor_version=extractor_version,
+                candidates=candidates,
+                inbox_ids=inbox_ids,
+            )
+        except (KeyError, PermissionError, ValueError):
+            _record_graph_mutation("distill_apply", "rejected")
+            raise
+        except Exception as error:
+            _record_graph_mutation("distill_apply", _graph_error_outcome(error))
+            raise
+        _record_graph_mutation("distill_apply", "success")
+        return result
+
+    def _apply_distillation(
+        self,
+        *,
+        session_id: str,
+        extractor_version: str,
+        candidates: Sequence[Mapping[str, object]],
+        inbox_ids: Sequence[int],
+    ) -> tuple[str, list[int], list[int]]:
         """Atomically apply validated candidates, evidence, and inbox consumption."""
         if not session_id:
             raise ValueError("session_id is required for distillation")
@@ -1202,6 +1346,7 @@ class UserModel:
                                 str(candidate["statement"]), quotes
                             )
                         except PermissionError:
+                            _record_suppression("node")
                             continue
                         node_id = self._upsert_node_tx(
                             connection,
@@ -1224,6 +1369,8 @@ class UserModel:
                         ):
                             alias_text = str(alias["text"]).strip()
                             if not alias_text or self.is_never_store(alias_text):
+                                if alias_text:
+                                    _record_suppression("node")
                                 continue
                             connection.execute(
                                 """
@@ -1256,6 +1403,7 @@ class UserModel:
                                 str(candidate["statement"]), quotes
                             )
                         except PermissionError:
+                            _record_suppression("edge")
                             continue
                         edge_id = self._upsert_edge_tx(
                             connection,
@@ -1571,6 +1719,29 @@ class UserModel:
         statement: str | None = None,
         never_initiate: bool | None = None,
     ) -> bool:
+        """Apply an owner edit and record its bounded mutation outcome."""
+        try:
+            changed = self._edit_node(
+                node_id,
+                statement=statement,
+                never_initiate=never_initiate,
+            )
+        except (PermissionError, ValueError, sqlite3.IntegrityError):
+            _record_graph_mutation("edit", "rejected")
+            raise
+        except Exception as error:
+            _record_graph_mutation("edit", _graph_error_outcome(error))
+            raise
+        _record_graph_mutation("edit", "success" if changed else "rejected")
+        return changed
+
+    def _edit_node(
+        self,
+        node_id: int,
+        *,
+        statement: str | None = None,
+        never_initiate: bool | None = None,
+    ) -> bool:
         """Apply authoritative owner edit, tombstoning prior identity."""
         with self._connect() as connection:
             with connection:
@@ -1584,6 +1755,7 @@ class UserModel:
                     try:
                         new_statement = self._validate_content(statement, [])
                     except PermissionError:
+                        _record_suppression("node")
                         return False
                     new_key = normalize_statement(new_statement)
                     conflict = connection.execute(
@@ -1640,10 +1812,24 @@ class UserModel:
         return True
 
     def edit_edge(self, edge_id: int, *, statement: str) -> bool:
+        """Apply an owner edge edit and record its bounded mutation outcome."""
+        try:
+            changed = self._edit_edge(edge_id, statement=statement)
+        except (PermissionError, ValueError, sqlite3.IntegrityError):
+            _record_graph_mutation("edit", "rejected")
+            raise
+        except Exception as error:
+            _record_graph_mutation("edit", _graph_error_outcome(error))
+            raise
+        _record_graph_mutation("edit", "success" if changed else "rejected")
+        return changed
+
+    def _edit_edge(self, edge_id: int, *, statement: str) -> bool:
         """Apply authoritative owner edit to an edge claim."""
         try:
             new_statement = self._validate_content(statement, [])
         except PermissionError:
+            _record_suppression("edge")
             return False
         with self._connect() as connection:
             with connection:
@@ -1694,6 +1880,16 @@ class UserModel:
         return True
 
     def delete_edge(self, edge_id: int) -> bool:
+        """Delete an edge and record its bounded mutation outcome."""
+        try:
+            changed = self._delete_edge(edge_id)
+        except Exception as error:
+            _record_graph_mutation("delete", _graph_error_outcome(error))
+            raise
+        _record_graph_mutation("delete", "success" if changed else "rejected")
+        return changed
+
+    def _delete_edge(self, edge_id: int) -> bool:
         """Delete edge and write endpoint-stable keyed tombstone."""
         with self._connect() as connection:
             with connection:
@@ -1741,6 +1937,16 @@ class UserModel:
         return True
 
     def delete_node(self, node_id: int) -> bool:
+        """Delete a node and record its bounded mutation outcome."""
+        try:
+            changed = self._delete_node(node_id)
+        except Exception as error:
+            _record_graph_mutation("delete", _graph_error_outcome(error))
+            raise
+        _record_graph_mutation("delete", "success" if changed else "rejected")
+        return changed
+
+    def _delete_node(self, node_id: int) -> bool:
         """Delete node/incident edges and write privacy-safe tombstones."""
         with self._connect() as connection:
             with connection:
@@ -1859,9 +2065,18 @@ class UserModel:
     @staticmethod
     def is_eligible(claim: Mapping[str, object]) -> bool:
         """Check mechanical floor using currently auditable evidence only."""
+        occurrences = claim.get("n_auditable_occurrences", 0)
+        sessions = claim.get("n_auditable_sessions", 0)
+        if (
+            isinstance(occurrences, bool)
+            or not isinstance(occurrences, int)
+            or isinstance(sessions, bool)
+            or not isinstance(sessions, int)
+        ):
+            return False
         return (
-            int(claim.get("n_auditable_occurrences", 0)) >= GRADUATION_MIN_OCCURRENCES
-            and int(claim.get("n_auditable_sessions", 0)) >= GRADUATION_MIN_SESSIONS
+            occurrences >= GRADUATION_MIN_OCCURRENCES
+            and sessions >= GRADUATION_MIN_SESSIONS
         )
 
     def _propose(self, claim_kind: ClaimKind, claim_id: int) -> bool:
@@ -2111,6 +2326,17 @@ class UserModel:
         return result
 
     def revalidate_stale(self, now: datetime | None = None) -> int:
+        """Revalidate stale claims and record only actual mutation work."""
+        try:
+            changed = self._revalidate_stale(now)
+        except Exception as error:
+            _record_graph_mutation("revalidate", _graph_error_outcome(error))
+            raise
+        if changed:
+            _record_graph_mutation("revalidate", "success")
+        return changed
+
+    def _revalidate_stale(self, now: datetime | None = None) -> int:
         """Flag decayed thread/pattern/strategy and edge claims for review."""
         current = now or datetime.now(UTC)
         changed = 0
@@ -2286,7 +2512,7 @@ class UserModel:
         if not 1 <= k <= 50:
             raise ValueError("k must be between 1 and 50")
         self.revalidate_stale(now)
-        topic_tokens = _tokens(topic)
+        topic_tokens = tokens(topic)
         allow_private = (
             self._topic_explicitly_raises_boundary(topic)
             if allow_never_initiate is None
@@ -2302,7 +2528,7 @@ class UserModel:
             )
             if (node["never_initiate"] or boundary_match) and not allow_private:
                 continue
-            overlap = len(topic_tokens & _tokens(node["statement"]))
+            overlap = len(topic_tokens & tokens(node["statement"]))
             if overlap == 0:
                 continue
             score = overlap * _STATUS_WEIGHT.get(node["status"], 0.0)

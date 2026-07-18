@@ -5,8 +5,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 import pytest
-from fastapi.testclient import TestClient
 
+from tests.type_contracts import HttpTestClient
 from therapy.memory import MemoryStore
 from therapy.server import app as app_module
 from therapy.voice.contracts import (
@@ -24,8 +24,10 @@ class FakeVoiceGateway:
 
     answer: WebRTCAnswer = WebRTCAnswer(sdp="answer-sdp", type="answer", pc_id="peer-1")
     error: Exception | None = None
-    calls: list[tuple[WebRTCOffer, SessionTarget]] = field(default_factory=list)
-    disconnected: list[str] = field(default_factory=list)
+    calls: list[tuple[WebRTCOffer, SessionTarget]] = field(
+        default_factory=lambda: []
+    )
+    disconnected: list[str] = field(default_factory=lambda: [])
     closed: bool = False
 
     async def negotiate(
@@ -45,7 +47,9 @@ class FakeVoiceGateway:
 
 
 @pytest.fixture
-def gateway_client(client: TestClient) -> Iterator[tuple[TestClient, FakeVoiceGateway]]:
+def gateway_client(
+    client: HttpTestClient,
+) -> Iterator[tuple[HttpTestClient, FakeVoiceGateway]]:
     """Inject an owned fake gateway into the live FastAPI test application."""
     gateway = FakeVoiceGateway()
     app_module.app.dependency_overrides[app_module.get_voice_gateway] = lambda: gateway
@@ -56,7 +60,7 @@ def gateway_client(client: TestClient) -> Iterator[tuple[TestClient, FakeVoiceGa
 
 
 def test_offer_new_session_preserves_response_shape(
-    gateway_client: tuple[TestClient, FakeVoiceGateway],
+    gateway_client: tuple[HttpTestClient, FakeVoiceGateway],
 ) -> None:
     client, gateway = gateway_client
 
@@ -82,7 +86,7 @@ def test_offer_new_session_preserves_response_shape(
 
 
 def test_disconnect_voice_uses_owned_gateway(
-    gateway_client: tuple[TestClient, FakeVoiceGateway],
+    gateway_client: tuple[HttpTestClient, FakeVoiceGateway],
 ) -> None:
     client, gateway = gateway_client
 
@@ -94,7 +98,7 @@ def test_disconnect_voice_uses_owned_gateway(
 
 
 def test_offer_automatically_resumes_and_enriches_transcript_in_order(
-    data_dir: Path, gateway_client: tuple[TestClient, FakeVoiceGateway]
+    data_dir: Path, gateway_client: tuple[HttpTestClient, FakeVoiceGateway]
 ) -> None:
     client, gateway = gateway_client
     store = MemoryStore(data_dir)
@@ -116,7 +120,7 @@ def test_offer_automatically_resumes_and_enriches_transcript_in_order(
 
 
 def test_offer_explicit_session_wins_over_automatic_resume(
-    data_dir: Path, gateway_client: tuple[TestClient, FakeVoiceGateway]
+    data_dir: Path, gateway_client: tuple[HttpTestClient, FakeVoiceGateway]
 ) -> None:
     client, gateway = gateway_client
     store = MemoryStore(data_dir)
@@ -141,7 +145,7 @@ def test_offer_explicit_session_wins_over_automatic_resume(
 
 
 def test_offer_unknown_explicit_session_opens_fresh_session(
-    gateway_client: tuple[TestClient, FakeVoiceGateway],
+    gateway_client: tuple[HttpTestClient, FakeVoiceGateway],
 ) -> None:
     client, gateway = gateway_client
 
@@ -169,7 +173,7 @@ def test_offer_unknown_explicit_session_opens_fresh_session(
     ],
 )
 def test_offer_rejects_invalid_envelopes(
-    gateway_client: tuple[TestClient, FakeVoiceGateway],
+    gateway_client: tuple[HttpTestClient, FakeVoiceGateway],
     content: bytes,
     content_type: str,
     status: int,
@@ -185,7 +189,7 @@ def test_offer_rejects_invalid_envelopes(
 
 
 def test_offer_rejects_oversized_request_before_parsing(
-    gateway_client: tuple[TestClient, FakeVoiceGateway],
+    gateway_client: tuple[HttpTestClient, FakeVoiceGateway],
 ) -> None:
     client, gateway = gateway_client
     oversized = b"{" + b'"sdp":"' + b"x" * (256 * 1024) + b'","type":"offer"}'
@@ -208,7 +212,7 @@ def test_offer_rejects_oversized_request_before_parsing(
     ],
 )
 def test_offer_maps_owned_gateway_errors_to_stable_responses(
-    gateway_client: tuple[TestClient, FakeVoiceGateway],
+    gateway_client: tuple[HttpTestClient, FakeVoiceGateway],
     error: Exception,
     status: int,
 ) -> None:

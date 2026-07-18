@@ -1,3 +1,5 @@
+import pytest
+
 from therapy.perception.stt import clamp_language, is_supported, plausible_segment
 from therapy.speech.tts import VOICE_BY_LANGUAGE, voice_for
 
@@ -25,7 +27,7 @@ def test_plausible_segment_rejects_hallucination_signatures() -> None:
     assert not plausible_segment(**{**ok, "no_speech_prob": 0.9})
 
 
-def test_voice_map_covers_all_languages(monkeypatch) -> None:
+def test_voice_map_covers_all_languages(monkeypatch: pytest.MonkeyPatch) -> None:
     assert set(VOICE_BY_LANGUAGE) == {"en", "es", "pt"}
     for lang in VOICE_BY_LANGUAGE:
         assert voice_for(lang)

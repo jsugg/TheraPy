@@ -30,6 +30,7 @@ import socket
 import sys
 import threading
 import time
+import warnings
 from collections.abc import Callable, Iterator
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -42,10 +43,30 @@ if TYPE_CHECKING:
 
 _SUITES = ("unit", "integration", "e2e")
 
+
+def _find_repo_root() -> Path:
+    """Repo root = nearest ancestor holding pyproject.toml, else the fixed layout.
+
+    The fallback exists because ``./pyproject.toml`` is a single-file Docker bind
+    mount that goes stale whenever a host-side edit swaps its inode: the marker
+    then vanishes inside the container and a bare ``next()`` would raise
+    ``StopIteration`` and error every test at collection. ``make restart``
+    re-resolves the mount; the proper fix is deferred to the test-hardening plan.
+    """
+    for parent in Path(__file__).resolve().parents:
+        if (parent / "pyproject.toml").exists():
+            return parent
+    fallback = Path(__file__).resolve().parents[1]  # <root>/tests/conftest.py
+    warnings.warn(
+        f"conftest: no pyproject.toml above {__file__}; using {fallback}. In the "
+        "container the pyproject.toml bind mount is likely stale — run `make restart`.",
+        stacklevel=2,
+    )
+    return fallback
+
+
 # Make the repo importable (scripts/ is not a package) regardless of launcher.
-REPO_ROOT = next(
-    p for p in Path(__file__).resolve().parents if (p / "pyproject.toml").exists()
-)
+REPO_ROOT = _find_repo_root()
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 

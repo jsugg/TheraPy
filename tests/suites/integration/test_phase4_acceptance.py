@@ -3,12 +3,12 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING
+from typing import cast
 
 import pytest
 
-if TYPE_CHECKING:
-    from fastapi.testclient import TestClient
+from tests.type_contracts import HttpTestClient
+from therapy.observability.interactions import require_json_object
 
 
 @pytest.fixture
@@ -18,14 +18,16 @@ def test_mode(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @pytest.fixture
-def acceptance_client(test_mode: None, client: TestClient) -> TestClient:
+def acceptance_client(
+    test_mode: None, client: HttpTestClient
+) -> HttpTestClient:
     """Return the centrally isolated client after test mode is active."""
     del test_mode
     return client
 
 
 def _agent_turn(
-    client: TestClient,
+    client: HttpTestClient,
     text: str,
     *,
     session_id: str | None = None,
@@ -41,54 +43,71 @@ def _agent_turn(
         body["session_id"] = session_id
     response = client.post("/api/testing/agent/turn", json=body)
     assert response.status_code == 200, response.text
-    return response.json()
+    return _json_object(response.json())
 
 
-def _seed_late_meeting_evidence(client: TestClient) -> None:
+def _json_object(value: object) -> dict[str, object]:
+    """Validate one JSON object returned by the test HTTP boundary."""
+    return cast(dict[str, object], require_json_object(value, "test.response"))
+
+
+def _json_objects(value: object) -> list[dict[str, object]]:
+    """Validate one JSON array of objects returned by the test boundary."""
+    if not isinstance(value, list):
+        raise TypeError("test response field must be an array")
+    return [_json_object(item) for item in cast(list[object], value)]
+
+
+def _seed_late_meeting_evidence(client: HttpTestClient) -> None:
+    distillation: dict[str, object] = {}
     for index in range(3):
         result = _agent_turn(
             client,
             f"Late meeting {index} drains my energy.",
             finalize=True,
         )
-        distillation = result["distillation"]
-        assert isinstance(distillation, dict)
+        candidate = result["distillation"]
+        distillation = _json_object(candidate)
     assert distillation["proposed_nodes"]
     assert distillation["proposed_edges"]
 
 
-def _confirm_next(client: TestClient, topic: str) -> dict[str, object]:
+def _confirm_next(client: HttpTestClient, topic: str) -> dict[str, object]:
     reflected = _agent_turn(client, topic)
     insight = reflected["insight"]
-    assert isinstance(insight, dict), reflected
+    insight_object = _json_object(insight)
     confirmed = _agent_turn(client, "yes", session_id=str(reflected["session_id"]))
     resolution = confirmed["resolution"]
-    assert isinstance(resolution, dict)
-    assert resolution["state"] == "confirmed"
+    resolution_object = _json_object(resolution)
+    assert resolution_object["state"] == "confirmed"
     assert "confirmed" in str(confirmed["reply"])
-    return insight
+    return insight_object
 
 
 def test_real_agent_loop_context_privacy_research_and_proactivity(
-    acceptance_client: TestClient,
+    acceptance_client: HttpTestClient,
 ) -> None:
     client = acceptance_client
     _seed_late_meeting_evidence(client)
 
-    proposed = client.get("/api/graph").json()
-    assert {node["status"] for node in proposed["nodes"]} == {"proposed"}
-    assert {edge["status"] for edge in proposed["edges"]} == {"proposed"}
+    proposed = _json_object(client.get("/api/graph").json())
+    proposed_nodes = _json_objects(proposed["nodes"])
+    proposed_edges = _json_objects(proposed["edges"])
+    assert {node["status"] for node in proposed_nodes} == {"proposed"}
+    assert {edge["status"] for edge in proposed_edges} == {"proposed"}
 
     first = _confirm_next(client, "Late meetings drained my energy again.")
     second = _confirm_next(client, "Energy drops after late meetings.")
     third = _confirm_next(client, "Late meetings trigger an energy drop.")
-    assert first["claim_kind"] == "node"
-    assert second["claim_kind"] == "node"
-    assert third["claim_kind"] == "edge"
+    claim_kinds = [first["claim_kind"], second["claim_kind"], third["claim_kind"]]
+    assert claim_kinds.count("node") == 2
+    assert claim_kinds.count("edge") == 1
 
-    confirmed = client.get("/api/graph").json()
-    assert all(node["status"] == "confirmed" for node in confirmed["nodes"])
-    assert confirmed["edges"][0]["status"] == "confirmed"
+    confirmed = _json_object(client.get("/api/graph").json())
+    confirmed_nodes = _json_objects(confirmed["nodes"])
+    confirmed_edges = _json_objects(confirmed["edges"])
+    assert all(node["status"] == "confirmed" for node in confirmed_nodes)
+    assert confirmed_edges[0]["status"] == "confirmed"
     refreshed = _agent_turn(client, "A late meeting drained my energy today.")
     assert "Late meetings trigger an energy drop" in str(refreshed["memory_note"])
 
@@ -127,7 +146,8 @@ def test_real_agent_loop_context_privacy_research_and_proactivity(
         params={"q": "planning checklist", "k": 1, "threshold": 0.1},
     )
     assert cited.status_code == 200, cited.text
-    source = cited.json()["sources"][0]
+    cited_payload = _json_object(cited.json())
+    source = _json_objects(cited_payload["sources"])[0]
     assert source["page"] is None
     assert source["section"] == "Planning transitions"
     assert source["anchor"] == "section-planning-transitions-block-1"
@@ -153,24 +173,36 @@ def test_real_agent_loop_context_privacy_research_and_proactivity(
     }
     quiet = client.post("/api/testing/proactivity/run", json=request)
     assert quiet.status_code == 200, quiet.text
-    assert quiet.json()["job"]["state"] == "retry"
-    assert quiet.json()["job"]["result"] == {"reason": "quiet_hours"}
+    quiet_job = _json_object(_json_object(quiet.json())["job"])
+    assert quiet_job["state"] == "retry"
+    assert quiet_job["result"] == {"reason": "quiet_hours"}
 
     from therapy.server import app as app_module
 
-    app_module._proactivity.cache_clear()
+    proactivity_factory = getattr(app_module, "_proactivity", None)
+    cache_clear = getattr(proactivity_factory, "cache_clear", None)
+    if not callable(cache_clear):
+        raise TypeError("proactivity cache is unavailable")
+    cache_clear()
     daytime = future_night.replace(hour=14)
     request["now"] = daytime.isoformat()
     delivered = client.post("/api/testing/proactivity/run", json=request)
     assert delivered.status_code == 200, delivered.text
-    assert delivered.json()["job"]["state"] == "delivered"
-    jobs = client.get("/api/proactivity/jobs").json()["jobs"]
+    delivered_job = _json_object(_json_object(delivered.json())["job"])
+    assert delivered_job["state"] == "delivered"
+    jobs_payload = _json_object(client.get("/api/proactivity/jobs").json())
+    jobs = _json_objects(jobs_payload["jobs"])
     assert sum(job["idempotency_key"] == "acceptance-restart" for job in jobs) == 1
-    messages = client.get("/api/proactivity/in-app?consume=false").json()["messages"]
+    messages_payload = _json_object(
+        client.get("/api/proactivity/in-app?consume=false").json()
+    )
+    messages = _json_objects(messages_payload["messages"])
     assert any(message["channel"] == "check_in" for message in messages)
 
 
-def test_acceptance_routes_are_hidden_without_test_mode(client: TestClient) -> None:
+def test_acceptance_routes_are_hidden_without_test_mode(
+    client: HttpTestClient,
+) -> None:
     assert client.post(
         "/api/testing/agent/turn", json={"text": "hello", "language": "en"}
     ).status_code == 404

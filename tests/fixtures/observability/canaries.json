@@ -1,0 +1,22 @@
+{
+  "content": {
+    "completion": "OBS-CANARY-COMPLETION-d74c3a",
+    "memory_note": "OBS-CANARY-MEMORY-NOTE-e85b4b",
+    "provider_error": "OBS-CANARY-PROVIDER-ERROR-3d6a90",
+    "retrieval_passage": "OBS-CANARY-RETRIEVAL-PASSAGE-f96a5c",
+    "system_prompt": "OBS-CANARY-SYSTEM-PROMPT-c63d29",
+    "tool_arguments": "OBS-CANARY-TOOL-ARGUMENTS-1b887e",
+    "tool_definition": "OBS-CANARY-TOOL-DEFINITION-0a796d",
+    "tool_result": "OBS-CANARY-TOOL-RESULT-2c798f",
+    "typed_transcript": "OBS-CANARY-TYPED-TRANSCRIPT-a41f07",
+    "voice_transcript": "OBS-CANARY-VOICE-TRANSCRIPT-b52e18"
+  },
+  "forbidden": {
+    "api_key": "OBS-CANARY-API-KEY-713ed4",
+    "auth_header": "OBS-CANARY-AUTH-HEADER-604dc3",
+    "push_key": "OBS-CANARY-PUSH-KEY-9310f6",
+    "query_string": "OBS-CANARY-QUERY-STRING-5f4cb2",
+    "sdp": "OBS-CANARY-SDP-BLOB-4e5ba1",
+    "turn_key": "OBS-CANARY-TURN-KEY-822fe5"
+  }
+}

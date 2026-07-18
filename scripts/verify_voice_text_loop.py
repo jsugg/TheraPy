@@ -34,6 +34,8 @@ import sys
 import time
 from dataclasses import dataclass, field
 from fractions import Fraction
+from importlib.metadata import PackageNotFoundError, version
+from typing import Literal
 
 import httpx
 import numpy as np
@@ -43,10 +45,42 @@ from av import AudioFrame
 from kokoro_onnx import Kokoro
 from pipecat.services.kokoro.tts import KOKORO_CACHE_DIR
 
+from therapy.observability.interactions import JsonValue, require_json_object
+
 SERVER = "http://localhost:8000"
 RATE = 48_000
 FRAME_SAMPLES = RATE // 50  # 20 ms
 VOICED_RMS = 200.0  # int16 RMS above which a frame counts as bot speech
+SCRIPT_NAME = "verify_voice_text_loop"
+SCENARIOS = frozenset({"voice-text-loop"})
+
+type VerificationResult = Literal["pass", "fail"]
+
+
+def _text(value: JsonValue | object) -> str:
+    """Return a protocol value only when it is text."""
+    return value if isinstance(value, str) else ""
+
+
+def build_verification_record(
+    *, scenario: str, duration_s: float, result: VerificationResult
+) -> dict[str, str | float]:
+    """Build the final bounded verification record."""
+    if scenario not in SCENARIOS:
+        raise ValueError("unsupported verification scenario")
+    try:
+        build = version("therapy")
+    except PackageNotFoundError:
+        build = "unknown"
+    return {
+        "record": "verification",
+        "script": SCRIPT_NAME,
+        "build": build,
+        "scenario": scenario,
+        "duration_s": duration_s,
+        "result": result,
+        "environment": "test",
+    }
 
 # Distinct male "user" voices so the harness never hears itself in the
 # assistant's (female) voices.
@@ -122,8 +156,10 @@ class UserAudioTrack(MediaStreamTrack):
 class Observations:
     """Everything the harness hears and reads back from the server."""
 
-    transcripts: list[dict] = field(default_factory=list)
-    voiced_at: list[float] = field(default_factory=list)
+    transcripts: list[dict[str, JsonValue]] = field(
+        default_factory=list[dict[str, JsonValue]]
+    )
+    voiced_at: list[float] = field(default_factory=list[float])
     transcript_event: asyncio.Event = field(default_factory=asyncio.Event)
 
     def first_voiced_after(self, t: float) -> float | None:
@@ -132,7 +168,9 @@ class Observations:
     def last_voiced(self) -> float | None:
         return self.voiced_at[-1] if self.voiced_at else None
 
-    async def wait_transcript(self, role: str, after: int, timeout: float = 120.0) -> dict:
+    async def wait_transcript(
+        self, role: str, after: int, timeout: float = 120.0
+    ) -> dict[str, JsonValue]:
         deadline = time.monotonic() + timeout
         while True:
             for msg in self.transcripts[after:]:
@@ -154,6 +192,8 @@ async def watch_bot_audio(track: MediaStreamTrack, obs: Observations) -> None:
             frame = await track.recv()
         except Exception:
             return
+        if not isinstance(frame, AudioFrame):
+            continue
         samples = frame.to_ndarray().astype(np.float32)
         if np.sqrt(np.mean(samples**2)) > VOICED_RMS:
             obs.voiced_at.append(time.monotonic())
@@ -235,7 +275,7 @@ async def spoken_turn(
         await asyncio.sleep(0.1)
 
     ttfa = f"{first_audio - ended:.2f}s" if first_audio else "NO AUDIO"
-    checks = []
+    checks: list[str] = []
     if expect_user:
         detected = user_msg.get("language")
         checks.append("stt: ok" if detected == expect_user else f"stt: MISMATCH ({detected})")
@@ -247,8 +287,8 @@ async def spoken_turn(
         )
     results.append(
         f"[{label}] {' | '.join(checks)} | client TTFA (incl. 0.7s VAD close): {ttfa}\n"
-        f"     heard: {user_msg.get('text', '')!r}\n"
-        f"     reply: {bot_msg.get('text', '')[:120]!r}"
+        f"     heard: {_text(user_msg.get('text'))!r}\n"
+        f"     reply: {_text(bot_msg.get('text'))[:120]!r}"
     )
 
 
@@ -262,15 +302,23 @@ async def main() -> None:
     pc.addTrack(mic)
 
     channel = pc.createDataChannel("chat", ordered=True)
-    channel.on("message", lambda raw: (
-        obs.transcripts.append(json.loads(raw)) if '"transcript"' in raw else None,
-        obs.transcript_event.set(),
-    ))
+
+    def on_message(raw: str | bytes) -> None:
+        if isinstance(raw, str) and '"transcript"' in raw:
+            payload: object = json.loads(raw)
+            obs.transcripts.append(
+                require_json_object(payload, "data-channel transcript")
+            )
+        obs.transcript_event.set()
+
+    channel.on("message", on_message)
 
     @pc.on("track")
-    def on_track(track: MediaStreamTrack) -> None:
+    def _on_track(track: MediaStreamTrack) -> None:
         if track.kind == "audio":
             asyncio.ensure_future(watch_bot_audio(track, obs))
+
+    _ = _on_track
 
     await pc.setLocalDescription(await pc.createOffer())
     while pc.iceGatheringState != "complete":
@@ -285,8 +333,15 @@ async def main() -> None:
             timeout=60,
         )
         response.raise_for_status()
-        answer = response.json()
-    await pc.setRemoteDescription(RTCSessionDescription(sdp=answer["sdp"], type=answer["type"]))
+        answer_payload: object = response.json()
+        answer = require_json_object(answer_payload, "offer answer")
+    answer_sdp = answer.get("sdp")
+    answer_type = answer.get("type")
+    if not isinstance(answer_sdp, str) or not isinstance(answer_type, str):
+        raise TypeError("offer answer must contain string sdp and type")
+    await pc.setRemoteDescription(
+        RTCSessionDescription(sdp=answer_sdp, type=answer_type)
+    )
 
     # Generous window: on a cold server the first connection also pays
     # whisper/kokoro model loading before the handshake completes.
@@ -330,8 +385,9 @@ async def main() -> None:
     bot_msg = await obs.wait_transcript("assistant", seen)
     await asyncio.sleep(2.0)
     modality = "silent (mirrored)" if obs.first_voiced_after(sent_at) is None else "with audio"
-    status = "text reply ✓" if bot_msg.get("text") else "NO TEXT REPLY"
-    results.append(f"[typed] {status} — {modality}\n     reply: {bot_msg.get('text', '')[:120]!r}")
+    bot_text = _text(bot_msg.get("text"))
+    status = "text reply ✓" if bot_text else "NO TEXT REPLY"
+    results.append(f"[typed] {status} — {modality}\n     reply: {bot_text[:120]!r}")
     print(results[-1], flush=True)
 
     # 3. Voice turn again (mirroring must restore speech), used for barge-in:
@@ -353,11 +409,14 @@ async def main() -> None:
         await wait_speech_end(mic)
         await asyncio.sleep(2.5)
         last = obs.last_voiced()
-        stopped = last is None or last < time.monotonic() - 1.5
-        results.append(
-            "[barge-in] reply audio stopped after interruption ✓" if stopped
-            else f"[barge-in] audio still playing {time.monotonic() - last:.1f}s ago — check allow_interruptions"
-        )
+        elapsed = None if last is None else time.monotonic() - last
+        if elapsed is None or elapsed > 1.5:
+            results.append("[barge-in] reply audio stopped after interruption ✓")
+        else:
+            results.append(
+                f"[barge-in] audio still playing {elapsed:.1f}s ago — "
+                "check allow_interruptions"
+            )
         # Drain the interruption's own turn — its transcript and reply arrive
         # late and must not bleed into the next scenario's assertions.
         await obs.wait_transcript("user", seen_interrupt)
@@ -429,5 +488,26 @@ async def main() -> None:
     print("\nPASS — all scenarios green.")
 
 
+def _run_with_record() -> None:
+    """Run the verifier and always leave its machine record last on stdout."""
+    started = time.monotonic()
+    result: VerificationResult = "fail"
+    try:
+        asyncio.run(main())
+    except SystemExit as exc:
+        if exc.code in (None, 0):
+            result = "pass"
+        raise
+    else:
+        result = "pass"
+    finally:
+        record = build_verification_record(
+            scenario="voice-text-loop",
+            duration_s=time.monotonic() - started,
+            result=result,
+        )
+        print(json.dumps(record), flush=True)
+
+
 if __name__ == "__main__":
-    asyncio.run(main())
+    _run_with_record()
