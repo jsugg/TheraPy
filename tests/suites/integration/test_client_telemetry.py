@@ -1,7 +1,10 @@
 """Strict client telemetry endpoint (plan O4.1; O4 gate schema tests)."""
 
 import random
-from collections.abc import Iterator
+import time
+from collections.abc import Iterator, Mapping, Sequence
+from pathlib import Path
+from typing import cast
 
 import pytest
 from opentelemetry import trace as trace_api
@@ -11,21 +14,38 @@ from opentelemetry.sdk.trace.export.in_memory_span_exporter import (
     InMemorySpanExporter,
 )
 
+from tests.type_contracts import HttpTestClient
+
 
 @pytest.fixture
-def enabled(client, monkeypatch: pytest.MonkeyPatch):
+def enabled(
+    client: HttpTestClient, monkeypatch: pytest.MonkeyPatch
+) -> pytest.MonkeyPatch:
     monkeypatch.setenv("THERAPY_CLIENT_TELEMETRY", "1")
     # Same-origin is mandatory (O4 audit F-03): the shared test client
     # presents its own origin so accept-path tests exercise the happy path.
     client.headers["Origin"] = "http://testserver"
-    from therapy.server import app as app_mod
-
-    app_mod._client_bucket["tokens"] = 60.0
+    _set_client_tokens(60.0)
     return monkeypatch
 
 
-def _batch(events: list[dict]) -> dict:
+def _batch(events: Sequence[Mapping[str, object]]) -> dict[str, object]:
     return {"schema_version": 1, "events": events}
+
+
+def _set_client_tokens(tokens: float) -> None:
+    """Set the test-only rate-limit state through a validated boundary."""
+    from therapy.server import app as app_mod
+
+    bucket_value: object = getattr(app_mod, "_client_bucket", None)
+    if not isinstance(bucket_value, dict):
+        raise TypeError("client telemetry bucket is unavailable")
+    raw_bucket = cast(dict[object, object], bucket_value)
+    if not all(isinstance(key, str) for key in raw_bucket):
+        raise TypeError("client telemetry bucket has invalid keys")
+    bucket = cast(dict[str, object], raw_bucket)
+    bucket["tokens"] = tokens
+    bucket["updated"] = time.monotonic()
 
 
 @pytest.fixture
@@ -45,7 +65,9 @@ def otel_spans(
         provider.shutdown()
 
 
-def test_disabled_by_default_is_404(client, monkeypatch) -> None:
+def test_disabled_by_default_is_404(
+    client: HttpTestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
     monkeypatch.delenv("THERAPY_CLIENT_TELEMETRY", raising=False)
     response = client.post(
         "/api/telemetry/client",
@@ -54,7 +76,9 @@ def test_disabled_by_default_is_404(client, monkeypatch) -> None:
     assert response.status_code == 404
 
 
-def test_valid_batch_accepted(client, enabled) -> None:
+def test_valid_batch_accepted(
+    client: HttpTestClient, enabled: pytest.MonkeyPatch
+) -> None:
     response = client.post(
         "/api/telemetry/client",
         json=_batch(
@@ -77,8 +101,8 @@ def test_valid_batch_accepted(client, enabled) -> None:
 
 
 def test_valid_and_malformed_traceparents_control_owned_broad_span(
-    client,
-    enabled,
+    client: HttpTestClient,
+    enabled: pytest.MonkeyPatch,
     monkeypatch: pytest.MonkeyPatch,
     otel_spans: tuple[TracerProvider, InMemorySpanExporter],
 ) -> None:
@@ -97,10 +121,13 @@ def test_valid_and_malformed_traceparents_control_owned_broad_span(
         span
         for span in exporter.get_finished_spans()
         if span.name == "client_telemetry"
+        and span.instrumentation_scope is not None
         and span.instrumentation_scope.name == "therapy.broad"
     ]
     assert len(spans) == 1
-    assert spans[0].context.trace_id == int(trace_id_hex, 16)
+    span_context = spans[0].context
+    assert span_context is not None
+    assert span_context.trace_id == int(trace_id_hex, 16)
     assert spans[0].parent is not None
     assert spans[0].parent.is_remote
     assert dict(spans[0].attributes or {}) == {
@@ -119,11 +146,14 @@ def test_valid_and_malformed_traceparents_control_owned_broad_span(
         span
         for span in exporter.get_finished_spans()
         if span.name == "client_telemetry"
+        and span.instrumentation_scope is not None
         and span.instrumentation_scope.name == "therapy.broad"
     ]
     assert len(malformed_spans) == 1
-    assert malformed_spans[0].context.trace_id != int(trace_id_hex, 16)
-    assert malformed_spans[0].context.trace_id != 0
+    malformed_context = malformed_spans[0].context
+    assert malformed_context is not None
+    assert malformed_context.trace_id != int(trace_id_hex, 16)
+    assert malformed_context.trace_id != 0
     assert malformed_spans[0].parent is None
     assert dict(malformed_spans[0].attributes or {}) == {
         "component": "server",
@@ -132,7 +162,7 @@ def test_valid_and_malformed_traceparents_control_owned_broad_span(
 
 
 def test_offer_fastapi_instrumentation_extracts_traceparent(
-    data_dir,
+    data_dir: Path,
     monkeypatch: pytest.MonkeyPatch,
     otel_spans: tuple[TracerProvider, InMemorySpanExporter],
 ) -> None:
@@ -166,9 +196,14 @@ def test_offer_fastapi_instrumentation_extracts_traceparent(
     monkeypatch.setattr(trace_api, "get_tracer", provider.get_tracer)
     trace_id_hex = "fedcba9876543210fedcba9876543210"
     traceparent = f"00-{trace_id_hex}-fedcba9876543210-01"
-    app_mod._store.cache_clear()
+    store_factory = getattr(app_mod, "_store", None)
+    cache_clear = getattr(store_factory, "cache_clear", None)
+    if not callable(cache_clear):
+        raise TypeError("server store cache is unavailable")
+    cache_clear()
     try:
-        with TestClient(traced_app) as traced_client:
+        with TestClient(traced_app) as raw_client:
+            traced_client = cast(HttpTestClient, raw_client)
             response = traced_client.post(
                 "/api/offer?new_session=1",
                 json={"sdp": "offer-sdp", "type": "offer"},
@@ -176,7 +211,7 @@ def test_offer_fastapi_instrumentation_extracts_traceparent(
             )
     finally:
         FastAPIInstrumentor.uninstrument_app(traced_app)
-        app_mod._store.cache_clear()
+        cache_clear()
 
     assert response.status_code == 200
     trace_id = int(trace_id_hex, 16)
@@ -184,16 +219,23 @@ def test_offer_fastapi_instrumentation_extracts_traceparent(
         span for span in exporter.get_finished_spans() if span.kind is SpanKind.SERVER
     ]
     assert len(server_spans) == 1
-    assert server_spans[0].context.trace_id == trace_id
+    server_context = server_spans[0].context
+    assert server_context is not None
+    assert server_context.trace_id == trace_id
     assert server_spans[0].parent is not None
     assert server_spans[0].parent.is_remote
     owned_spans = [
         span
         for span in exporter.get_finished_spans()
-        if span.instrumentation_scope.name == "therapy.broad"
+        if span.instrumentation_scope is not None
+        and span.instrumentation_scope.name == "therapy.broad"
     ]
     assert owned_spans
-    assert {span.context.trace_id for span in owned_spans} == {trace_id}
+    owned_contexts = [span.context for span in owned_spans]
+    assert all(context is not None for context in owned_contexts)
+    assert {context.trace_id for context in owned_contexts if context is not None} == {
+        trace_id
+    }
 
 
 @pytest.mark.parametrize(
@@ -208,12 +250,16 @@ def test_offer_fastapi_instrumentation_extracts_traceparent(
         {"name": "webrtc_sample", "packet_loss_ratio": 1.5},
     ],
 )
-def test_free_text_identifiers_and_ranges_rejected(client, enabled, event) -> None:
+def test_free_text_identifiers_and_ranges_rejected(
+    client: HttpTestClient,
+    enabled: pytest.MonkeyPatch,
+    event: dict[str, object],
+) -> None:
     response = client.post("/api/telemetry/client", json=_batch([event]))
     assert response.status_code == 422
 
 
-def test_batch_bounds(client, enabled) -> None:
+def test_batch_bounds(client: HttpTestClient, enabled: pytest.MonkeyPatch) -> None:
     too_many = [{"name": "shell_fetch"}] * 21
     assert (
         client.post("/api/telemetry/client", json=_batch(too_many)).status_code
@@ -228,7 +274,9 @@ def test_batch_bounds(client, enabled) -> None:
     )
 
 
-def test_oversize_body_rejected(client, enabled) -> None:
+def test_oversize_body_rejected(
+    client: HttpTestClient, enabled: pytest.MonkeyPatch
+) -> None:
     response = client.post(
         "/api/telemetry/client",
         content=b"x" * 100,
@@ -240,7 +288,9 @@ def test_oversize_body_rejected(client, enabled) -> None:
     assert response.status_code == 413
 
 
-def test_cross_origin_rejected(client, enabled) -> None:
+def test_cross_origin_rejected(
+    client: HttpTestClient, enabled: pytest.MonkeyPatch
+) -> None:
     response = client.post(
         "/api/telemetry/client",
         json=_batch([{"name": "shell_fetch"}]),
@@ -260,7 +310,9 @@ def test_cross_origin_rejected(client, enabled) -> None:
     ],
 )
 def test_missing_null_malformed_or_wrong_scheme_origin_rejected(
-    client, enabled, headers
+    client: HttpTestClient,
+    enabled: pytest.MonkeyPatch,
+    headers: dict[str, str],
 ) -> None:
     request_headers = dict(headers) or {"Origin": ""}
     response = client.post(
@@ -271,7 +323,9 @@ def test_missing_null_malformed_or_wrong_scheme_origin_rejected(
     assert response.status_code == 403
 
 
-def test_forwarded_proto_defines_the_expected_scheme(client, enabled) -> None:
+def test_forwarded_proto_defines_the_expected_scheme(
+    client: HttpTestClient, enabled: pytest.MonkeyPatch
+) -> None:
     """Behind the HTTPS proxy the browser origin is https; the forwarded
     scheme must win over the socket scheme."""
     response = client.post(
@@ -303,20 +357,26 @@ def test_forwarded_proto_defines_the_expected_scheme(client, enabled) -> None:
         {"jitter_ms": False},  # boolean as float
     ],
 )
-def test_lax_type_coercions_rejected(client, enabled, event_override) -> None:
+def test_lax_type_coercions_rejected(
+    client: HttpTestClient,
+    enabled: pytest.MonkeyPatch,
+    event_override: dict[str, object],
+) -> None:
     event = {"name": "webrtc_sample", **event_override}
     response = client.post("/api/telemetry/client", json=_batch([event]))
     assert response.status_code == 422
 
 
-def test_boolean_schema_version_rejected(client, enabled) -> None:
+def test_boolean_schema_version_rejected(
+    client: HttpTestClient, enabled: pytest.MonkeyPatch
+) -> None:
     payload = {"schema_version": True, "events": [{"name": "shell_fetch"}]}
     response = client.post("/api/telemetry/client", json=payload)
     assert response.status_code == 422
 
 
 def test_malformed_content_length_is_controlled_client_error(
-    client, enabled
+    client: HttpTestClient, enabled: pytest.MonkeyPatch
 ) -> None:
     response = client.post(
         "/api/telemetry/client",
@@ -330,7 +390,7 @@ def test_malformed_content_length_is_controlled_client_error(
 
 
 def test_rejections_emit_fixed_schema_event_without_payload_values(
-    client, enabled
+    client: HttpTestClient, enabled: pytest.MonkeyPatch
 ) -> None:
     import io
     import json
@@ -359,24 +419,32 @@ def test_rejections_emit_fixed_schema_event_without_payload_values(
     assert response.status_code == 422
     assert response.json() == {"detail": "invalid telemetry batch"}
     lines = stream.getvalue().splitlines()
-    events = [json.loads(line) for line in lines]
+    from therapy.observability.interactions import require_json_object
+
+    events = [
+        require_json_object(json.loads(line), "test.log.event") for line in lines
+    ]
     rejected = [e for e in events if e["event.name"] == "client_telemetry_rejected"]
     assert [e["outcome"] for e in rejected] == ["schema_error"]
     assert marker not in stream.getvalue()
 
 
 def test_all_accepted_webrtc_fields_feed_metrics(
-    client, enabled, monkeypatch
+    client: HttpTestClient,
+    enabled: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """O4 audit F-06: accepted diagnostics must never be silently discarded."""
     from therapy.observability import telemetry
 
-    recorded: list[tuple[str, float, dict]] = []
-    monkeypatch.setattr(
-        telemetry,
-        "record_metric",
-        lambda name, value, attrs=None: recorded.append((name, value, attrs or {})),
-    )
+    recorded: list[tuple[str, float, dict[str, str]]] = []
+
+    def _record_metric(
+        name: str, value: float, attrs: dict[str, str] | None = None
+    ) -> None:
+        recorded.append((name, value, attrs or {}))
+
+    monkeypatch.setattr(telemetry, "record_metric", _record_metric)
     response = client.post(
         "/api/telemetry/client",
         json=_batch(
@@ -409,10 +477,10 @@ def test_all_accepted_webrtc_fields_feed_metrics(
     } <= names
 
 
-def test_rate_limit_is_process_wide_not_ip_keyed(client, enabled) -> None:
-    from therapy.server import app as app_mod
-
-    app_mod._client_bucket["tokens"] = 1.0
+def test_rate_limit_is_process_wide_not_ip_keyed(
+    client: HttpTestClient, enabled: pytest.MonkeyPatch
+) -> None:
+    _set_client_tokens(1.0)
     ok = client.post(
         "/api/telemetry/client", json=_batch([{"name": "shell_fetch"}])
     )
@@ -423,7 +491,9 @@ def test_rate_limit_is_process_wide_not_ip_keyed(client, enabled) -> None:
     assert limited.status_code == 429
 
 
-def test_fuzz_random_payloads_never_pass_schema(client, enabled) -> None:
+def test_fuzz_random_payloads_never_pass_schema(
+    client: HttpTestClient, enabled: pytest.MonkeyPatch
+) -> None:
     """Deterministic fuzz loop (O4 gate): randomly structured junk is always
     422, never accepted or a 500."""
     rng = random.Random(20260716)
@@ -431,10 +501,8 @@ def test_fuzz_random_payloads_never_pass_schema(client, enabled) -> None:
         "session-1234", "https://x.test/?q=1", "v=0\\no=- 46117", "sk-abc",
         {"nested": {"deep": True}}, ["a", 1], 1e308, -5, "shell_fetch",
     ]
-    from therapy.server import app as app_mod
-
     for _ in range(100):
-        app_mod._client_bucket["tokens"] = 60.0  # isolate schema behavior
+        _set_client_tokens(60.0)  # isolate schema behavior
         event = {
             rng.choice(["name", "outcome", "rtt_ms", "extra", "url", "id"]):
                 rng.choice(fragments)

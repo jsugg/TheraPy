@@ -10,7 +10,7 @@ from therapy.server.protocol import (
 )
 
 
-def _turn(i: int, text: str | None = None) -> dict:
+def _turn(i: int, text: str | None = None) -> dict[str, str]:
     return {
         "role": "user" if i % 2 == 0 else "assistant",
         "text": f"t{i}" if text is None else text,

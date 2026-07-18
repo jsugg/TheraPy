@@ -7,14 +7,17 @@ import json
 import logging
 import sqlite3
 import sys
-from collections.abc import Iterator
+from collections.abc import Generator, Iterable, Iterator
 from contextlib import contextmanager
 from pathlib import Path
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
+from typing import cast
 
 import numpy as np
 import pytest
+from PIL.Image import Image
 
+from tests.type_contracts import EventCall, event_recorder
 from therapy.knowledge.embeddings import (
     MODEL_DIMENSION,
     EmbeddingMetadata,
@@ -27,6 +30,7 @@ from therapy.knowledge.research_ingest import (
     TesseractOCR,
     extract_source,
 )
+from therapy.observability.interactions import require_json_object
 
 _BODY_TITLE = "Body doubling for ADHD"
 _BODY_REF = "Brown 2021, ADHD Practice Review"
@@ -95,17 +99,38 @@ def _assert_metric_cardinality(calls: list[MetricCall]) -> None:
         assert expected.keys() == declared.keys()
         assert attributes.keys() == expected.keys()
         for key, value in attributes.items():
-            if declared[key] is not None:
-                assert expected[key] == set(declared[key])
+            assert expected[key] == set(declared[key])
             assert value in expected[key]
 
 
 class StubEmbeddingModel:
     """Minimal FastEmbed-compatible model for local telemetry tests."""
 
-    def embed(self, texts: list[str]) -> Iterator[np.ndarray]:
+    def embed(
+        self,
+        documents: str | Iterable[str],
+        batch_size: int = 256,
+        parallel: int | None = None,
+        **kwargs: object,
+    ) -> Iterator[np.ndarray]:
+        del batch_size, parallel, kwargs
+        texts = (documents,) if isinstance(documents, str) else documents
         for _ in texts:
             yield np.ones(MODEL_DIMENSION, dtype=np.float32)
+
+
+class VectorFaultEmbeddingModel:
+    """FastEmbed-compatible model that fails while producing vectors."""
+
+    def embed(
+        self,
+        documents: str | Iterable[str],
+        batch_size: int = 256,
+        parallel: int | None = None,
+        **kwargs: object,
+    ) -> Iterator[np.ndarray]:
+        del documents, batch_size, parallel, kwargs
+        raise RuntimeError("private-vector-fault-canary")
 
 
 class StubSpan:
@@ -160,7 +185,7 @@ class FakeOCR:
             "languages": ["eng", "spa", "por"],
         }
 
-    def recognize(self, image) -> list[OCRBlock]:
+    def recognize(self, image: Image) -> list[OCRBlock]:
         del image
         return [
             OCRBlock("Body doubling helps start a task.", 0.96, (1, 2, 100, 20)),
@@ -178,6 +203,18 @@ class TimeoutOCR:
     def recognize(self, image: object) -> list[OCRBlock]:
         del image
         raise TimeoutError("private-ocr-timeout-payload-canary")
+
+
+class ErrorOCR:
+    """OCR double that proves non-timeout failure classification."""
+
+    @property
+    def metadata(self) -> dict[str, object]:
+        return {}
+
+    def recognize(self, image: object) -> list[OCRBlock]:
+        del image
+        raise RuntimeError("private-ocr-error-payload-canary")
 
 
 def _kb(path: Path, revision: str = "test-v1") -> ResearchKB:
@@ -212,10 +249,19 @@ def test_psychoeducation_is_only_retrieved_text_with_source_attribution(
 
     result = kb.psychoeducation("task initiation", k=1)
 
-    assert _BODY_TEXT in result["answer"]
-    assert result["sources"][0]["ref"] == _BODY_REF
-    assert result["sources"][0]["anchor"] == "section-document-block-1"
-    assert result["sources"][0]["citation"] in result["answer"]
+    answer = result["answer"]
+    sources = result["sources"]
+    assert isinstance(answer, str)
+    assert isinstance(sources, list)
+    assert sources
+    source_value = cast(list[object], sources)[0]
+    source = require_json_object(source_value, "psychoeducation.sources[0]")
+    citation = source.get("citation")
+    assert isinstance(citation, str)
+    assert _BODY_TEXT in answer
+    assert source["ref"] == _BODY_REF
+    assert source["anchor"] == "section-document-block-1"
+    assert citation in answer
 
 
 def test_silent_grounding_labels_untrusted_research_and_not_user_memory(
@@ -253,6 +299,22 @@ def test_content_hash_dedup_and_explicit_reingest(
         1,
         {"format": "markdown", "outcome": "success", "deduplicated": "true"},
     ) in metric_calls
+    assert any(
+        name == "therapy_research_ingest_seconds"
+        and attrs == {"format": "markdown", "outcome": "success"}
+        for name, _, attrs in metric_calls
+    )
+    assert (
+        "therapy_research_source_bytes",
+        len(payload),
+        {"format": "markdown"},
+    ) in metric_calls
+    assert (
+        "therapy_research_pages",
+        0,
+        {"format": "markdown"},
+    ) in metric_calls
+    assert any(name == "therapy_research_blocks" for name, _, _ in metric_calls)
     _assert_metric_cardinality(metric_calls)
 
 
@@ -268,7 +330,7 @@ def test_research_observability_success_spans_and_cardinality(
     @contextmanager
     def capture_span(
         name: str, *, component: str, operation: str
-    ) -> Iterator[StubSpan]:
+    ) -> Generator[StubSpan, None, None]:
         span = StubSpan()
         span_calls.append((name, component, operation, span))
         yield span
@@ -292,6 +354,16 @@ def test_research_observability_success_spans_and_cardinality(
         1,
         {"format": "text", "outcome": "success", "deduplicated": "false"},
     ) in metric_calls
+    assert any(
+        name == "therapy_research_ingest_seconds"
+        and attrs == {"format": "text", "outcome": "success"}
+        for name, _, attrs in metric_calls
+    )
+    assert (
+        "therapy_research_source_bytes",
+        len(b"Private-text-canary supports task initiation."),
+        {"format": "text"},
+    ) in metric_calls
     stages = {
         attrs["stage"]
         for name, _, attrs in metric_calls
@@ -309,11 +381,25 @@ def test_research_observability_success_spans_and_cardinality(
         if name == "therapy_research_queries_total"
     ]
     assert query_outcomes == ["hit", "no_hit"]
+    assert any(name == "therapy_research_query_seconds" for name, _, _ in metric_calls)
+    assert any(name == "therapy_research_query_candidates" for name, _, _ in metric_calls)
+    assert any(name == "therapy_research_query_results" for name, _, _ in metric_calls)
+    assert any(name == "therapy_research_query_top_score" for name, _, _ in metric_calls)
+    assert any(name == "therapy_research_reindex_documents" for name, _, _ in metric_calls)
+    assert any(name == "therapy_research_reindex_blocks" for name, _, _ in metric_calls)
+    assert any(
+        name == "therapy_research_unindexed_documents"
+        for name, _, _ in metric_calls
+    )
     assert {name for name, _, _, _ in span_calls} >= {
-        "research.ingest_bytes",
-        "research.reindex",
-        "research.query",
+        "db.operation",
         "research.reindex.document",
+    }
+    assert {operation for _, _, operation, _ in span_calls} >= {
+        "ingest_bytes",
+        "reindex",
+        "query",
+        "reindex_document",
     }
     document_spans = [
         span for name, _, _, span in span_calls if name == "research.reindex.document"
@@ -372,7 +458,7 @@ def test_unexpected_db_failure_records_error_and_file_without_db(
 ) -> None:
     from therapy.observability import logging as observability_logging
 
-    event_calls: list[tuple[str, dict[str, object]]] = []
+    event_calls: list[EventCall] = []
 
     def capture_event(event_name: str, **kwargs: object) -> None:
         event_calls.append((event_name, kwargs))
@@ -437,7 +523,7 @@ def test_delete_detects_db_without_file_without_leaking_path(
     monkeypatch.setattr(
         observability_logging,
         "emit_event",
-        lambda event_name, **kwargs: event_calls.append((event_name, kwargs)),
+        event_recorder(event_calls),
     )
     kb = _kb(tmp_path)
     result = kb.ingest_bytes(
@@ -558,13 +644,13 @@ def test_fastembed_records_cold_warm_success_and_load_error(
     model = StubEmbeddingModel()
 
     def load_model() -> StubEmbeddingModel:
-        backend._model = model
+        vars(backend)["_model"] = model
         return model
 
     monkeypatch.setattr(backend, "_load", load_model)
     backend.embed_documents(["private-passage-canary"])
     backend.embed_query("private-query-canary")
-    backend._model = None
+    vars(backend)["_model"] = None
 
     def fail_load() -> StubEmbeddingModel:
         raise RuntimeError("private-model-load-canary")
@@ -588,10 +674,102 @@ def test_fastembed_records_cold_warm_success_and_load_error(
         for name, _, attrs in metric_calls
         if name == "therapy_embedding_seconds"
     ] == ["cold", "warm", "cold"]
+    assert [
+        value
+        for name, value, _ in metric_calls
+        if name == "therapy_embedding_items"
+    ] == [1, 1, 1]
+    assert any(
+        name == "therapy_embedding_characters_per_second"
+        for name, _, _ in metric_calls
+    )
     _assert_metric_cardinality(metric_calls)
     broad_payload = repr(metric_calls).casefold()
     assert "private-" not in broad_payload
     assert str(tmp_path).casefold() not in broad_payload
+
+
+def test_fastembed_vector_fault_records_error_without_payload(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    metric_calls: list[MetricCall],
+) -> None:
+    backend = FastEmbedBackend(tmp_path)
+    model = VectorFaultEmbeddingModel()
+
+    def load_model() -> VectorFaultEmbeddingModel:
+        return model
+
+    monkeypatch.setattr(backend, "_load", load_model)
+    with pytest.raises(RuntimeError, match="private-vector-fault"):
+        backend.embed_documents(["private-vector-input-canary"])
+
+    assert (
+        "therapy_embedding_batches_total",
+        1,
+        {"cache": "cold", "outcome": "error"},
+    ) in metric_calls
+    assert any(
+        name == "therapy_embedding_seconds" and attrs == {"cache": "cold"}
+        for name, _, attrs in metric_calls
+    )
+    _assert_metric_cardinality(metric_calls)
+    broad_payload = repr(metric_calls).casefold()
+    assert "private-" not in broad_payload
+    assert str(tmp_path).casefold() not in broad_payload
+
+
+def test_fastembed_model_load_records_success_and_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    metric_calls: list[MetricCall],
+) -> None:
+    class FakeTextEmbedding:
+        @staticmethod
+        def list_supported_models() -> list[dict[str, str]]:
+            return [{"model": "intfloat/multilingual-e5-small"}]
+
+        def __init__(self, **_kwargs: object) -> None:
+            pass
+
+        def embed(self, texts: list[str]) -> Iterator[np.ndarray]:
+            for _ in texts:
+                yield np.ones(MODEL_DIMENSION, dtype=np.float32)
+
+    def model_source(**kwargs: object) -> dict[str, object]:
+        return kwargs
+
+    fastembed_module = ModuleType("fastembed")
+    fastembed_module.__dict__["TextEmbedding"] = FakeTextEmbedding
+    common_module = ModuleType("fastembed.common")
+    model_description_module = ModuleType("fastembed.common.model_description")
+    model_description_module.__dict__["ModelSource"] = model_source
+    model_description_module.__dict__["PoolingType"] = SimpleNamespace(MEAN="mean")
+    monkeypatch.setitem(sys.modules, "fastembed", fastembed_module)
+    monkeypatch.setitem(sys.modules, "fastembed.common", common_module)
+    monkeypatch.setitem(
+        sys.modules,
+        "fastembed.common.model_description",
+        model_description_module,
+    )
+
+    assert FastEmbedBackend(tmp_path / "success").embed_query("probe").size > 0
+
+    class BrokenTextEmbedding(FakeTextEmbedding):
+        def __init__(self, **_kwargs: object) -> None:
+            raise RuntimeError("private-fastembed-load-canary")
+
+    fastembed_module.__dict__["TextEmbedding"] = BrokenTextEmbedding
+    with pytest.raises(RuntimeError, match="private-fastembed-load"):
+        FastEmbedBackend(tmp_path / "failure").embed_query("probe")
+
+    outcomes = [
+        attrs["outcome"]
+        for name, _, attrs in metric_calls
+        if name == "therapy_embedding_model_load_seconds"
+    ]
+    assert outcomes == ["success", "error"]
+    assert "private-fastembed-load-canary" not in repr(metric_calls)
 
 
 @pytest.mark.parametrize(
@@ -673,7 +851,9 @@ def test_image_ocr_preview_excludes_low_confidence_until_owner_correction(
     assert result["status"] == "review_required"
     assert result["review_blocks"] == 1
     assert detail is not None
-    assert detail["ocr_metadata"]["engine"] == "fake-local"
+    ocr_metadata = detail["ocr_metadata"]
+    assert isinstance(ocr_metadata, dict)
+    assert ocr_metadata["engine"] == "fake-local"
     initial = kb.query("uncertain", threshold=0.0)
     assert all("uncertain wrd" not in item["text"] for item in initial)
 
@@ -695,6 +875,13 @@ def test_image_ocr_preview_excludes_low_confidence_until_owner_correction(
         name == "therapy_ocr_seconds" and attrs == {"outcome": "success"}
         for name, _, attrs in metric_calls
     )
+    assert any(name == "therapy_ocr_pixels" for name, _, _ in metric_calls)
+    assert any(name == "therapy_ocr_blocks" for name, _, _ in metric_calls)
+    assert (
+        "therapy_ocr_pages_total",
+        1.0,
+        {"outcome": "success"},
+    ) in metric_calls
     assert any(
         name == "therapy_research_stage_seconds"
         and attrs == {"stage": "ocr", "outcome": "success"}
@@ -742,12 +929,51 @@ def test_ocr_timeout_records_timeout_without_payload(
     assert "private-ocr" not in repr(metric_calls).casefold()
 
 
+def test_ocr_error_records_error_without_payload(
+    tmp_path: Path, metric_calls: list[MetricCall]
+) -> None:
+    image_module = pytest.importorskip("PIL.Image")
+    image = image_module.new("RGB", (16, 16), "white")
+    payload = io.BytesIO()
+    image.save(payload, format="PNG")
+
+    with pytest.raises(RuntimeError, match="private-ocr-error"):
+        _kb(tmp_path).ingest_bytes(
+            payload.getvalue(),
+            "private-ocr-error-name-canary.png",
+            "image/png",
+            ocr_backend=ErrorOCR(),
+        )
+
+    assert (
+        "therapy_ocr_runs_total",
+        1.0,
+        {"outcome": "error"},
+    ) in metric_calls
+    assert any(
+        name == "therapy_ocr_seconds" and attrs == {"outcome": "error"}
+        for name, _, attrs in metric_calls
+    )
+    assert any(
+        name == "therapy_research_stage_seconds"
+        and attrs == {"stage": "ocr", "outcome": "error"}
+        for name, _, attrs in metric_calls
+    )
+    assert (
+        "therapy_research_ingests_total",
+        1,
+        {"format": "image", "outcome": "error", "deduplicated": "false"},
+    ) in metric_calls
+    _assert_metric_cardinality(metric_calls)
+    assert "private-ocr" not in repr(metric_calls).casefold()
+
+
 def test_tesseract_cold_start_emits_bounded_version_validity_once(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from therapy.observability import logging as observability_logging
 
-    event_calls: list[tuple[str, dict[str, object]]] = []
+    event_calls: list[EventCall] = []
     timeouts: list[float] = []
 
     def image_to_osd(image: object, *, timeout: float) -> str:
@@ -757,15 +983,24 @@ def test_tesseract_cold_start_emits_bounded_version_validity_once(
 
     def image_to_data(image: object, **kwargs: object) -> dict[str, list[object]]:
         del image
-        timeouts.append(float(kwargs["timeout"]))
+        timeout = kwargs["timeout"]
+        assert isinstance(timeout, int | float)
+        timeouts.append(float(timeout))
         return {"text": []}
+
+    def get_languages(config: str) -> list[str]:
+        del config
+        return ["eng"]
+
+    def get_tesseract_version() -> str:
+        return "private-version-canary"
 
     monkeypatch.setitem(
         sys.modules,
         "pytesseract",
         SimpleNamespace(
-            get_languages=lambda config: ["eng"],
-            get_tesseract_version=lambda: "private-version-canary",
+            get_languages=get_languages,
+            get_tesseract_version=get_tesseract_version,
             image_to_osd=image_to_osd,
             image_to_data=image_to_data,
             TesseractError=RuntimeError,
@@ -775,7 +1010,7 @@ def test_tesseract_cold_start_emits_bounded_version_validity_once(
     monkeypatch.setattr(
         observability_logging,
         "emit_event",
-        lambda event_name, **kwargs: event_calls.append((event_name, kwargs)),
+        event_recorder(event_calls),
     )
     backend = TesseractOCR("eng")
 
@@ -817,8 +1052,13 @@ def test_digital_pdf_preserves_page_anchor_without_ocr(
     detail = kb.document(result["document_id"])
 
     assert detail is not None
-    assert detail["blocks"][0]["anchor"] == "page-1-block-1"
-    assert detail["blocks"][0]["extraction_method"] == "digital"
+    blocks = detail["blocks"]
+    assert isinstance(blocks, list)
+    assert blocks
+    first_block_value = cast(list[object], blocks)[0]
+    first_block = require_json_object(first_block_value, "document.blocks[0]")
+    assert first_block["anchor"] == "page-1-block-1"
+    assert first_block["extraction_method"] == "digital"
     hit = kb.query("task initiation", threshold=0.1)[0]
     assert hit["page"] == 1
     assert "p. 1" in hit["citation"]
@@ -854,18 +1094,29 @@ def test_scanned_pdf_pages_use_local_ocr_with_reviewable_page_anchors(
 
     assert detail is not None
     assert detail["status"] == "review_required"
-    assert detail["ocr_metadata"]["engine"] == "fake-local"
-    assert [block["anchor"] for block in detail["blocks"]] == [
+    ocr_metadata = detail["ocr_metadata"]
+    blocks = detail["blocks"]
+    assert isinstance(ocr_metadata, dict)
+    assert isinstance(blocks, list)
+    block_values = cast(list[object], blocks)
+    typed_blocks = [
+        require_json_object(block, f"document.blocks[{index}]")
+        for index, block in enumerate(block_values)
+    ]
+    assert ocr_metadata["engine"] == "fake-local"
+    assert [block["anchor"] for block in typed_blocks] == [
         "page-1-block-1",
         "page-1-block-2",
     ]
-    assert all(block["extraction_method"] == "ocr" for block in detail["blocks"])
+    assert all(block["extraction_method"] == "ocr" for block in typed_blocks)
 
 
 def test_model_revision_change_triggers_deterministic_reindex(tmp_path: Path) -> None:
     first = _kb(tmp_path, "revision-one")
     document_id = first.ingest(_BODY_TITLE, _BODY_REF, _BODY_TEXT)
-    assert first.document(document_id)["index_model_revision"] == "revision-one"
+    first_detail = first.document(document_id)
+    assert first_detail is not None
+    assert first_detail["index_model_revision"] == "revision-one"
 
     second = _kb(tmp_path, "revision-two")
     assert second.query("task initiation", threshold=0.1)
@@ -882,11 +1133,17 @@ def test_export_contains_artifact_and_delete_removes_all_corpus_bytes(
     document_id = kb.ingest(_BODY_TITLE, _BODY_REF, _BODY_TEXT)
 
     snapshot = kb.export_all()
-    document = snapshot["documents"][0]
+    documents = snapshot["documents"]
+    assert isinstance(documents, list)
+    assert documents
+    document_value = cast(list[object], documents)[0]
+    document = require_json_object(document_value, "snapshot.documents[0]")
     assert document["artifact_base64"]
     assert json.loads(json.dumps(snapshot)) == snapshot
 
-    artifact = tmp_path / str(document["artifact_path"])
+    artifact_path = document.get("artifact_path")
+    assert isinstance(artifact_path, str)
+    artifact = tmp_path / artifact_path
     assert artifact.exists()
     assert kb.delete_document(document_id)
     assert not artifact.exists()

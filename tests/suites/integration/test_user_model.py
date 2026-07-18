@@ -6,6 +6,7 @@ import json
 import sqlite3
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import cast
 
 import pytest
 
@@ -13,10 +14,13 @@ from therapy.knowledge.insight import InsightService
 from therapy.knowledge.user_model import (
     EDGE_TYPES,
     NODE_TYPES,
+    GraphEdge,
+    GraphNode,
     UserModel,
     render_context,
 )
 from therapy.memory import MemoryStore
+from therapy.observability.interactions import require_json_object
 
 type MetricCall = tuple[str, float, dict[str, str]]
 
@@ -58,6 +62,20 @@ def _reinforce_edge(model: UserModel, src: int, dst: int) -> int:
     return edge_id
 
 
+def _node(model: UserModel, node_id: int) -> GraphNode:
+    """Return one required graph node for assertions."""
+    node = model.get_node(node_id)
+    assert node is not None
+    return node
+
+
+def _edge(model: UserModel, edge_id: int) -> GraphEdge:
+    """Return one required graph edge for assertions."""
+    edge = model.get_edge(edge_id)
+    assert edge is not None
+    return edge
+
+
 def test_appendix_a_registries_and_legacy_compatibility(tmp_path: Path) -> None:
     assert NODE_TYPES == (
         "identity_fact",
@@ -86,7 +104,7 @@ def test_appendix_a_registries_and_legacy_compatibility(tmp_path: Path) -> None:
     model = UserModel(tmp_path)
     node_id = model.upsert_node("routine", "Walks before breakfast.")
     assert node_id is not None
-    assert model.get_node(node_id)["type"] == "pattern"
+    assert _node(model, node_id)["type"] == "pattern"
 
 
 def test_source_authority_and_direct_user_statement_path(tmp_path: Path) -> None:
@@ -99,9 +117,9 @@ def test_source_authority_and_direct_user_statement_path(tmp_path: Path) -> None
 
     assert stated is not None
     assert observed is not None
-    assert model.get_node(stated)["status"] == "confirmed"
-    assert model.get_node(stated)["source"] == "user-stated"
-    assert model.get_node(observed)["status"] == "observation"
+    assert _node(model, stated)["status"] == "confirmed"
+    assert _node(model, stated)["source"] == "user-stated"
+    assert _node(model, observed)["status"] == "observation"
 
 
 def test_node_and_edge_share_evidence_gated_lifecycle(tmp_path: Path) -> None:
@@ -110,18 +128,18 @@ def test_node_and_edge_share_evidence_gated_lifecycle(tmp_path: Path) -> None:
     trigger = _reinforce_node(model, "Drinks coffee late.")
     edge = _reinforce_edge(model, trigger, pattern)
 
-    assert model.is_eligible(model.get_node(pattern)) is True
-    assert model.is_eligible(model.get_edge(edge)) is True
+    assert model.is_eligible(_node(model, pattern)) is True
+    assert model.is_eligible(_edge(model, edge)) is True
     assert model.confirm_node(pattern) is False
     assert model.confirm_edge(edge) is False
     assert model.propose(pattern) is True
     assert model.propose_edge(edge) is True
-    assert model.get_node(pattern)["status"] == "proposed"
-    assert model.get_edge(edge)["status"] == "proposed"
+    assert _node(model, pattern)["status"] == "proposed"
+    assert _edge(model, edge)["status"] == "proposed"
     assert model.confirm_node(pattern, session_id="validation") is True
     assert model.confirm_edge(edge, session_id="validation") is True
-    assert model.get_node(pattern)["status"] == "confirmed"
-    assert model.get_edge(edge)["status"] == "confirmed"
+    assert _node(model, pattern)["status"] == "confirmed"
+    assert _edge(model, edge)["status"] == "confirmed"
     assert model.lifecycle_events("edge", edge)[-1]["event_type"] == "user_confirmed"
 
 
@@ -130,7 +148,7 @@ def test_rejection_is_durable_until_new_evidence(tmp_path: Path) -> None:
     node_id = _reinforce_node(model)
     assert model.propose(node_id) is True
     assert model.reject_node(node_id) is True
-    assert model.get_node(node_id)["status"] == "rejected"
+    assert _node(model, node_id)["status"] == "rejected"
     assert model.propose(node_id) is False
 
     model.upsert_node("pattern", "Skips lunch when busy.", session_id="s3")
@@ -293,9 +311,9 @@ def test_decay_flags_stale_nodes_and_edges_for_revalidation(tmp_path: Path) -> N
     changed = model.revalidate_stale(datetime.now(UTC) + timedelta(days=100))
 
     assert changed == 3
-    assert model.get_node(thread)["status"] == "needs_revalidation"
-    assert model.get_node(pattern)["status"] == "needs_revalidation"
-    assert model.get_edge(edge)["status"] == "needs_revalidation"
+    assert _node(model, thread)["status"] == "needs_revalidation"
+    assert _node(model, pattern)["status"] == "needs_revalidation"
+    assert _edge(model, edge)["status"] == "needs_revalidation"
 
 
 def test_session_deletion_sanitizes_quotes_or_removes_derived_claims(
@@ -323,7 +341,7 @@ def test_session_deletion_sanitizes_quotes_or_removes_derived_claims(
     assert evidence[0]["quote_text"] is None
     assert evidence[0]["source_state"] == "deleted"
     assert evidence[0]["source_marker"] is not None
-    assert model.get_node(kept)["status"] == "needs_revalidation"
+    assert _node(model, kept)["status"] == "needs_revalidation"
 
     removed_result = model.delete_session_evidence("remove", remove_derived=True)
     assert removed_result["claims_removed"] == 1
@@ -530,7 +548,13 @@ def test_export_contains_full_provenance_and_no_plaintext_tombstone(
     assert "claim_evidence" in snapshot
     assert "distillation_runs" in snapshot
     assert "Writes clear plans" not in encoded
-    assert len(snapshot["tombstones"][0]["digest"]) == 64
+    tombstones = snapshot["tombstones"]
+    assert isinstance(tombstones, list)
+    tombstone_value = cast(list[object], tombstones)[0]
+    tombstone = require_json_object(tombstone_value, "snapshot.tombstones[0]")
+    digest = tombstone["digest"]
+    assert isinstance(digest, str)
+    assert len(digest) == 64
 
 
 def test_graph_mutation_metrics_cover_success_rejection_and_cardinality(
@@ -720,3 +744,360 @@ def test_graph_read_paths_do_not_emit_mutation_metrics(
     assert not any(
         name == "therapy_graph_mutations_total" for name, _, _ in metric_calls
     )
+
+
+def test_inferred_claims_upgrade_in_place_when_owner_confirms_them(
+    tmp_path: Path,
+) -> None:
+    model = UserModel(tmp_path)
+    source = model.add_user_statement("thread", "Planning the coming week.")
+    target = model.upsert_node("strategy", "Uses a written checklist.")
+    assert source is not None
+    assert target is not None
+    edge = model.upsert_edge(
+        source,
+        target,
+        "supports",
+        statement="Weekly planning supports checklist use.",
+    )
+    assert edge is not None
+
+    confirmed_target = model.add_user_statement("strategy", "Uses a written checklist.")
+    confirmed_edge = model.add_user_edge(
+        source,
+        target,
+        "supports",
+        "Weekly planning supports checklist use.",
+    )
+
+    assert confirmed_target == target
+    assert confirmed_edge == edge
+    assert (_node(model, target)["status"], _node(model, target)["source"]) == (
+        "confirmed",
+        "user-stated",
+    )
+    assert (_edge(model, edge)["status"], _edge(model, edge)["source"]) == (
+        "confirmed",
+        "user-stated",
+    )
+    assert [
+        (event["from_status"], event["to_status"], event["event_type"])
+        for event in model.lifecycle_events()
+        if (event["claim_kind"], event["claim_id"])
+        in {("node", target), ("edge", edge)}
+    ] == [
+        (None, "observation", "observed"),
+        (None, "observation", "observed"),
+        ("observation", "confirmed", "direct_user_statement"),
+        ("observation", "confirmed", "direct_user_statement"),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("node_type", "days"),
+    [("thread", 14), ("pattern", 56), ("strategy", 90), ("strength", None)],
+)
+def test_node_revalidation_schedule_is_type_specific(
+    tmp_path: Path, node_type: str, days: int | None
+) -> None:
+    model = UserModel(tmp_path)
+    node_id = model.upsert_node(node_type, f"Schedule for {node_type}.")
+    assert node_id is not None
+    node = _node(model, node_id)
+
+    if days is None:
+        assert node["revalidation_due_at"] is None
+        return
+    assert node["revalidation_due_at"] is not None
+    assert datetime.fromisoformat(node["revalidation_due_at"]) - datetime.fromisoformat(
+        node["last_seen"]
+    ) == timedelta(days=days)
+
+
+def test_distillation_filters_private_candidates_and_replays_success(
+    tmp_path: Path, metric_calls: list[MetricCall]
+) -> None:
+    model = UserModel(tmp_path)
+    model.add_boundary("never_store", "restricted")
+    tombstoned = model.add_user_statement("strategy", "Retire this draft.")
+    assert tombstoned is not None
+    assert model.delete_node(tombstoned)
+    metric_calls.clear()
+
+    result = model.apply_distillation(
+        session_id="distill-filter-session",
+        extractor_version="filter-v1",
+        candidates=[
+            {
+                "kind": "node",
+                "type": "thread",
+                "statement": "Plans the coming week.",
+                "aliases": [
+                    {"text": ""},
+                    {"text": "restricted planning alias"},
+                    {"text": "Weekly planning", "language": "en"},
+                ],
+            },
+            {
+                "kind": "node",
+                "type": "strategy",
+                "statement": "Uses concise checklists.",
+            },
+            {
+                "kind": "node",
+                "type": "thread",
+                "statement": "A restricted private topic.",
+            },
+            {
+                "kind": "node",
+                "type": "strategy",
+                "statement": "Retire this draft.",
+            },
+            {
+                "kind": "edge",
+                "type": "supports",
+                "src": "Plans the coming week.",
+                "dst": "Uses concise checklists.",
+                "statement": "Weekly planning supports concise checklists.",
+            },
+            {
+                "kind": "edge",
+                "type": "conflicts_with",
+                "src": "Plans the coming week.",
+                "dst": "Uses concise checklists.",
+                "statement": "A restricted relationship.",
+            },
+        ],
+        inbox_ids=[],
+    )
+    replay = model.apply_distillation(
+        session_id="distill-filter-session",
+        extractor_version="filter-v1",
+        candidates=[],
+        inbox_ids=[],
+    )
+
+    assert replay == result
+    assert len(result[1]) == 2
+    assert len(result[2]) == 1
+    assert {node["statement"] for node in model.nodes()} == {
+        "Plans the coming week.",
+        "Uses concise checklists.",
+    }
+    assert [edge["statement"] for edge in model.edges()] == [
+        "Weekly planning supports concise checklists."
+    ]
+    with sqlite3.connect(tmp_path / "therapy.db") as connection:
+        aliases = {
+            str(row[0])
+            for row in connection.execute("SELECT alias FROM node_aliases").fetchall()
+        }
+    assert "Weekly planning" in aliases
+    assert "restricted planning alias" not in aliases
+    assert "Retire this draft." not in aliases
+    assert all(
+        set(attrs) <= {"operation", "outcome", "table_class"}
+        for _, _, attrs in metric_calls
+    )
+    assert "restricted" not in json.dumps(metric_calls).casefold()
+    assert "distill-filter-session" not in json.dumps(metric_calls)
+
+
+def test_distillation_rejects_invalid_scope_and_self_edges_atomically(
+    tmp_path: Path, metric_calls: list[MetricCall]
+) -> None:
+    model = UserModel(tmp_path)
+    inbox_id = model.add_observation("Owner-scoped observation.", session_id="owner")
+    endpoint = model.add_user_statement("thread", "One endpoint.")
+    assert inbox_id is not None
+    assert endpoint is not None
+    metric_calls.clear()
+
+    with pytest.raises(ValueError, match="belong to the session"):
+        model.apply_distillation(
+            session_id="foreign",
+            extractor_version="scope-v1",
+            candidates=[
+                {
+                    "kind": "node",
+                    "type": "strength",
+                    "statement": "This mutation must roll back.",
+                }
+            ],
+            inbox_ids=[inbox_id],
+        )
+    with pytest.raises(ValueError, match="endpoints must be different"):
+        model.apply_distillation(
+            session_id="owner",
+            extractor_version="self-edge-v1",
+            candidates=[
+                {
+                    "kind": "edge",
+                    "type": "supports",
+                    "src": "One endpoint.",
+                    "dst": "One endpoint.",
+                    "statement": "A self relationship.",
+                }
+            ],
+            inbox_ids=[],
+        )
+
+    assert model.get_node(endpoint) is not None
+    assert all(
+        node["statement"] != "This mutation must roll back." for node in model.nodes()
+    )
+    assert [row["id"] for row in model.pending_observations("owner")] == [inbox_id]
+    assert model.edges() == []
+    failed = [
+        run
+        for run in cast(list[dict[str, object]], model.export_all()["distillation_runs"])
+        if run["state"] == "failed"
+    ]
+    assert len(failed) == 2
+    assert all(str(run["error"]).startswith("ValueError:") for run in failed)
+    assert [
+        attrs["outcome"]
+        for name, _, attrs in metric_calls
+        if name == "therapy_graph_mutations_total"
+        and attrs["operation"] == "distill_apply"
+    ] == ["rejected", "rejected"]
+
+
+def test_distillation_run_retry_and_failure_state_are_durable(tmp_path: Path) -> None:
+    model = UserModel(tmp_path)
+    run_id = model.start_distillation_run("retry-session", "retry-v1")
+    assert model.start_distillation_run("retry-session", "retry-v1") == run_id
+
+    model.fail_distillation_run(run_id, RuntimeError("x" * 1_200))
+    failed = model.distillation_run(run_id)
+    assert failed is not None
+    assert failed["state"] == "failed"
+    assert len(str(failed["error"])) == 1_000
+
+    assert model.start_distillation_run("retry-session", "retry-v1") == run_id
+    retried = model.distillation_run(run_id)
+    assert retried is not None
+    assert retried["state"] == "running"
+    assert retried["attempt_count"] == 2
+    assert retried["error"] is None
+
+    applied_run, node_ids, edge_ids = model.apply_distillation(
+        session_id="retry-session",
+        extractor_version="retry-v1",
+        candidates=[],
+        inbox_ids=[],
+    )
+    assert (applied_run, node_ids, edge_ids) == (run_id, [], [])
+    model.fail_distillation_run(run_id, RuntimeError("must not replace success"))
+    succeeded = model.distillation_run(run_id)
+    assert succeeded is not None
+    assert succeeded["state"] == "succeeded"
+    assert succeeded["result"] == {"node_ids": [], "edge_ids": []}
+    assert model.distillation_run("missing-run") is None
+    with pytest.raises(ValueError, match="required"):
+        model.start_distillation_run("", "retry-v1")
+
+
+def test_mutation_failures_emit_bounded_error_and_timeout_outcomes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    metric_calls: list[MetricCall],
+) -> None:
+    model = UserModel(tmp_path)
+    source = model.add_user_statement("thread", "Source node.")
+    target = model.add_user_statement("strategy", "Target node.")
+    assert source is not None
+    assert target is not None
+    metric_calls.clear()
+
+    with pytest.raises(ValueError, match="session_id"):
+        model.apply_distillation(
+            session_id="", extractor_version="v1", candidates=[], inbox_ids=[]
+        )
+
+    def fail_distillation(**_kwargs: object) -> tuple[str, list[int], list[int]]:
+        raise TimeoutError("private distillation payload")
+
+    monkeypatch.setattr(model, "_apply_distillation", fail_distillation)
+    with pytest.raises(TimeoutError, match="private distillation"):
+        model.apply_distillation(
+            session_id="timeout-session",
+            extractor_version="v1",
+            candidates=[],
+            inbox_ids=[],
+        )
+
+    def fail_revalidation(_now: datetime | None = None) -> int:
+        raise TimeoutError("private revalidation payload")
+
+    monkeypatch.setattr(model, "_revalidate_stale", fail_revalidation)
+    with pytest.raises(TimeoutError, match="private revalidation"):
+        model.revalidate_stale()
+
+    def fail_node(*_args: object, **_kwargs: object) -> int | None:
+        raise TimeoutError("private node payload")
+
+    monkeypatch.setattr(model, "_upsert_node", fail_node)
+    with pytest.raises(TimeoutError, match="private node"):
+        model.upsert_node("thread", "Do not emit this node.")
+
+    busy = sqlite3.OperationalError("private edge payload")
+    busy.sqlite_errorcode = sqlite3.SQLITE_BUSY
+
+    def fail_edge(*_args: object, **_kwargs: object) -> int | None:
+        raise busy
+
+    monkeypatch.setattr(model, "_upsert_edge", fail_edge)
+    with pytest.raises(sqlite3.OperationalError, match="private edge"):
+        model.upsert_edge(
+            source, target, "supports", statement="Do not emit this edge."
+        )
+
+    mutations = [
+        (attrs["operation"], attrs["outcome"])
+        for name, _, attrs in metric_calls
+        if name == "therapy_graph_mutations_total"
+    ]
+    assert mutations == [
+        ("distill_apply", "rejected"),
+        ("distill_apply", "timeout"),
+        ("revalidate", "timeout"),
+        ("add_node", "timeout"),
+        ("add_edge", "timeout"),
+    ]
+    assert all(
+        set(attrs) == {"operation", "outcome"}
+        for name, _, attrs in metric_calls
+        if name == "therapy_graph_mutations_total"
+    )
+    assert "private" not in json.dumps(metric_calls).casefold()
+
+
+def test_processed_observation_audit_rows_are_marked_and_pruned(
+    tmp_path: Path,
+) -> None:
+    model = UserModel(tmp_path)
+    first = model.add_observation("First bounded observation.", session_id="s1")
+    second = model.add_observation("Second bounded observation.", session_id="s1")
+    assert first is not None
+    assert second is not None
+
+    model.mark_observations_processed([], run_id="ignored")
+    model.mark_observations_processed([first], run_id="run-1")
+    pending = model.pending_observations("s1")
+    assert [row["id"] for row in pending] == [second]
+    audited = model.pending_observations("s1", include_processed=True)
+    assert audited[0]["distillation_run_id"] == "run-1"
+
+    with sqlite3.connect(tmp_path / "therapy.db") as connection:
+        connection.execute(
+            "UPDATE observation_inbox SET processed_at = ? WHERE id = ?",
+            ("2000-01-01T00:00:00+00:00", first),
+        )
+        connection.commit()
+    assert model.prune_processed_observations(older_than_days=1) == 1
+    assert [row["id"] for row in model.pending_observations(include_processed=True)] == [
+        second
+    ]
+    with pytest.raises(ValueError, match=">= 1"):
+        model.prune_processed_observations(older_than_days=0)

@@ -31,7 +31,9 @@ FIXTURES = Path(__file__).resolve().parents[2] / "fixtures/observability"
         ("opentelemetry.instrumentation.httpx", TelemetryPlane.BROAD),
     ],
 )
-def test_known_scopes_route_to_exactly_one_plane(scope, expected) -> None:
+def test_known_scopes_route_to_exactly_one_plane(
+    scope: str, expected: TelemetryPlane
+) -> None:
     assert classify_scope(scope) is expected
 
 
@@ -40,7 +42,7 @@ def test_known_scopes_route_to_exactly_one_plane(scope, expected) -> None:
     [None, "", "random.sdk", "opentelemetry.instrumentation.sqlite3",
      "therapy.unknown", "langchain", "grpc"],
 )
-def test_unknown_scopes_are_dropped_not_fanned_out(scope) -> None:
+def test_unknown_scopes_are_dropped_not_fanned_out(scope: str | None) -> None:
     assert classify_scope(scope) is None
 
 

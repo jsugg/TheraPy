@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import math
+from pathlib import Path
+
 import pytest
 
 # scripts/ is baked, not bind-mounted, into the container image; guard so a
@@ -49,7 +52,7 @@ def test_compute_error_rates_known_pair() -> None:
 
     rates = compute_error_rates("The cat sat.", "the cat")
 
-    assert rates["wer"] == pytest.approx(1 / 3)
+    assert math.isclose(rates["wer"], 1 / 3)
     assert set(rates) == {"wer", "cer", "mer", "wil"}
 
 
@@ -173,7 +176,9 @@ def test_high_risk_deterministic_failure_requires_human_review() -> None:
 
     result = evaluate_behavior_cases([case], {"crisis-test": "no resource"})
 
-    evaluated_case = result["cases"][0]
+    evaluated_cases = result["cases"]
+    assert isinstance(evaluated_cases, list)
+    evaluated_case = evaluated_cases[0]
     assert isinstance(evaluated_case, dict)
     assert evaluated_case["verdict"] == "fail"
     assert evaluated_case["human_review_required"] is True
@@ -187,7 +192,9 @@ def test_high_risk_non_failure_still_requires_human_review() -> None:
         [case], {"crisis-test": "You can call CVV at 188; I'm here with you."}
     )
 
-    evaluated_case = result["cases"][0]
+    evaluated_cases = result["cases"]
+    assert isinstance(evaluated_cases, list)
+    evaluated_case = evaluated_cases[0]
     assert isinstance(evaluated_case, dict)
     assert evaluated_case["verdict"] == REVIEW_VERDICT
     assert evaluated_case["human_review_required"] is True
@@ -199,7 +206,7 @@ def test_committed_corpus_covers_the_frozen_dimension_set() -> None:
     assert {case["dimension"] for case in cases} == REQUIRED_DIMENSIONS
 
 
-def test_loader_rejects_unknown_dimensions(tmp_path) -> None:
+def test_loader_rejects_unknown_dimensions(tmp_path: Path) -> None:
     import json as json_module
 
     path = tmp_path / "cases.json"
@@ -225,14 +232,14 @@ def test_loader_rejects_unknown_dimensions(tmp_path) -> None:
         load_behavior_cases(path)
 
 
-def test_restricted_report_refuses_paths_outside_local(tmp_path) -> None:
+def test_restricted_report_refuses_paths_outside_local(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="refusing to write"):
         write_restricted_report(
             {"x": 1}, tmp_path / "report.json", repo_root=tmp_path / "fake-repo"
         )
 
 
-def test_restricted_report_is_owner_only(tmp_path) -> None:
+def test_restricted_report_is_owner_only(tmp_path: Path) -> None:
     output = tmp_path / ".local" / "obs-eval" / "report.json"
 
     label = write_restricted_report({"x": 1}, output, repo_root=tmp_path)

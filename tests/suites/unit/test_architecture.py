@@ -210,3 +210,47 @@ assert not loaded, loaded
         capture_output=True,
         text=True,
     )
+
+
+def test_raw_audio_can_only_reach_local_stt_or_owner_storage(repo_root: Path) -> None:
+    """Cloud LLM adapters never receive raw-audio objects or byte buffers."""
+    path = repo_root / PIPECAT_ROOT / "pipeline.py"
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    direct_allowlist = {
+        "_persisted",
+        "len",
+        "model.transcribe",
+        "np.frombuffer",
+        "store.add_turn",
+    }
+    threaded_allowlist = {"_transcribe_utterance", "self._recorder"}
+    violations: list[str] = []
+
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        values = [*node.args, *(keyword.value for keyword in node.keywords)]
+        carries_audio = any(
+            isinstance(candidate, ast.Name)
+            and candidate.id in {"audio", "audio_float"}
+            or isinstance(candidate, ast.Attribute)
+            and candidate.attr == "audio"
+            for value in values
+            for candidate in ast.walk(value)
+        )
+        if not carries_audio:
+            continue
+        callee = ast.unparse(node.func)
+        if callee in direct_allowlist:
+            continue
+        if (
+            callee == "run_in_thread"
+            and len(node.args) >= 2
+            and ast.unparse(node.args[1]) in threaded_allowlist
+        ):
+            continue
+        violations.append(f"{path.relative_to(repo_root)}:{node.lineno} {callee}")
+
+    assert not violations, "Raw audio crossed an unowned boundary:\n" + "\n".join(
+        violations
+    )

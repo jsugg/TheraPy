@@ -1,5 +1,6 @@
 import asyncio
 import json
+import sqlite3
 import wave
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -72,7 +73,7 @@ def test_resume_candidate_uses_last_turn_for_unfinalized_session(
     stale_started_at = (datetime.now(UTC) - timedelta(hours=2)).isoformat(
         timespec="microseconds"
     )
-    with store._connect() as connection:
+    with sqlite3.connect(tmp_path / "therapy.db") as connection:
         with connection:
             connection.execute(
                 "UPDATE sessions SET started_at = ? WHERE id = ?",

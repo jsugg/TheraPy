@@ -13,12 +13,14 @@ from therapy.observability.telemetry import PlaneRoutingSpanProcessor, state
 
 class RecordingProcessor:
     def __init__(self) -> None:
-        self.ended: list[object] = []
+        self.ended: list[SimpleNamespace] = []
 
-    def on_start(self, span, parent_context=None) -> None:
+    def on_start(
+        self, span: SimpleNamespace, parent_context: object | None = None
+    ) -> None:
         pass
 
-    def on_end(self, span) -> None:
+    def on_end(self, span: SimpleNamespace) -> None:
         self.ended.append(span)
 
     def shutdown(self) -> None:
@@ -28,12 +30,13 @@ class RecordingProcessor:
         return True
 
 
-def _span(scope_name: str | None, attributes: dict) -> SimpleNamespace:
+def _span(scope_name: str | None, attributes: dict[str, object]) -> SimpleNamespace:
     return SimpleNamespace(
         instrumentation_scope=(
             SimpleNamespace(name=scope_name) if scope_name else None
         ),
         attributes=attributes,
+        status=None,
     )
 
 

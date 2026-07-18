@@ -9,7 +9,7 @@ import asyncio
 import io
 import json
 import logging
-from collections.abc import Iterator
+from collections.abc import Coroutine, Iterator
 from pathlib import Path
 
 import pytest
@@ -17,6 +17,7 @@ import pytest
 pytest.importorskip("pipecat")
 
 from pipecat.frames.frames import (  # noqa: E402
+    Frame,
     InterruptionFrame,
     LLMContextFrame,
     LLMFullResponseEndFrame,
@@ -25,6 +26,10 @@ from pipecat.frames.frames import (  # noqa: E402
 )
 from pipecat.observers.base_observer import FramePushed  # noqa: E402
 from pipecat.processors.aggregators.llm_context import LLMContext  # noqa: E402
+from pipecat.processors.frame_processor import (  # noqa: E402
+    FrameDirection,
+    FrameProcessor,
+)
 
 from therapy.integrations.pipecat.observability import (  # noqa: E402
     InteractionCaptureObserver,
@@ -35,6 +40,10 @@ from therapy.observability.capture import (  # noqa: E402
     start_capture,
 )
 from therapy.observability.config import ObservabilityConfig  # noqa: E402
+from therapy.observability.journal import (  # noqa: E402
+    JournalStore,
+    LoadedInteraction,
+)
 from therapy.observability.logging import BroadJsonFormatter  # noqa: E402
 
 TRANSCRIPT_CANARY = "OBS-TEST-VOICE-TRANSCRIPT-9f2c"
@@ -42,14 +51,23 @@ SYSTEM_CANARY = "OBS-TEST-SYSTEM-PROMPT-7d1a"
 COMPLETION_CANARY = "OBS-TEST-COMPLETION-3b8e"
 
 
-class _FakeLLM:
+class _FakeLLM(FrameProcessor):
     pass
 
 
-def _pushed(frame, *, source=None, destination=None) -> FramePushed:
+def _pushed(
+    frame: Frame,
+    *,
+    source: FrameProcessor | None = None,
+    destination: FrameProcessor | None = None,
+) -> FramePushed:
+    fallback = _FakeLLM()
     return FramePushed(
-        source=source, destination=destination, frame=frame,
-        direction=None, timestamp=0,
+        source=source or fallback,
+        destination=destination or fallback,
+        frame=frame,
+        direction=FrameDirection.DOWNSTREAM,
+        timestamp=0,
     )
 
 
@@ -76,7 +94,9 @@ def broad_log() -> Iterator[io.StringIO]:
     logger.handlers = []
 
 
-def _drive(observer: InteractionCaptureObserver, llm: _FakeLLM, *, interrupt: bool):
+def _drive(
+    observer: InteractionCaptureObserver, llm: _FakeLLM, *, interrupt: bool
+) -> Coroutine[object, object, None]:
     async def scenario() -> None:
         await observer.on_push_frame(
             _pushed(_context_frame(), destination=llm)
@@ -100,6 +120,12 @@ def _drive(observer: InteractionCaptureObserver, llm: _FakeLLM, *, interrupt: bo
     return scenario()
 
 
+def _loaded(store: JournalStore, interaction_id: str) -> LoadedInteraction:
+    loaded = store.load(interaction_id)
+    assert loaded is not None
+    return loaded
+
+
 def test_transcript_reaches_restricted_capture_once_and_never_broad(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, broad_log: io.StringIO
 ) -> None:
@@ -115,23 +141,33 @@ def test_transcript_reaches_restricted_capture_once_and_never_broad(
         )
         try:
             await _drive(observer, llm, interrupt=False)
+            assert runtime.writer is not None
             await runtime.writer.flush()
             store = runtime.store
+            assert store is not None
             ids = list(store.iter_interaction_ids())
             assert len(ids) == 1  # exactly once
-            loaded = store.load(ids[0])
+            loaded = _loaded(store, ids[0])
             row = loaded["interaction"]
             assert row["status"] == "succeeded"
             assert row["operation"] == "reply"
-            request = json.loads(row["canonical_request_json"])
+            canonical_request_json = row["canonical_request_json"]
+            assert canonical_request_json is not None
+            request = json.loads(canonical_request_json)
             assert request["system_instructions"] == SYSTEM_CANARY
             assert TRANSCRIPT_CANARY in json.dumps(request["messages"])
-            terminal = json.loads(row["terminal_json"])
+            terminal_json = row["terminal_json"]
+            assert terminal_json is not None
+            terminal = json.loads(terminal_json)
             assert terminal["response"]["completion"] == COMPLETION_CANARY
-            deltas = [
-                json.loads(event["payload_json"])["delta"]
-                for event in loaded["events"]
-            ]
+            deltas: list[str] = []
+            for event in loaded["events"]:
+                payload_json = event["payload_json"]
+                assert payload_json is not None
+                payload = json.loads(payload_json)
+                delta = payload["delta"]
+                assert isinstance(delta, str)
+                deltas.append(delta)
             assert "".join(deltas) == COMPLETION_CANARY
         finally:
             await runtime.close()
@@ -158,13 +194,17 @@ def test_interruption_yields_explicit_incomplete_with_partial_stream(
         )
         try:
             await _drive(observer, llm, interrupt=True)
+            assert runtime.writer is not None
             await runtime.writer.flush()
             store = runtime.store
+            assert store is not None
             ids = list(store.iter_interaction_ids())
             assert len(ids) == 1
-            loaded = store.load(ids[0])
+            loaded = _loaded(store, ids[0])
             assert loaded["interaction"]["status"] == "incomplete"
-            terminal = json.loads(loaded["interaction"]["terminal_json"])
+            terminal_json = loaded["interaction"]["terminal_json"]
+            assert terminal_json is not None
+            terminal = json.loads(terminal_json)
             assert terminal["reason"] == "barge_in"
             assert len(loaded["events"]) == 1  # partial stream preserved
         finally:
@@ -181,10 +221,14 @@ def test_task_telemetry_kwargs_are_safe(monkeypatch: pytest.MonkeyPatch) -> None
     kwargs = build_task_telemetry(llm, session_id="sess-product-42")
     assert kwargs["enable_tracing"] is False  # owned provider not installed
     assert kwargs["enable_turn_tracking"] is False
-    assert kwargs["conversation_id"].startswith("tele-")
-    assert "sess-product-42" not in kwargs["conversation_id"]
-    assert len(kwargs["observers"]) == 2  # capture + MetricsFrame adapter
-    assert isinstance(kwargs["observers"][0], InteractionCaptureObserver)
+    conversation_id = kwargs["conversation_id"]
+    observers = kwargs["observers"]
+    assert isinstance(conversation_id, str)
+    assert isinstance(observers, list)
+    assert conversation_id.startswith("tele-")
+    assert "sess-product-42" not in conversation_id
+    assert len(observers) == 2  # capture + MetricsFrame adapter
+    assert isinstance(observers[0], InteractionCaptureObserver)
 
 
 def test_sdp_never_appears_in_capture_or_broad(
@@ -204,6 +248,7 @@ def test_sdp_never_appears_in_capture_or_broad(
         )
         try:
             await _drive(observer, llm, interrupt=False)
+            assert runtime.writer is not None
             await runtime.writer.flush()
         finally:
             await runtime.close()

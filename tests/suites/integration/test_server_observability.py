@@ -5,23 +5,35 @@ event. Broad surfaces carry enums/buckets only — never IDs, paths, or content.
 
 from __future__ import annotations
 
+from collections.abc import Callable
+from pathlib import Path
+from typing import cast
+
 import pytest
+
+from tests.type_contracts import HttpTestClient
+from therapy.memory import MemoryStore
+
+type MetricCall = tuple[str, float, dict[str, str]]
+type MetricCalls = list[MetricCall]
 
 
 @pytest.fixture
-def metric_calls(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, float, dict]]:
+def metric_calls(monkeypatch: pytest.MonkeyPatch) -> MetricCalls:
     from therapy.observability import telemetry
 
-    calls: list[tuple[str, float, dict]] = []
-    monkeypatch.setattr(
-        telemetry,
-        "record_metric",
-        lambda name, value, attrs=None: calls.append((name, value, attrs or {})),
-    )
+    calls: MetricCalls = []
+
+    def _record_metric(
+        name: str, value: float, attrs: dict[str, str] | None = None
+    ) -> None:
+        calls.append((name, value, attrs or {}))
+
+    monkeypatch.setattr(telemetry, "record_metric", _record_metric)
     return calls
 
 
-def test_ready_reports_bounded_component_enums(client) -> None:
+def test_ready_reports_bounded_component_enums(client: HttpTestClient) -> None:
     payload = client.get("/ready").json()
     checks = payload["checks"]
 
@@ -39,21 +51,27 @@ def test_ready_reports_bounded_component_enums(client) -> None:
         assert "/" not in value
 
 
-def test_ready_scheduler_check_follows_heartbeat(client, monkeypatch) -> None:
+def test_ready_scheduler_check_follows_heartbeat(
+    client: HttpTestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
     import time
 
     from therapy.dialogue import outreach
 
-    monkeypatch.setitem(outreach._scheduler_heartbeat, "last_tick", time.time())
+    heartbeat = {"value": time.time()}
+    def _last_tick() -> float:
+        return heartbeat["value"]
+
+    monkeypatch.setattr(outreach, "last_scheduler_tick", _last_tick)
     assert client.get("/ready").json()["checks"]["scheduler"] == "ready"
 
-    monkeypatch.setitem(
-        outreach._scheduler_heartbeat, "last_tick", time.time() - 3_600
-    )
+    heartbeat["value"] = time.time() - 3_600
     assert client.get("/ready").json()["checks"]["scheduler"] == "degraded"
 
 
-def test_rejected_offer_counts_bounded_outcome(client, metric_calls) -> None:
+def test_rejected_offer_counts_bounded_outcome(
+    client: HttpTestClient, metric_calls: MetricCalls
+) -> None:
     from therapy.server import app as app_module
 
     app_module.app.dependency_overrides[app_module.get_voice_gateway] = (
@@ -76,7 +94,7 @@ def test_rejected_offer_counts_bounded_outcome(client, metric_calls) -> None:
 
 
 def test_resumable_and_ice_config_emit_finite_signal_outcomes(
-    client, metric_calls
+    client: HttpTestClient, metric_calls: MetricCalls
 ) -> None:
     assert client.get("/api/resumable").status_code == 200
     assert client.get("/api/ice-config").status_code == 200
@@ -89,7 +107,9 @@ def test_resumable_and_ice_config_emit_finite_signal_outcomes(
     assert {"operation": "ice_config", "outcome": "success"} in signals
 
 
-def test_read_routes_record_count_buckets_only(client, metric_calls) -> None:
+def test_read_routes_record_count_buckets_only(
+    client: HttpTestClient, metric_calls: MetricCalls
+) -> None:
     assert client.get("/api/sessions").status_code == 200
     assert client.get("/api/graph").status_code == 200
     assert client.get("/api/research").status_code == 200
@@ -106,7 +126,9 @@ def test_read_routes_record_count_buckets_only(client, metric_calls) -> None:
         assert bucket in ("0", "1-9", "10-99", "100-999", "1000+")
 
 
-def test_missing_turn_audio_counts_missing_outcome(client, metric_calls) -> None:
+def test_missing_turn_audio_counts_missing_outcome(
+    client: HttpTestClient, metric_calls: MetricCalls
+) -> None:
     response = client.get("/api/sessions/nope/turns/1/audio")
     assert response.status_code == 404
     assert (
@@ -117,14 +139,28 @@ def test_missing_turn_audio_counts_missing_outcome(client, metric_calls) -> None
 
 
 def test_turn_audio_records_range_full_and_bytes(
-    client, metric_calls, monkeypatch, tmp_path
+    client: HttpTestClient,
+    metric_calls: MetricCalls,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
     from therapy.server import app as app_mod
 
     wav = tmp_path / "turn.wav"
     wav.write_bytes(b"RIFF" + b"\x00" * 100)
+    store_factory_value = getattr(app_mod, "_store", None)
+    if not callable(store_factory_value):
+        raise TypeError("server store factory is unavailable")
+    store_factory = cast(Callable[[], MemoryStore], store_factory_value)
+
+    def _turn_audio_path(
+        store: MemoryStore, session_id: str, turn_id: int
+    ) -> str:
+        del store, session_id, turn_id
+        return str(wav)
+
     monkeypatch.setattr(
-        type(app_mod._store()), "turn_audio_path", lambda self, s, t: str(wav)
+        type(store_factory()), "turn_audio_path", _turn_audio_path
     )
 
     assert client.get("/api/sessions/s/turns/1/audio").status_code == 200
@@ -147,7 +183,9 @@ def test_turn_audio_records_range_full_and_bytes(
     assert byte_values == [104, 104]
 
 
-def test_invalid_crisis_config_emits_fixed_event(client, monkeypatch) -> None:
+def test_invalid_crisis_config_emits_fixed_event(
+    client: HttpTestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
     import io
     import json
     import logging
@@ -170,7 +208,12 @@ def test_invalid_crisis_config_emits_fixed_event(client, monkeypatch) -> None:
     finally:
         logger.handlers = previous_handlers
 
-    events = [json.loads(line) for line in stream.getvalue().splitlines()]
+    from therapy.observability.interactions import require_json_object
+
+    events = [
+        require_json_object(json.loads(line), "test.log.event")
+        for line in stream.getvalue().splitlines()
+    ]
     invalid = [e for e in events if e["event.name"] == "crisis_config_invalid"]
     assert [e["outcome"] for e in invalid] == ["error"]
     # Config validity only: the event must not carry the env value.

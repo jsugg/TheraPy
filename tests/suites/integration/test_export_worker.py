@@ -1,8 +1,12 @@
 """Export worker outage/retry/ACK contract (plan O1.2, O1 gate)."""
 
 import asyncio
+import sqlite3
 from pathlib import Path
 
+import pytest
+
+from tests.type_contracts import MetricCall, metric_recorder
 from therapy.observability.exporters import (
     ExportError,
     ExportWorker,
@@ -16,12 +20,19 @@ from therapy.observability.interactions import (
     Message,
     ProviderNative,
 )
-from therapy.observability.journal import JournalStore
+from therapy.observability.journal import JournalStore, LoadedInteraction
 from therapy.observability.model import (
     InteractionOperation,
     InteractionStatus,
     Provider,
 )
+
+
+def _connection(store: JournalStore) -> sqlite3.Connection:
+    """Return the journal connection for export-state assertions."""
+    connection = getattr(store, "_conn", None)
+    assert isinstance(connection, sqlite3.Connection)
+    return connection
 
 
 def _record(interaction_id: str) -> InteractionRecord:
@@ -62,7 +73,7 @@ class FlakyExporter:
         self.attempts: dict[str, int] = {}
         self.acked: list[str] = []
 
-    async def export(self, interaction: dict) -> str | None:
+    async def export(self, interaction: LoadedInteraction) -> str | None:
         interaction_id = interaction["interaction"]["interaction_id"]
         count = self.attempts.get(interaction_id, 0) + 1
         self.attempts[interaction_id] = count
@@ -75,11 +86,22 @@ class FlakyExporter:
 class RejectingExporter:
     backend_name = "phoenix"
 
-    async def export(self, interaction: dict) -> str | None:
+    async def export(self, interaction: LoadedInteraction) -> str | None:
         raise PermanentExportError("payload rejected")
 
 
-def test_backend_outage_keeps_records_until_ack(tmp_path: Path) -> None:
+def test_backend_outage_keeps_records_until_ack(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from therapy.observability import telemetry
+
+    metrics: list[MetricCall] = []
+    monkeypatch.setattr(
+        telemetry,
+        "record_metric",
+        metric_recorder(metrics),
+    )
+
     async def scenario() -> None:
         store = JournalStore(tmp_path / "journal.sqlite3")
         for index in range(2):
@@ -106,9 +128,41 @@ def test_backend_outage_keeps_records_until_ack(tmp_path: Path) -> None:
         store.close()
 
     asyncio.run(scenario())
+    capture = [item for item in metrics if item[0].startswith("therapy_llm_capture")]
+    durations = [attrs["outcome"] for name, _, attrs in capture if name.endswith("seconds")]
+    assert durations == ["error", "error", "success", "success"]
+    records = [
+        attrs
+        for name, _, attrs in capture
+        if name == "therapy_llm_capture_records_total"
+    ]
+    assert records == [
+        {"operation": "summary", "status": "failed"},
+        {"operation": "summary", "status": "failed"},
+        {"operation": "summary", "status": "exported"},
+        {"operation": "summary", "status": "exported"},
+    ]
+    export_outcomes = [
+        attrs["outcome"]
+        for name, _, attrs in capture
+        if name == "therapy_llm_capture_exports_total"
+    ]
+    assert export_outcomes == ["failure", "failure", "accepted", "accepted"]
+    assert "completion" not in repr(capture)
 
 
-def test_permanent_rejection_is_parked_not_looped(tmp_path: Path) -> None:
+def test_permanent_rejection_is_parked_not_looped(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from therapy.observability import telemetry
+
+    metrics: list[MetricCall] = []
+    monkeypatch.setattr(
+        telemetry,
+        "record_metric",
+        metric_recorder(metrics),
+    )
+
     async def scenario() -> None:
         store = JournalStore(tmp_path / "journal.sqlite3")
         store.start_attempt(_record("itx-perm"))
@@ -118,7 +172,7 @@ def test_permanent_rejection_is_parked_not_looped(tmp_path: Path) -> None:
         # parked far in the future; the record itself is preserved
         assert store.pending_exports("phoenix") == []
         assert store.load("itx-perm") is not None
-        row = store._conn.execute(
+        row = _connection(store).execute(
             "SELECT state, last_error_type FROM interaction_exports "
             "WHERE interaction_id='itx-perm'"
         ).fetchone()
@@ -127,6 +181,12 @@ def test_permanent_rejection_is_parked_not_looped(tmp_path: Path) -> None:
         store.close()
 
     asyncio.run(scenario())
+    assert (
+        "therapy_llm_capture_exports_total",
+        1,
+        {"backend": "phoenix", "outcome": "rejected"},
+    ) in metrics
+    assert "payload rejected" not in repr(metrics)
 
 
 def test_nonterminal_records_are_never_exported(tmp_path: Path) -> None:

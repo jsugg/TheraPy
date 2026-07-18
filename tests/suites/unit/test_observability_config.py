@@ -1,5 +1,7 @@
 """ObservabilityConfig contract (plan §4, O1 test list)."""
 
+from pathlib import Path
+
 import pytest
 
 from therapy.observability.config import (
@@ -33,7 +35,7 @@ def clean_env(monkeypatch: pytest.MonkeyPatch) -> pytest.MonkeyPatch:
     return monkeypatch
 
 
-def test_defaults_match_the_contract_table(clean_env) -> None:
+def test_defaults_match_the_contract_table(clean_env: pytest.MonkeyPatch) -> None:
     config = ObservabilityConfig.from_env()
     assert config.capture_mode is CaptureMode.RUNTIME
     assert config.journal_path.name == "interaction-journal.sqlite3"
@@ -51,19 +53,19 @@ def test_defaults_match_the_contract_table(clean_env) -> None:
     assert config.client_telemetry_enabled is False
 
 
-def test_journal_defaults_under_data_dir(clean_env) -> None:
+def test_journal_defaults_under_data_dir(clean_env: pytest.MonkeyPatch) -> None:
     clean_env.setenv("THERAPY_DATA_DIR", "/data")
     config = ObservabilityConfig.from_env()
     assert str(config.journal_path) == "/data/interaction-journal.sqlite3"
 
 
-def test_journal_must_not_be_a_product_db(clean_env) -> None:
+def test_journal_must_not_be_a_product_db(clean_env: pytest.MonkeyPatch) -> None:
     clean_env.setenv("THERAPY_INTERACTION_JOURNAL", "/data/memory.sqlite3")
     with pytest.raises(ConfigError):
         ObservabilityConfig.from_env()
 
 
-def test_unknown_backend_rejected(clean_env) -> None:
+def test_unknown_backend_rejected(clean_env: pytest.MonkeyPatch) -> None:
     clean_env.setenv("THERAPY_INTERACTION_BACKEND", "kafka")
     with pytest.raises(ConfigError):
         ObservabilityConfig.from_env()
@@ -71,7 +73,9 @@ def test_unknown_backend_rejected(clean_env) -> None:
     assert SUPPORTED_BACKENDS == ("journal", "phoenix")
 
 
-def test_backend_requires_explicit_restricted_endpoint(clean_env) -> None:
+def test_backend_requires_explicit_restricted_endpoint(
+    clean_env: pytest.MonkeyPatch,
+) -> None:
     clean_env.setenv("THERAPY_INTERACTION_BACKEND", "phoenix")
     with pytest.raises(ConfigError):
         ObservabilityConfig.from_env()  # never inferred from the broad endpoint
@@ -96,7 +100,9 @@ def test_backend_requires_explicit_restricted_endpoint(clean_env) -> None:
         ("THERAPY_LOG_LEVEL", "TRACE"),
     ],
 )
-def test_invalid_values_fail_fast(clean_env, name: str, value: str) -> None:
+def test_invalid_values_fail_fast(
+    clean_env: pytest.MonkeyPatch, name: str, value: str
+) -> None:
     clean_env.setenv(name, value)
     with pytest.raises(ConfigError):
         ObservabilityConfig.from_env()
@@ -112,14 +118,14 @@ def test_invalid_values_fail_fast(clean_env, name: str, value: str) -> None:
     ],
 )
 def test_otlp_endpoint_rejects_credentials_query_and_bad_schemes(
-    clean_env, endpoint: str
+    clean_env: pytest.MonkeyPatch, endpoint: str
 ) -> None:
     clean_env.setenv("THERAPY_OTLP_BROAD_ENDPOINT", endpoint)
     with pytest.raises(ConfigError):
         ObservabilityConfig.from_env()
 
 
-def test_error_messages_never_echo_values(clean_env) -> None:
+def test_error_messages_never_echo_values(clean_env: pytest.MonkeyPatch) -> None:
     secret_ish = "http://user:sekrit-token@collector:4318"
     clean_env.setenv("THERAPY_OTLP_BROAD_ENDPOINT", secret_ish)
     with pytest.raises(ConfigError) as excinfo:
@@ -127,7 +133,9 @@ def test_error_messages_never_echo_values(clean_env) -> None:
     assert "sekrit" not in str(excinfo.value)
 
 
-def test_fingerprint_is_deterministic_and_short(clean_env) -> None:
+def test_fingerprint_is_deterministic_and_short(
+    clean_env: pytest.MonkeyPatch,
+) -> None:
     first = ObservabilityConfig.from_env().fingerprint()
     second = ObservabilityConfig.from_env().fingerprint()
     assert first == second
@@ -136,13 +144,17 @@ def test_fingerprint_is_deterministic_and_short(clean_env) -> None:
     assert ObservabilityConfig.from_env().fingerprint() != first
 
 
-def test_restricted_endpoint_never_inferred_from_broad(clean_env) -> None:
+def test_restricted_endpoint_never_inferred_from_broad(
+    clean_env: pytest.MonkeyPatch,
+) -> None:
     clean_env.setenv("THERAPY_OTLP_BROAD_ENDPOINT", "http://collector:4318")
     config = ObservabilityConfig.from_env()
     assert config.otlp_restricted_endpoint is None
 
 
-def test_journal_rejects_the_actual_product_db(clean_env, tmp_path) -> None:
+def test_journal_rejects_the_actual_product_db(
+    clean_env: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
     """Audit F-06: therapy.db (the real product DB) is refused by name and
     by resolved path."""
     clean_env.setenv("THERAPY_DATA_DIR", str(tmp_path))

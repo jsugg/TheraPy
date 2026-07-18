@@ -7,11 +7,31 @@ import threading
 import time
 from pathlib import Path
 from types import ModuleType
+from typing import Protocol, cast
 
 import pytest
 
 import scripts.hostwatch as hostwatch_module
 from scripts.hostwatch import StackWatch, notify_macos, probe, run, write_state
+from tests.type_contracts import FreePort, WaitUntil
+
+
+class _HostwatchArguments(Protocol):
+    notify: str
+
+
+class _ArgumentParser(Protocol):
+    def __call__(self, args: list[str]) -> _HostwatchArguments: ...
+
+
+class _HostwatchLogger(Protocol):
+    def __call__(self, event_name: str, **fields: object) -> None: ...
+
+
+class _RecordBuilder(Protocol):
+    def __call__(
+        self, *, scenario: str, duration_s: float, result: str
+    ) -> dict[str, object]: ...
 
 ALLOWED_LOG_FIELDS = frozenset(
     {
@@ -62,7 +82,7 @@ class _VerifierDependencyStub:
     pass
 
 
-def _stub_verifier_dependencies(monkeypatch) -> None:
+def _stub_verifier_dependencies(monkeypatch: pytest.MonkeyPatch) -> None:
     aiortc = ModuleType("aiortc")
     aiortc.__dict__.update(
         {
@@ -96,11 +116,11 @@ def _stub_verifier_dependencies(monkeypatch) -> None:
         monkeypatch.setitem(sys.modules, name, module)
 
 
-def test_probe_returns_true_for_local_http_200(ok_server) -> None:
+def test_probe_returns_true_for_local_http_200(ok_server: str) -> None:
     assert probe(f"{ok_server}/health", timeout=1.0) is True
 
 
-def test_probe_returns_false_for_closed_port(free_port) -> None:
+def test_probe_returns_false_for_closed_port(free_port: FreePort) -> None:
     port = free_port()
 
     assert probe(f"http://127.0.0.1:{port}/health", timeout=0.2) is False
@@ -193,7 +213,7 @@ def test_recover_restarts_provider_when_daemon_is_wedged() -> None:
     ]
 
 
-def test_watch_forever_recovers_after_max_failures(wait_until) -> None:
+def test_watch_forever_recovers_after_max_failures(wait_until: WaitUntil) -> None:
     probe_count = 0
 
     def fake_prober(_url: str, _timeout: float) -> bool:
@@ -235,7 +255,9 @@ def test_watch_forever_recovers_after_max_failures(wait_until) -> None:
     assert not thread.is_alive()
 
 
-def test_hostwatch_stdout_uses_only_broad_schema_and_hides_commands(capsys) -> None:
+def test_hostwatch_stdout_uses_only_broad_schema_and_hides_commands(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
     command_marker = "full-host-command-must-not-be-logged"
 
     def fake_runner(_cmd: list[str], _timeout: float) -> bool:
@@ -257,7 +279,12 @@ def test_hostwatch_stdout_uses_only_broad_schema_and_hides_commands(capsys) -> N
     assert watcher.recover() == "container"
 
     output = capsys.readouterr().out
-    records = [json.loads(line) for line in output.splitlines()]
+    from therapy.observability.interactions import require_json_object
+
+    records = [
+        require_json_object(json.loads(line), "test.hostwatch.log")
+        for line in output.splitlines()
+    ]
     assert records
     assert command_marker not in output
     assert all(REQUIRED_LOG_FIELDS <= record.keys() for record in records)
@@ -265,13 +292,19 @@ def test_hostwatch_stdout_uses_only_broad_schema_and_hides_commands(capsys) -> N
     assert all(record["component"] == "hostwatch" for record in records)
 
 
-def test_hostwatch_plain_fallback_survives_broken_json(monkeypatch, capsys) -> None:
-    def broken_dumps(*_args, **_kwargs) -> str:
+def test_hostwatch_plain_fallback_survives_broken_json(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    def broken_dumps(*_args: object, **_kwargs: object) -> str:
         raise RuntimeError("broken encoder")
 
     monkeypatch.setattr(hostwatch_module.json, "dumps", broken_dumps)
 
-    hostwatch_module._log(
+    logger_value: object = getattr(hostwatch_module, "_log", None)
+    if not callable(logger_value):
+        raise TypeError("hostwatch logger is unavailable")
+    logger = cast(_HostwatchLogger, logger_value)
+    logger(
         "hostwatch.emitter.failure",
         operation="probe",
         outcome="error",
@@ -290,13 +323,13 @@ def test_hostwatch_state_file_is_owner_only(tmp_path: Path) -> None:
 
 
 def test_hostwatch_state_replace_is_atomic_on_crash(
-    tmp_path: Path, monkeypatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     state_file = tmp_path / "hostwatch.json"
     initial = {"consecutive_failures": 1}
     write_state(state_file, initial)
 
-    def crash_before_replace(_source, _destination) -> None:
+    def crash_before_replace(_source: object, _destination: object) -> None:
         raise OSError("simulated crash")
 
     monkeypatch.setattr(hostwatch_module.os, "replace", crash_before_replace)
@@ -308,7 +341,9 @@ def test_hostwatch_state_replace_is_atomic_on_crash(
     assert list(tmp_path.glob(f".{state_file.name}.*.tmp")) == []
 
 
-def test_macos_notification_is_bounded_and_docker_independent(monkeypatch) -> None:
+def test_macos_notification_is_bounded_and_docker_independent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     calls: list[tuple[list[str], dict[str, object]]] = []
 
     def fake_run(
@@ -327,10 +362,14 @@ def test_macos_notification_is_bounded_and_docker_independent(monkeypatch) -> No
 
 
 def test_hostwatch_notify_cli_accepts_only_none_or_macos() -> None:
-    assert hostwatch_module._parse_args([]).notify == "none"
-    assert hostwatch_module._parse_args(["--notify", "macos"]).notify == "macos"
+    parser_value: object = getattr(hostwatch_module, "_parse_args", None)
+    if not callable(parser_value):
+        raise TypeError("hostwatch argument parser is unavailable")
+    parse_args = cast(_ArgumentParser, parser_value)
+    assert parse_args([]).notify == "none"
+    assert parse_args(["--notify", "macos"]).notify == "macos"
     with pytest.raises(SystemExit):
-        hostwatch_module._parse_args(["--notify", "arbitrary-command"])
+        parse_args(["--notify", "arbitrary-command"])
 
 
 @pytest.mark.parametrize(
@@ -343,13 +382,17 @@ def test_hostwatch_notify_cli_accepts_only_none_or_macos() -> None:
     ],
 )
 def test_verification_script_record_builder(
-    module_name: str, scenario: str, monkeypatch
+    module_name: str, scenario: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     _stub_verifier_dependencies(monkeypatch)
     monkeypatch.delitem(sys.modules, module_name, raising=False)
     module = importlib.import_module(module_name)
 
-    record = module.build_verification_record(
+    builder_value: object = getattr(module, "build_verification_record", None)
+    if not callable(builder_value):
+        raise TypeError("verification record builder is unavailable")
+    builder = cast(_RecordBuilder, builder_value)
+    record = builder(
         scenario=scenario,
         duration_s=1.25,
         result="pass",

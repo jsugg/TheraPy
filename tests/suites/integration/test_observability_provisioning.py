@@ -8,6 +8,7 @@ from importlib import import_module
 from pathlib import Path
 from typing import Protocol, TextIO, cast
 
+from therapy.observability.interactions import JsonValue, require_json_object
 from therapy.observability.metrics import INSTRUMENTS, InstrumentKind
 
 ROOT = Path(__file__).resolve().parents[3]
@@ -64,12 +65,13 @@ def _assert_known_metrics(expr: str, *, context: str) -> None:
     assert not unknown, f"{context} references unknown metrics: {sorted(unknown)}"
 
 
-def _load_mapping(path: Path) -> dict[str, object]:
+def _load_mapping(path: Path) -> dict[str, JsonValue]:
     """Load a JSON or YAML document and validate its object boundary."""
     with path.open(encoding="utf-8") as stream:
-        payload = json.load(stream) if path.suffix == ".json" else YAML.safe_load(stream)
-    assert isinstance(payload, dict), f"{path} must contain a mapping"
-    return payload
+        payload: object = (
+            json.load(stream) if path.suffix == ".json" else YAML.safe_load(stream)
+        )
+    return require_json_object(payload, str(path))
 
 
 def test_dashboard_promql_uses_declared_or_external_metrics() -> None:

@@ -5,7 +5,9 @@ from __future__ import annotations
 from pathlib import Path
 
 import numpy as np
+import pytest
 
+from tests.type_contracts import MetricCall, metric_recorder
 from therapy.knowledge.context import (
     MEMORY_MARKER,
     ContextAssembler,
@@ -68,6 +70,86 @@ def _assembler(tmp_path: Path) -> tuple[ContextAssembler, UserModel, MemoryStore
         ),
     )
     return assembler, model, store
+
+
+def test_context_budget_clipping_records_bounded_source_only(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from therapy.observability import telemetry
+
+    store = MemoryStore(tmp_path)
+    model = UserModel(tmp_path)
+    assembler = ContextAssembler(
+        model,
+        store,
+        embedder=SemanticTestEmbedder(),
+        budget=ContextBudget(max_tokens=100, node_threshold=0.0),
+    )
+    model.add_user_statement("pattern", "Sleep " + "planning " * 120)
+    calls: list[MetricCall] = []
+    monkeypatch.setattr(
+        telemetry,
+        "record_metric",
+        metric_recorder(calls),
+    )
+
+    result = assembler.assemble("sleep planning", "synthetic-session")
+
+    assert result["note"] is not None
+    assert result["note"].endswith("[Context clipped to token budget]")
+    truncations = [
+        attrs
+        for name, value, attrs in calls
+        if name == "therapy_context_truncations_total" and value == 1
+    ]
+    assert truncations == [{"source": "graph"}]
+    stages = {
+        attrs["stage"]
+        for name, _, attrs in calls
+        if name == "therapy_context_stage_seconds" and attrs["outcome"] == "success"
+    }
+    assert stages == {"graph", "episode", "insight", "research", "embed"}
+    selected_sources = {
+        attrs["source"]
+        for name, _, attrs in calls
+        if name == "therapy_context_selected_items"
+    }
+    assert selected_sources == {"graph", "edge", "episode", "insight", "research"}
+    assert any(name == "therapy_context_rendered_chars" for name, _, _ in calls)
+    assert "planning" not in repr(truncations)
+
+
+def test_context_stage_failure_is_bounded_and_content_free(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from therapy.observability import telemetry
+
+    assembler, _, _ = _assembler(tmp_path)
+    calls: list[MetricCall] = []
+    monkeypatch.setattr(
+        telemetry,
+        "record_metric",
+        metric_recorder(calls),
+    )
+
+    def fail_query(_text: str) -> np.ndarray:
+        raise RuntimeError("private-context-stage-canary")
+
+    monkeypatch.setattr(assembler.embedder, "embed_query", fail_query)
+    with pytest.raises(RuntimeError, match="private-context-stage"):
+        assembler.assemble("private-topic-canary", "private-session-canary")
+
+    assert any(
+        name == "therapy_context_stage_seconds"
+        and attrs == {"stage": "embed", "outcome": "error"}
+        for name, _, attrs in calls
+    )
+    assert any(
+        name == "therapy_context_assembly_seconds"
+        and attrs == {"outcome": "error"}
+        for name, _, attrs in calls
+    )
+    assert "private-" not in repr(calls)
 
 
 def test_portuguese_topic_retrieves_english_graph_and_relevant_episode(
@@ -155,11 +237,15 @@ def test_semantic_adjacency_delivers_insight_then_confirmation_refreshes_graph(
 
     proposed = assembler.assemble("Tenho problemas com o almoço.", "current")
     assert proposed["insight"] is not None
-    assert "Does that feel accurate" in proposed["note"]
+    proposed_note = proposed["note"]
+    assert proposed_note is not None
+    assert "Does that feel accurate" in proposed_note
 
     confirmed = assembler.assemble("Sim", "current")
     assert confirmed["insight"] is None
-    assert model.get_node(node_id)["status"] == "confirmed"
+    node = model.get_node(node_id)
+    assert node is not None
+    assert node["status"] == "confirmed"
 
 
 def test_context_replacement_keeps_one_bounded_memory_block() -> None:
@@ -192,6 +278,8 @@ def test_per_turn_context_silently_includes_relevant_curated_technique(
 
     turn = assembler.assemble("Uma lista ajudaria no planejamento", "current")
 
+    note = turn["note"]
+    assert note is not None
     assert "visible checklist" in turn["research"]
     assert "UNTRUSTED REFERENCE MATERIAL" in turn["research"]
-    assert "Silent technique grounding" in turn["note"]
+    assert "Silent technique grounding" in note

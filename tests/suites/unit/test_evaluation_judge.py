@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 from pathlib import Path
 
 import pytest
@@ -62,8 +63,8 @@ def test_majority_pass_reports_sampled_uncertainty() -> None:
 
     assert result["verdict"] == "pass"
     assert result["majority_verdict"] == "pass"
-    assert result["agreement_ratio"] == pytest.approx(2 / 3)
-    assert result["uncertainty"] == pytest.approx(1 / 3)
+    assert math.isclose(result["agreement_ratio"], 2 / 3)
+    assert math.isclose(result["uncertainty"], 1 / 3)
     assert completion.temperatures == [JUDGE_TEMPERATURE] * 3
     assert "validate without rushing to solutions" in completion.prompts[0]
     assert "dismiss the user" in completion.prompts[0]
@@ -81,8 +82,8 @@ def test_no_majority_is_uncertain() -> None:
     result = judge_case(_case(), "Ambiguous response.", completion=completion)
 
     assert result["verdict"] == "uncertain"
-    assert result["agreement_ratio"] == pytest.approx(1 / 3)
-    assert result["uncertainty"] == pytest.approx(2 / 3)
+    assert math.isclose(result["agreement_ratio"], 1 / 3)
+    assert math.isclose(result["uncertainty"], 2 / 3)
     assert result["human_review_required"] is True
 
 

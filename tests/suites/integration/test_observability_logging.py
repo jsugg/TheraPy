@@ -9,6 +9,7 @@ import io
 import json
 import logging
 from collections.abc import Iterator
+from typing import cast
 
 import pytest
 
@@ -27,9 +28,11 @@ ALLOWED_KEYS = {
     "duration_ms", "error.type", "retry_count", "count", "stack",
 }
 
+type LogCapture = tuple[io.StringIO, logging.Logger]
+
 
 @pytest.fixture
-def capture() -> Iterator[tuple[io.StringIO, logging.Logger]]:
+def capture() -> Iterator[LogCapture]:
     stream = io.StringIO()
     handler = logging.StreamHandler(stream)
     handler.setFormatter(
@@ -43,11 +46,19 @@ def capture() -> Iterator[tuple[io.StringIO, logging.Logger]]:
     logger.handlers = []
 
 
-def _lines(stream: io.StringIO) -> list[dict]:
-    return [json.loads(line) for line in stream.getvalue().splitlines()]
+def _lines(stream: io.StringIO) -> list[dict[str, object]]:
+    from therapy.observability.interactions import require_json_object
+
+    return [
+        cast(
+            dict[str, object],
+            require_json_object(json.loads(line), "test.log.event"),
+        )
+        for line in stream.getvalue().splitlines()
+    ]
 
 
-def test_events_are_single_line_fixed_schema_json(capture) -> None:
+def test_events_are_single_line_fixed_schema_json(capture: LogCapture) -> None:
     stream, _ = capture
     emit_event(
         "voice.connect",
@@ -65,10 +76,14 @@ def test_events_are_single_line_fixed_schema_json(capture) -> None:
     assert event["duration_ms"] == 12.346
     assert set(event) <= ALLOWED_KEYS
     assert event["deployment.environment"] == "test"
-    assert len(event["service.instance.id"]) == 32
+    instance_id = event["service.instance.id"]
+    assert isinstance(instance_id, str)
+    assert len(instance_id) == 32
 
 
-def test_provider_exception_message_never_reaches_broad_output(capture) -> None:
+def test_provider_exception_message_never_reaches_broad_output(
+    capture: LogCapture,
+) -> None:
     stream, _ = capture
     secret = "sk-super-secret-token in the provider error"
     exc = RuntimeError(secret)
@@ -89,7 +104,9 @@ def test_provider_exception_message_never_reaches_broad_output(capture) -> None:
     assert "stack" not in event  # stacks are for unexpected owned failures
 
 
-def test_owned_failure_gets_filtered_package_relative_stack(capture) -> None:
+def test_owned_failure_gets_filtered_package_relative_stack(
+    capture: LogCapture,
+) -> None:
     stream, _ = capture
 
     def _boom() -> None:
@@ -109,8 +126,11 @@ def test_owned_failure_gets_filtered_package_relative_stack(capture) -> None:
         )
     event = _lines(stream)[0]
     assert event["error.type"] == "ValueError"
-    assert event["stack"], "owned failure must carry a stack"
-    joined = " ".join(event["stack"])
+    stack = event["stack"]
+    assert isinstance(stack, list)
+    raw_stack = cast(list[object], stack)
+    assert all(isinstance(item, str) for item in raw_stack)
+    joined = " ".join(cast(list[str], raw_stack))
     assert "secrets" not in joined  # no message text
     assert "/Users/" not in joined  # package-relative paths only
     assert "_boom" in joined

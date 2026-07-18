@@ -74,7 +74,7 @@
     "send_initial_empty_metrics",
     "start_metadata"
   ],
-  "pipeline_task_parameters": [
+  "pipeline_worker_parameters": [
     "active",
     "additional_span_attributes",
     "app_resources",

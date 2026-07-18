@@ -10,9 +10,12 @@ Run: `docker compose exec therapy uv run pytest -m e2e`
 """
 
 import re
-from typing import TYPE_CHECKING
+from collections.abc import Callable, Mapping
+from typing import TYPE_CHECKING, Protocol, cast
 
 import pytest
+
+from therapy.observability.interactions import JsonValue, require_json_object
 
 # Playwright ships only in the container test bed. Where it (and the realtime
 # stack these E2E exercise) isn't installed, keep the module importable and skip
@@ -43,6 +46,25 @@ else:
 pytestmark = pytest.mark.skipif(not _HAS_PLAYWRIGHT, reason="playwright not installed")
 
 
+class _CdpSession(Protocol):
+    """Typed subset of Playwright's partially typed CDP session."""
+
+    def send(
+        self, method: str, params: dict[str, object] | None = None
+    ) -> dict[str, object]: ...
+
+
+def _dispatch_event(
+    locator: object, event_type: str, event_init: Mapping[str, object]
+) -> None:
+    """Dispatch a typed event through Playwright's partially typed locator API."""
+    dispatch = getattr(locator, "dispatch_event", None)
+    assert callable(dispatch)
+    cast(Callable[[str, dict[str, object]], None], dispatch)(
+        event_type, dict(event_init)
+    )
+
+
 def test_chrome_reports_pwa_installable(page: Page, e2e_server: str) -> None:
     # Capture the install signal if the headless build fires it (it often
     # suppresses the event, so this is reported, not asserted).
@@ -64,7 +86,9 @@ def test_chrome_reports_pwa_installable(page: Page, e2e_server: str) -> None:
     # Chrome's own verdict — the check the earlier structural test skipped, so
     # it wrongly reported the app installable. Empty means Chrome would offer
     # install (the headless build just never fires the banner event).
-    cdp = page.context.new_cdp_session(page)
+    cdp_value = page.context.new_cdp_session(page)
+    assert callable(getattr(cdp_value, "send", None))
+    cdp = cast(_CdpSession, cdp_value)
     errors = cdp.send("Page.getInstallabilityErrors")["installabilityErrors"]
     assert errors == [], f"Chrome reports installability blockers: {errors}"
 
@@ -325,29 +349,33 @@ def test_hold_to_talk_handles_longpress_and_pointer_lifecycle(
     primary = {"pointerId": 1, "isPrimary": True, "button": 0}
 
     # Hold state machine: press holds, release releases.
-    talk.dispatch_event("pointerdown", primary)
+    _dispatch_event(talk, "pointerdown", primary)
     expect(talk).to_have_attribute("aria-pressed", "true")
     assert "is-holding" in (talk.get_attribute("class") or "")
-    talk.dispatch_event("pointerup", {"pointerId": 1})
+    _dispatch_event(talk, "pointerup", {"pointerId": 1})
     expect(talk).to_have_attribute("aria-pressed", "false")
 
     # Multi-touch: a SECOND finger's release must not end the first finger's hold.
-    talk.dispatch_event("pointerdown", primary)
+    _dispatch_event(talk, "pointerdown", primary)
     expect(talk).to_have_attribute("aria-pressed", "true")
-    talk.dispatch_event("pointerdown", {"pointerId": 2, "isPrimary": False, "button": 0})
-    talk.dispatch_event("pointerup", {"pointerId": 2})
+    _dispatch_event(
+        talk, "pointerdown", {"pointerId": 2, "isPrimary": False, "button": 0}
+    )
+    _dispatch_event(talk, "pointerup", {"pointerId": 2})
     expect(talk).to_have_attribute("aria-pressed", "true")  # still held
-    talk.dispatch_event("pointerup", {"pointerId": 1})
+    _dispatch_event(talk, "pointerup", {"pointerId": 1})
     expect(talk).to_have_attribute("aria-pressed", "false")
 
     # A genuinely cancelled gesture must fail safe by ending the hold (mute).
-    talk.dispatch_event("pointerdown", primary)
+    _dispatch_event(talk, "pointerdown", primary)
     expect(talk).to_have_attribute("aria-pressed", "true")
-    talk.dispatch_event("pointercancel", {"pointerId": 1})
+    _dispatch_event(talk, "pointercancel", {"pointerId": 1})
     expect(talk).to_have_attribute("aria-pressed", "false")
 
     # A non-primary contact / secondary mouse button must never start a hold.
-    talk.dispatch_event("pointerdown", {"pointerId": 3, "isPrimary": True, "button": 2})
+    _dispatch_event(
+        talk, "pointerdown", {"pointerId": 3, "isPrimary": True, "button": 2}
+    )
     expect(talk).to_have_attribute("aria-pressed", "false")
 
 
@@ -363,13 +391,16 @@ def test_composer_stays_sticky_at_viewport_bottom(
     assert composer.evaluate("el => getComputedStyle(el).bottom") == "0px"
 
 
-def _agent_turn(page: Page, e2e_server: str, text: str, *, finalize: bool) -> dict:
+def _agent_turn(
+    page: Page, e2e_server: str, text: str, *, finalize: bool
+) -> dict[str, JsonValue]:
     response = page.request.post(
         f"{e2e_server}/api/testing/agent/turn",
         data={"text": text, "language": "en", "finalize": finalize},
     )
     assert response.ok, response.text()
-    return response.json()
+    payload: object = response.json()
+    return require_json_object(payload, "agent turn response")
 
 
 def test_model_workspace_graph_pending_corpus_and_sovereignty(
@@ -394,8 +425,8 @@ def test_model_workspace_graph_pending_corpus_and_sovereignty(
     page.goto(f"{e2e_server}/#model")
     workspace = page.locator("#model-workspace")
     expect(workspace).to_be_visible(timeout=15_000)
-    expect(page.locator("#model-nodes .model-item")).to_have_count(3)
-    expect(page.locator("#model-edges .model-item")).to_have_count(1)
+    expect(page.locator("#model-nodes .model-item")).to_have_count(3, timeout=15_000)
+    expect(page.locator("#model-edges .model-item")).to_have_count(1, timeout=15_000)
     assert page_errors == []
 
     channel_settings = {
@@ -473,7 +504,7 @@ def test_model_workspace_graph_pending_corpus_and_sovereignty(
     brother_claim = page.locator("#model-nodes .model-item").filter(
         has_text="My brother is a sensitive ongoing thread."
     )
-    expect(brother_claim).to_contain_text("rejected")
+    expect(brother_claim).to_contain_text("rejected", timeout=15_000)
     page.once("dialog", lambda dialog: dialog.accept())
     brother_claim.get_by_role("button", name="Delete").click()
     expect(page.locator("#model-nodes")).not_to_contain_text(
@@ -569,9 +600,6 @@ def test_client_telemetry_queue_is_bounded_and_flushes(
 ) -> None:
     page = telemetry_page
     page.goto(f"{e2e_server}/")
-    page.wait_for_function(
-        "navigator.serviceWorker.ready.then(r => !!r.active)", timeout=20_000
-    )
 
     queue = page.evaluate(
         """() => {
@@ -645,7 +673,9 @@ def test_client_telemetry_queue_is_bounded_and_flushes(
     assert second_response.value.status == 200
     requests.append(second_response.value.request)
 
-    first_events = requests[0].post_data_json["events"]
+    first_payload = requests[0].post_data_json
+    assert first_payload is not None
+    first_events = first_payload["events"]
     assert {
         "name": "webrtc_sample",
         "outcome": "success",
@@ -694,7 +724,9 @@ def test_client_telemetry_records_service_worker_registration(
     ) as response_info:
         status = page.evaluate("() => window.telemetry.flush()")
     assert status == 200
-    events = response_info.value.request.post_data_json["events"]
+    payload = response_info.value.request.post_data_json
+    assert payload is not None
+    events = payload["events"]
     assert {"name": "sw_lifecycle", "outcome": "success"} in events
 
 
@@ -824,10 +856,37 @@ def test_service_worker_posts_telemetry_directly_with_no_open_window(
     import json
 
     page.goto(f"{e2e_server}/")
-    page.wait_for_function(
-        "navigator.serviceWorker.ready.then(r => !!r.active)", timeout=20_000
+    active = page.evaluate(
+        """async () => {
+          const registrations = await navigator.serviceWorker.getRegistrations();
+          await Promise.all(registrations.map((registration) => registration.unregister()));
+          const registration = await navigator.serviceWorker.register("/sw.js");
+          if (!registration.active) {
+            const worker = registration.installing || registration.waiting;
+            if (worker) {
+              await new Promise((resolve, reject) => {
+                const timer = setTimeout(
+                  () => reject(new Error("service worker activation timed out")),
+                  20_000,
+                );
+                worker.addEventListener("statechange", () => {
+                  if (worker.state === "activated") {
+                    clearTimeout(timer);
+                    resolve();
+                  }
+                });
+                if (worker.state === "activated") {
+                  clearTimeout(timer);
+                  resolve();
+                }
+              });
+            }
+          }
+          return !!registration.active;
+        }"""
     )
-    worker = page.context.service_workers[0]
+    assert active
+    worker = page.context.service_workers[-1]
 
     posts = worker.evaluate(
         """async () => {

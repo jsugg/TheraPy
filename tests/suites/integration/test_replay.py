@@ -39,8 +39,9 @@ _FIXTURE = Path("tests/fixtures/observability/interactions/ollama_success.json")
 
 def _object(value: object, label: str) -> dict[str, object]:
     assert isinstance(value, dict), f"{label} must be an object"
-    assert all(isinstance(key, str) for key in value), label
-    return cast(dict[str, object], value)
+    mapping = cast(dict[object, object], value)
+    assert all(isinstance(key, str) for key in mapping), label
+    return cast(dict[str, object], mapping)
 
 
 def _json_object(value: object, label: str) -> dict[str, JsonValue]:

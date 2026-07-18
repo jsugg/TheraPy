@@ -11,11 +11,11 @@ import pytest
 from fastapi import HTTPException
 
 from therapy.integrations.pipecat.runtime import (
+    Connection,
     PipecatVoiceGateway,
     PipelineRunner,
-    _Connection,
-    _load_pipecat,
-    _VendorRequest,
+    VendorRequest,
+    load_pipecat,
 )
 from therapy.voice.contracts import (
     ConnectionConflict,
@@ -40,8 +40,10 @@ class FakeConnection:
 class FakeRequestHandler:
     """Mimic Pipecat's new-connection and renegotiation callback behavior."""
 
-    requests: list[WebRTCOffer] = field(default_factory=list)
-    connections: dict[str, FakeConnection] = field(default_factory=dict)
+    requests: list[WebRTCOffer] = field(default_factory=list[WebRTCOffer])
+    connections: dict[str, FakeConnection] = field(
+        default_factory=dict[str, FakeConnection]
+    )
     callback_count: int = 0
     closed: bool = False
     failure: HTTPException | None = None
@@ -49,7 +51,7 @@ class FakeRequestHandler:
 
     async def handle_web_request(
         self,
-        request: _VendorRequest,
+        request: VendorRequest,
         webrtc_connection_callback: Callable[[object], Awaitable[None]],
     ) -> dict[str, object] | None:
         offer = request
@@ -98,9 +100,18 @@ def make_gateway(
     )
 
 
+def _active_pipeline_task(
+    gateway: PipecatVoiceGateway,
+) -> asyncio.Task[None] | None:
+    """Inspect the adapter's task lifecycle without untyped private access."""
+    task = getattr(gateway, "_pipeline_task", None)
+    assert task is None or isinstance(task, asyncio.Task)
+    return cast(asyncio.Task[None] | None, task)
+
+
 def test_real_pipecat_factory_maps_fields_redacts_and_suppresses_logs() -> None:
     try:
-        handler, request_factory = _load_pipecat()
+        handler, request_factory = load_pipecat()
     except ModuleNotFoundError:
         pytest.skip("Pipecat realtime stack is not installed")
         return
@@ -146,9 +157,9 @@ def test_adapter_maps_owned_offer_and_answer_without_leaking_vendor_objects() ->
     async def scenario() -> None:
         handler = FakeRequestHandler()
         stop = asyncio.Event()
-        seen: list[tuple[_Connection, SessionTarget]] = []
+        seen: list[tuple[Connection, SessionTarget]] = []
 
-        async def run_pipeline(connection: _Connection, target: SessionTarget) -> None:
+        async def run_pipeline(connection: Connection, target: SessionTarget) -> None:
             seen.append((connection, target))
             await stop.wait()
 
@@ -181,7 +192,7 @@ def test_disconnect_only_stops_matching_peer_and_gateway_remains_reusable() -> N
         handler = FakeRequestHandler()
         stopped = asyncio.Event()
 
-        async def run_pipeline(connection: _Connection, target: SessionTarget) -> None:
+        async def run_pipeline(connection: Connection, target: SessionTarget) -> None:
             del connection, target
             try:
                 await asyncio.Event().wait()
@@ -210,7 +221,7 @@ def test_renegotiation_does_not_launch_duplicate_pipeline() -> None:
         stop = asyncio.Event()
         starts = 0
 
-        async def run_pipeline(connection: _Connection, target: SessionTarget) -> None:
+        async def run_pipeline(connection: Connection, target: SessionTarget) -> None:
             nonlocal starts
             starts += 1
             await stop.wait()
@@ -237,7 +248,7 @@ def test_preemption_drains_old_pipeline_before_starting_replacement() -> None:
         order: list[str] = []
         hold = asyncio.Event()
 
-        async def run_pipeline(connection: _Connection, target: SessionTarget) -> None:
+        async def run_pipeline(connection: Connection, target: SessionTarget) -> None:
             order.append(f"start:{connection.pc_id}")
             try:
                 await hold.wait()
@@ -266,7 +277,7 @@ def test_preemption_timeout_refuses_overlap_and_disconnects_new_peer() -> None:
         starts = 0
 
         async def stubborn_pipeline(
-            connection: _Connection, target: SessionTarget
+            connection: Connection, target: SessionTarget
         ) -> None:
             nonlocal starts
             starts += 1
@@ -296,7 +307,7 @@ def test_startup_failure_is_detected_despite_handler_swallowing_callback() -> No
         handler = FakeRequestHandler()
 
         async def broken_pipeline(
-            connection: _Connection, target: SessionTarget
+            connection: Connection, target: SessionTarget
         ) -> None:
             raise RuntimeError("sensitive provider detail")
 
@@ -322,7 +333,7 @@ def test_background_failure_is_observed_without_logging_failure_content(
         handler = FakeRequestHandler()
         fail = asyncio.Event()
 
-        async def broken_later(connection: _Connection, target: SessionTarget) -> None:
+        async def broken_later(connection: Connection, target: SessionTarget) -> None:
             await fail.wait()
             raise RuntimeError("private transcript text")
 
@@ -335,7 +346,7 @@ def test_background_failure_is_observed_without_logging_failure_content(
         await asyncio.sleep(0)
         await asyncio.sleep(0)
 
-        assert gateway._pipeline_task is None
+        assert _active_pipeline_task(gateway) is None
         await gateway.close()
 
     with caplog.at_level(logging.ERROR):
@@ -347,7 +358,7 @@ def test_background_failure_is_observed_without_logging_failure_content(
 
 
 def test_handler_conflict_and_invalid_answer_are_translated() -> None:
-    async def idle_pipeline(connection: _Connection, target: SessionTarget) -> None:
+    async def idle_pipeline(connection: Connection, target: SessionTarget) -> None:
         await asyncio.Event().wait()
 
     async def scenario() -> None:
@@ -379,7 +390,7 @@ def test_close_is_idempotent_drains_pipeline_and_rejects_new_offers() -> None:
         handler = FakeRequestHandler()
         cancelled = asyncio.Event()
 
-        async def run_pipeline(connection: _Connection, target: SessionTarget) -> None:
+        async def run_pipeline(connection: Connection, target: SessionTarget) -> None:
             try:
                 await asyncio.Event().wait()
             except asyncio.CancelledError:
@@ -397,7 +408,7 @@ def test_close_is_idempotent_drains_pipeline_and_rejects_new_offers() -> None:
 
         assert cancelled.is_set()
         assert handler.closed is True
-        assert gateway._pipeline_task is None
+        assert _active_pipeline_task(gateway) is None
         assert all(
             connection.disconnected for connection in handler.connections.values()
         )

@@ -1,10 +1,13 @@
 from pathlib import Path
 
+from tests.type_contracts import HttpTestClient
 from therapy.memory import MemoryStore
-from therapy.server.app import _resolve_session
+from therapy.server.app import resolve_session
 
 
-def test_sessions_returns_seeded_session_with_turn_count(data_dir: Path, client) -> None:
+def test_sessions_returns_seeded_session_with_turn_count(
+    data_dir: Path, client: HttpTestClient
+) -> None:
     store = MemoryStore(data_dir)
     session_id = store.create_session()
     store.add_turn(session_id, "user", "text", "en", "I felt calm.")
@@ -23,7 +26,9 @@ def test_sessions_returns_seeded_session_with_turn_count(data_dir: Path, client)
     assert session["turn_count"] == 2
 
 
-def test_session_detail_returns_turns_in_order(data_dir: Path, client) -> None:
+def test_session_detail_returns_turns_in_order(
+    data_dir: Path, client: HttpTestClient
+) -> None:
     store = MemoryStore(data_dir)
     session_id = store.create_session()
     first_turn_id = store.add_turn(
@@ -56,14 +61,16 @@ def test_session_detail_returns_turns_in_order(data_dir: Path, client) -> None:
     ]
 
 
-def test_session_detail_returns_404_for_unknown_id(client) -> None:
+def test_session_detail_returns_404_for_unknown_id(client: HttpTestClient) -> None:
     response = client.get("/api/sessions/unknown")
 
     assert response.status_code == 404
     assert response.json() == {"detail": "Session not found"}
 
 
-def test_session_detail_flags_audio_without_leaking_path(data_dir: Path, client) -> None:
+def test_session_detail_flags_audio_without_leaking_path(
+    data_dir: Path, client: HttpTestClient
+) -> None:
     store = MemoryStore(data_dir)
     session_id = store.create_session()
     store.add_turn(
@@ -80,7 +87,9 @@ def test_session_detail_flags_audio_without_leaking_path(data_dir: Path, client)
     assert "audio_path" not in voice_turn
 
 
-def test_turn_audio_endpoint_serves_wav_or_404(data_dir: Path, client) -> None:
+def test_turn_audio_endpoint_serves_wav_or_404(
+    data_dir: Path, client: HttpTestClient
+) -> None:
     store = MemoryStore(data_dir)
     session_id = store.create_session()
     voice_turn = store.add_turn(
@@ -107,7 +116,9 @@ def test_turn_audio_endpoint_serves_wav_or_404(data_dir: Path, client) -> None:
     )
 
 
-def test_delete_session_endpoint_removes_one_session(data_dir: Path, client) -> None:
+def test_delete_session_endpoint_removes_one_session(
+    data_dir: Path, client: HttpTestClient
+) -> None:
     store = MemoryStore(data_dir)
     doomed = store.create_session()
     store.add_turn(doomed, "user", "text", "en", "Erase this.")
@@ -125,7 +136,9 @@ def test_delete_session_endpoint_removes_one_session(data_dir: Path, client) -> 
     assert client.delete("/api/sessions/nope").status_code == 404
 
 
-def test_delete_session_refuses_while_pipeline_is_live(data_dir: Path, client) -> None:
+def test_delete_session_refuses_while_pipeline_is_live(
+    data_dir: Path, client: HttpTestClient
+) -> None:
     from therapy.server import live
 
     store = MemoryStore(data_dir)
@@ -138,7 +151,9 @@ def test_delete_session_refuses_while_pipeline_is_live(data_dir: Path, client) -
     assert store.has_session(session_id)
 
 
-def test_resumable_reflects_the_newest_session_freshness(data_dir: Path, client) -> None:
+def test_resumable_reflects_the_newest_session_freshness(
+    data_dir: Path, client: HttpTestClient
+) -> None:
     assert client.get("/api/resumable").json() == {"session_id": None}
 
     store = MemoryStore(data_dir)
@@ -160,26 +175,26 @@ def test_resolve_session_reports_what_the_connection_joins(tmp_path: Path) -> No
 
     # Default connect resumes the recent session; new_session forces a fresh
     # one even though a resumable session exists.
-    assert _resolve_session(store, new_session=False, explicit=None) == (
+    assert resolve_session(store, new_session=False, explicit=None) == (
         resumable,
         True,
     )
-    assert _resolve_session(store, new_session=True, explicit=None) == (None, False)
+    assert resolve_session(store, new_session=True, explicit=None) == (None, False)
 
     # An explicit id is joined verbatim; an unknown one falls back to fresh.
-    assert _resolve_session(store, new_session=False, explicit=resumable) == (
+    assert resolve_session(store, new_session=False, explicit=resumable) == (
         resumable,
         True,
     )
-    assert _resolve_session(store, new_session=False, explicit="nope") == (None, False)
+    assert resolve_session(store, new_session=False, explicit="nope") == (None, False)
 
 
 def test_resolve_session_fresh_when_nothing_resumable(tmp_path: Path) -> None:
     store = MemoryStore(tmp_path)
-    assert _resolve_session(store, new_session=False, explicit=None) == (None, False)
+    assert resolve_session(store, new_session=False, explicit=None) == (None, False)
 
 
-def test_rename_session_endpoint(data_dir: Path, client) -> None:
+def test_rename_session_endpoint(data_dir: Path, client: HttpTestClient) -> None:
     store = MemoryStore(data_dir)
     session_id = store.create_session()
 

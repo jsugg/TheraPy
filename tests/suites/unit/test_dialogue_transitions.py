@@ -3,23 +3,35 @@ and the raw-audio LLM-boundary guard. Broad values are enums/buckets only."""
 
 from __future__ import annotations
 
+from collections.abc import Coroutine
+from typing import Protocol, cast
+
 import pytest
+
+type MetricCall = tuple[str, float, dict[str, str]]
+type MetricCalls = list[MetricCall]
+
+
+class _RuntimeCompletion(Protocol):
+    def __call__(self, system: object, user: object) -> Coroutine[object, object, str]: ...
 
 
 @pytest.fixture
-def metric_calls(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, float, dict]]:
+def metric_calls(monkeypatch: pytest.MonkeyPatch) -> MetricCalls:
     from therapy.observability import telemetry
 
-    calls: list[tuple[str, float, dict]] = []
-    monkeypatch.setattr(
-        telemetry,
-        "record_metric",
-        lambda name, value, attrs=None: calls.append((name, value, attrs or {})),
-    )
+    calls: MetricCalls = []
+
+    def _record_metric(
+        name: str, value: float, attrs: dict[str, str] | None = None
+    ) -> None:
+        calls.append((name, value, attrs or {}))
+
+    monkeypatch.setattr(telemetry, "record_metric", _record_metric)
     return calls
 
 
-def _transitions(calls: list, kind: str) -> list[str]:
+def _transitions(calls: MetricCalls, kind: str) -> list[str]:
     return [
         attrs["outcome"]
         for name, _, attrs in calls
@@ -27,7 +39,9 @@ def _transitions(calls: list, kind: str) -> list[str]:
     ]
 
 
-def test_reply_language_transitions_only_on_state_change(metric_calls) -> None:
+def test_reply_language_transitions_only_on_state_change(
+    metric_calls: MetricCalls,
+) -> None:
     from therapy.dialogue.language_choice import ReplyLanguage
 
     state = ReplyLanguage()
@@ -44,7 +58,7 @@ def test_reply_language_transitions_only_on_state_change(metric_calls) -> None:
     ]
 
 
-def test_auto_language_change_records_one_transition(metric_calls) -> None:
+def test_auto_language_change_records_one_transition(metric_calls: MetricCalls) -> None:
     from therapy.dialogue.language_choice import ReplyLanguage
 
     state = ReplyLanguage(initial="en", established=True)
@@ -56,7 +70,9 @@ def test_auto_language_change_records_one_transition(metric_calls) -> None:
         assert "es" not in attrs.values()
 
 
-def test_modality_transitions_are_finite_and_change_only(metric_calls) -> None:
+def test_modality_transitions_are_finite_and_change_only(
+    metric_calls: MetricCalls,
+) -> None:
     from therapy.dialogue.modality import TEXT, VOICE, ReplyModality
 
     modality = ReplyModality()
@@ -76,7 +92,9 @@ def test_modality_transitions_are_finite_and_change_only(metric_calls) -> None:
     ]
 
 
-def test_prompt_builds_record_bounded_sections(metric_calls, monkeypatch) -> None:
+def test_prompt_builds_record_bounded_sections(
+    metric_calls: MetricCalls, monkeypatch: pytest.MonkeyPatch
+) -> None:
     monkeypatch.setenv(
         "THERAPY_CRISIS_CONTACTS", '[{"label": "Línea 135", "value": "135"}]'
     )
@@ -101,9 +119,14 @@ def test_prompt_builds_record_bounded_sections(metric_calls, monkeypatch) -> Non
 def test_llm_boundary_rejects_raw_audio_bytes() -> None:
     import asyncio
 
-    from therapy.memory.summarizer import complete
+    from therapy.memory import summarizer
+
+    completion_value: object = summarizer.complete
+    if not callable(completion_value):
+        raise TypeError("completion boundary is unavailable")
+    complete = cast(_RuntimeCompletion, completion_value)
 
     with pytest.raises(TypeError, match="text only"):
-        asyncio.run(complete("system", b"\x00\x01raw-audio"))  # type: ignore[arg-type]
+        asyncio.run(complete("system", b"\x00\x01raw-audio"))
     with pytest.raises(TypeError, match="text only"):
-        asyncio.run(complete(b"raw-audio", "user"))  # type: ignore[arg-type]
+        asyncio.run(complete(b"raw-audio", "user"))

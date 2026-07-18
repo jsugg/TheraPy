@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 
 from therapy.knowledge import insight
-from therapy.knowledge.user_model import UserModel
+from therapy.knowledge.user_model import GraphNode, UserModel
 
 type MetricCall = tuple[str, float, dict[str, str]]
 
@@ -35,6 +35,13 @@ def _proposed_node(model: UserModel, statement: str = "Skips lunch when busy.") 
     assert node_id is not None
     assert model.propose(node_id)
     return node_id
+
+
+def _node(model: UserModel, node_id: int) -> GraphNode:
+    """Return one required graph node for assertions."""
+    node = model.get_node(node_id)
+    assert node is not None
+    return node
 
 
 def test_explicit_model_directory_overrides_process_default(
@@ -90,7 +97,7 @@ def test_queue_records_snapshot_delivery_and_exact_confirmation(
     resolved = service.resolve_conversational("session", "Yes, that fits.")
     assert resolved is not None
     assert resolved["state"] == "confirmed"
-    assert model.get_node(node_id)["status"] == "confirmed"
+    assert _node(model, node_id)["status"] == "confirmed"
     assert [event["event_type"] for event in service.history(resolved["id"])] == [
         "delivered",
         "confirmed",
@@ -124,8 +131,8 @@ def test_rejection_updates_only_claim_just_delivered(
 
     assert resolved is not None
     assert resolved["claim_id"] == first
-    assert model.get_node(first)["status"] == "rejected"
-    assert model.get_node(second)["status"] == "proposed"
+    assert _node(model, first)["status"] == "rejected"
+    assert _node(model, second)["status"] == "proposed"
     assert (
         "therapy_insight_transitions_total",
         1,
@@ -149,10 +156,10 @@ def test_snooze_and_dismiss_preserve_graph_proposal(
 
     assert service.snooze(queued["id"], days=2)
     assert service.list(state="snoozed")[0]["snoozed_until"] is not None
-    assert model.get_node(node_id)["status"] == "proposed"
+    assert _node(model, node_id)["status"] == "proposed"
     assert service.dismiss(queued["id"])
     assert service.list(state="dismissed")[0]["resolved_at"] is not None
-    assert model.get_node(node_id)["status"] == "proposed"
+    assert _node(model, node_id)["status"] == "proposed"
     states = [
         attrs["state"]
         for name, _, attrs in metric_calls

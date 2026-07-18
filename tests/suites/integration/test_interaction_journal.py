@@ -13,18 +13,22 @@ from pathlib import Path
 
 import pytest
 
+from tests.type_contracts import MetricCall, metric_recorder
 from therapy.observability.interactions import (
     InteractionRecord,
     InteractionRequest,
     InteractionResponse,
+    JsonValue,
     Message,
     ProviderNative,
+    require_json_object,
 )
 from therapy.observability.journal import (
     AsyncJournalWriter,
     JournalConflict,
     JournalError,
     JournalStore,
+    LoadedInteraction,
 )
 from therapy.observability.model import (
     InteractionEventKind,
@@ -32,6 +36,13 @@ from therapy.observability.model import (
     InteractionStatus,
     Provider,
 )
+
+
+def _connection(store: JournalStore) -> sqlite3.Connection:
+    """Return the journal connection for intentional corruption tests."""
+    connection = getattr(store, "_conn", None)
+    assert isinstance(connection, sqlite3.Connection)
+    return connection
 
 
 def _record(interaction_id: str = "itx-j-0001") -> InteractionRecord:
@@ -70,8 +81,15 @@ def store(tmp_path: Path) -> Iterator[JournalStore]:
     journal.close()
 
 
+def _loaded(store: JournalStore, interaction_id: str) -> LoadedInteraction:
+    """Load one required journal row for assertions."""
+    loaded = store.load(interaction_id)
+    assert loaded is not None
+    return loaded
+
+
 def test_pragmas_and_schema(store: JournalStore) -> None:
-    conn = store._conn
+    conn = _connection(store)
     assert conn.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
     assert conn.execute("PRAGMA synchronous").fetchone()[0] == 2  # FULL
     assert conn.execute("PRAGMA foreign_keys").fetchone()[0] == 1
@@ -168,15 +186,18 @@ def test_restart_recovery_marks_incomplete_never_success(tmp_path: Path) -> None
         record.interaction_id, 0, InteractionEventKind.STREAM_DELTA, "t0", {"delta": "par"}
     )
     # simulate process death: no terminal write, no clean close
-    first._conn.close()
+    _connection(first).close()
 
     second = JournalStore(path)
     recovered = second.recover()
     assert recovered == 1
     loaded = second.load(record.interaction_id)
+    assert loaded is not None
     assert loaded["interaction"]["status"] == "incomplete"
-    assert "persisted_events=1" in loaded["interaction"]["terminal_json"]
-    assert "last_sequence=0" in loaded["interaction"]["terminal_json"]
+    terminal_json = loaded["interaction"]["terminal_json"]
+    assert terminal_json is not None
+    assert "persisted_events=1" in terminal_json
+    assert "last_sequence=0" in terminal_json
     # partial stream evidence is preserved
     assert [event["sequence"] for event in loaded["events"]] == [0]
     second.close()
@@ -204,7 +225,7 @@ def test_torn_payload_detected_by_checksum(store: JournalStore) -> None:
     store.append_stream_event(
         record.interaction_id, 0, InteractionEventKind.STREAM_DELTA, "t0", {"delta": "x"}
     )
-    store._conn.execute(
+    _connection(store).execute(
         "UPDATE interaction_events SET payload_json='{\"delta\": \"TORN' "
         "WHERE interaction_id=?",
         (record.interaction_id,),
@@ -212,7 +233,7 @@ def test_torn_payload_detected_by_checksum(store: JournalStore) -> None:
     with pytest.raises(ValueError, match="Unterminated string"):
         store.verify_checksums(record.interaction_id)  # torn JSON surfaces
 
-    store._conn.execute(
+    _connection(store).execute(
         "UPDATE interaction_events SET payload_json='{\"delta\": \"tampered\"}' "
         "WHERE interaction_id=?",
         (record.interaction_id,),
@@ -226,7 +247,7 @@ def test_retention_preserves_unacknowledged(store: JournalStore) -> None:
     store.start_attempt(ancient)
     store.finish_success("itx-old", {"completion": "done"})
     # backdate it beyond retention
-    store._conn.execute(
+    _connection(store).execute(
         "UPDATE interactions SET started_at='2020-01-01T00:00:00+00:00' "
         "WHERE interaction_id='itx-old'"
     )
@@ -280,7 +301,7 @@ def test_disk_full_fails_visibly_and_preserves_existing_data(
     store.start_attempt(_record("itx-before-full"))
     store.finish_success("itx-before-full", {"completion": "kept"})
 
-    store._conn.execute("PRAGMA max_page_count=8")  # no room to grow
+    _connection(store).execute("PRAGMA max_page_count=8")  # no room to grow
 
     def _fill() -> None:
         for index in range(64):
@@ -290,7 +311,7 @@ def test_disk_full_fails_visibly_and_preserves_existing_data(
     with pytest.raises(sqlite3.OperationalError, match="full"):
         _fill()
 
-    store._conn.execute("PRAGMA max_page_count=1073741823")
+    _connection(store).execute("PRAGMA max_page_count=1073741823")
     assert store.integrity_check() is True
     loaded = store.load("itx-before-full")
     assert loaded is not None
@@ -308,25 +329,43 @@ def test_checkpoint_and_integrity(store: JournalStore) -> None:
     assert store.health().last_checkpoint_at is not None
 
 
-def test_async_writer_group_commit_and_shutdown(tmp_path: Path) -> None:
+def test_async_writer_group_commit_and_shutdown(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from therapy.observability import telemetry
+
+    metrics: list[MetricCall] = []
+    monkeypatch.setattr(
+        telemetry,
+        "record_metric",
+        metric_recorder(metrics),
+    )
+
     async def scenario() -> None:
         store = JournalStore(tmp_path / "async-journal.sqlite3")
         writer = AsyncJournalWriter(store, queue_size=16, group_commit_ms=20)
         await writer.start()
         record = _record("itx-async-1")
         await writer.start_attempt(record)
-        for sequence in range(10):
-            await writer.append_stream_event(
-                "itx-async-1",
-                sequence,
-                InteractionEventKind.STREAM_DELTA,
-                f"t{sequence}",
-                {"delta": str(sequence)},
+        await asyncio.gather(
+            *(
+                writer.append_stream_event(
+                    "itx-async-1",
+                    sequence,
+                    InteractionEventKind.STREAM_DELTA,
+                    f"t{sequence}",
+                    {"delta": str(sequence)},
+                )
+                for sequence in range(10)
             )
-        await writer.finish_success("itx-async-1", {"completion": "0123456789"})
+        )
+        await writer.finish_success(
+            "itx-async-1", {"completion": "private-group-canary"}
+        )
         await writer.flush()
 
         loaded = store.load("itx-async-1")
+        assert loaded is not None
         assert loaded["interaction"]["status"] == "succeeded"
         assert len(loaded["events"]) == 10
         assert store.verify_checksums("itx-async-1")
@@ -341,6 +380,19 @@ def test_async_writer_group_commit_and_shutdown(tmp_path: Path) -> None:
             await writer.start_attempt(_record("itx-async-2"))
 
     asyncio.run(scenario())
+    commit_outcomes = [
+        attrs["outcome"]
+        for name, _, attrs in metrics
+        if name == "therapy_llm_capture_group_commits_total"
+    ]
+    assert "success" in commit_outcomes
+    assert "error" in commit_outcomes
+    assert any(
+        name == "therapy_llm_capture_group_commit_records" and value > 1
+        for name, value, _ in metrics
+    )
+    assert any(name == "therapy_llm_capture_append_bytes" for name, _, _ in metrics)
+    assert "private-group-canary" not in repr(metrics)
 
 
 def test_kill_during_stream_preserves_prefix(tmp_path: Path) -> None:
@@ -363,13 +415,14 @@ def test_kill_during_stream_preserves_prefix(tmp_path: Path) -> None:
             )
         await writer.flush()
         # hard kill: no terminal write, no close; drop everything on the floor
-        store._conn.close()
+        _connection(store).close()
 
     asyncio.run(first_process())
 
     second = JournalStore(path)
     assert second.recover() == 1
     loaded = second.load("itx-kill-1")
+    assert loaded is not None
     assert loaded["interaction"]["status"] == "incomplete"
     assert len(loaded["events"]) == 4
     second.close()
@@ -394,13 +447,18 @@ def test_exact_reconstruction_and_tamper_detection(store: JournalStore) -> None:
     assert envelope["modality"] == "voice"
     assert envelope["build_version"] == "0.1.0"
     assert envelope["status"] == "succeeded"
-    assert envelope["request"]["system_instructions"] == "sys"
-    assert [e["delta"] for e in envelope["stream"]] == ["he"]
-    assert envelope["terminal"]["kind"] == "success"
+    request = require_json_object(envelope["request"], "replay.request")
+    stream = envelope["stream"]
+    terminal = require_json_object(envelope["terminal"], "replay.terminal")
+    assert isinstance(stream, list)
+    stream_events = [require_json_object(event, "replay.stream") for event in stream]
+    assert request["system_instructions"] == "sys"
+    assert [event["delta"] for event in stream_events] == ["he"]
+    assert terminal["kind"] == "success"
     assert store.verify_checksums("itx-recon")
 
     # tampering with the canonical envelope is now visible
-    store._conn.execute(
+    _connection(store).execute(
         "UPDATE interactions SET canonical_record_json="
         "replace(canonical_record_json, 'sys', 'TAMPERED') "
         "WHERE interaction_id='itx-recon'"
@@ -416,17 +474,17 @@ def test_v1_to_v2_migration_flags_legacy_rows(tmp_path: Path) -> None:
     first.start_attempt(_record("itx-legacy"))
     first.finish_success("itx-legacy", {"completion": "x"})
     # simulate a v1 database: drop the v2 column content and version stamp
-    first._conn.execute(
+    _connection(first).execute(
         "UPDATE interactions SET canonical_record_json='' "
         "WHERE interaction_id='itx-legacy'"
     )
-    first._conn.execute(
+    _connection(first).execute(
         "UPDATE journal_metadata SET value='1' WHERE key='schema_version'"
     )
-    first._conn.close()
+    _connection(first).close()
 
     second = JournalStore(path)
-    version = second._conn.execute(
+    version = _connection(second).execute(
         "SELECT value FROM journal_metadata WHERE key='schema_version'"
     ).fetchone()[0]
     assert version == "2"
@@ -442,7 +500,9 @@ def test_group_commit_is_one_transaction(tmp_path: Path) -> None:
     store.append_stream_event(
         "itx-batch", 0, InteractionEventKind.STREAM_DELTA, "t", {"delta": "a"}
     )
-    items = [
+    items: list[
+        tuple[str, int, InteractionEventKind, str, dict[str, JsonValue]]
+    ] = [
         ("itx-batch", 1, InteractionEventKind.STREAM_DELTA, "t", {"delta": "b"}),
         # sequence 0 with DIFFERENT content: a visible conflict
         ("itx-batch", 0, InteractionEventKind.STREAM_DELTA, "t", {"delta": "X"}),
@@ -450,6 +510,6 @@ def test_group_commit_is_one_transaction(tmp_path: Path) -> None:
     with pytest.raises(JournalConflict):
         store.append_stream_events(items)
     # the whole batch rolled back: sequence 1 was not persisted
-    events = store.load("itx-batch")["events"]
+    events = _loaded(store, "itx-batch")["events"]
     assert [e["sequence"] for e in events] == [0]
     store.close()

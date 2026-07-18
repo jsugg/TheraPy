@@ -16,7 +16,9 @@ def _app_operations() -> set[tuple[str, str, str]]:
     for route in app.routes:
         if not isinstance(route, APIRoute):
             continue  # static mounts and non-API machinery
-        for method in route.methods - {"HEAD", "OPTIONS"}:
+        methods = route.methods
+        assert methods is not None
+        for method in methods - {"HEAD", "OPTIONS"}:
             operations.add((method, route.path, route.name))
     return operations
 

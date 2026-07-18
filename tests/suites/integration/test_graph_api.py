@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING
 import numpy as np
 import pytest
 
+from tests.type_contracts import HttpTestClient
 from therapy.knowledge.embeddings import EmbeddingMetadata
 from therapy.knowledge.research import IngestResult, ResearchKB
 from therapy.knowledge.research_ingest import OCRBackend, OCRBlock
@@ -110,7 +111,7 @@ def _proposed_edge(model: UserModel) -> int:
 
 
 def test_graph_endpoint_filters_and_returns_exact_registries(
-    data_dir: Path, client
+    data_dir: Path, client: HttpTestClient
 ) -> None:
     model = UserModel(data_dir)
     model.add_user_statement("identity_fact", "Is a teacher.")
@@ -127,7 +128,7 @@ def test_graph_endpoint_filters_and_returns_exact_registries(
 
 
 def test_observation_confirmation_conflicts_but_proposal_can_confirm_edit_and_delete(
-    data_dir: Path, client
+    data_dir: Path, client: HttpTestClient
 ) -> None:
     model = UserModel(data_dir)
     observation = model.upsert_node("pattern", "Runs on Tuesdays.")
@@ -153,7 +154,7 @@ def test_observation_confirmation_conflicts_but_proposal_can_confirm_edit_and_de
 
 
 def test_edge_has_equal_edit_confirm_reject_delete_and_audit_api(
-    data_dir: Path, client
+    data_dir: Path, client: HttpTestClient
 ) -> None:
     model = UserModel(data_dir)
     edge_id = _proposed_edge(model)
@@ -174,7 +175,7 @@ def test_edge_has_equal_edit_confirm_reject_delete_and_audit_api(
 
 
 def test_pending_insight_queue_resolves_exact_selected_claim(
-    data_dir: Path, client
+    data_dir: Path, client: HttpTestClient
 ) -> None:
     model = UserModel(data_dir)
     first = _proposed_node(model, "Skips lunch under deadline pressure.")
@@ -185,8 +186,12 @@ def test_pending_insight_queue_resolves_exact_selected_claim(
     response = client.post(f"/api/insights/{selected['id']}/confirm")
 
     assert response.status_code == 200
-    assert model.get_node(second)["status"] == "confirmed"
-    assert model.get_node(first)["status"] == "proposed"
+    second_node = model.get_node(second)
+    first_node = model.get_node(first)
+    assert second_node is not None
+    assert first_node is not None
+    assert second_node["status"] == "confirmed"
+    assert first_node["status"] == "proposed"
     history = client.get(f"/api/insights/{selected['id']}/history").json()["history"]
     assert history[-1]["event_type"] == "confirmed"
 
@@ -201,7 +206,9 @@ def test_pending_insight_queue_resolves_exact_selected_claim(
     ] == "dismissed"
 
 
-def test_boundaries_are_strictly_validated_and_removable(client) -> None:
+def test_boundaries_are_strictly_validated_and_removable(
+    client: HttpTestClient,
+) -> None:
     added = client.post(
         "/api/graph/boundaries", json={"kind": "never_store", "value": "salary"}
     )
@@ -219,7 +226,7 @@ def test_boundaries_are_strictly_validated_and_removable(client) -> None:
 
 
 def test_research_upload_query_preview_reindex_and_delete(
-    data_dir: Path, client, monkeypatch: pytest.MonkeyPatch
+    data_dir: Path, client: HttpTestClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     from therapy.server import app as app_module
 
@@ -243,7 +250,7 @@ def test_research_upload_query_preview_reindex_and_delete(
 
 
 def test_research_api_accepts_full_source_matrix_with_ocr_review_and_citations(
-    data_dir: Path, client, monkeypatch: pytest.MonkeyPatch
+    data_dir: Path, client: HttpTestClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     from therapy.server import app as app_module
 
@@ -311,7 +318,9 @@ def test_research_api_accepts_full_source_matrix_with_ocr_review_and_citations(
     assert corrected.json()["document"]["status"] == "indexed"
 
 
-def test_proactivity_api_defaults_off_and_validates_timezone(client) -> None:
+def test_proactivity_api_defaults_off_and_validates_timezone(
+    client: HttpTestClient,
+) -> None:
     channels = client.get("/api/proactivity").json()["channels"]
     assert [channel["enabled"] for channel in channels] == [False] * 4
     body = {
@@ -330,7 +339,7 @@ def test_proactivity_api_defaults_off_and_validates_timezone(client) -> None:
 
 
 def test_crisis_resources_config_endpoint(
-    client, monkeypatch: pytest.MonkeyPatch
+    client: HttpTestClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setenv(
         "THERAPY_CRISIS_CONTACTS", '[{"label": "Línea 135", "value": "135"}]'
@@ -345,7 +354,9 @@ def test_crisis_resources_config_endpoint(
     assert "invalid JSON" in malformed.json()["detail"]
 
 
-def test_owner_audit_emits_terminal_bounded_outcomes(client) -> None:
+def test_owner_audit_emits_terminal_bounded_outcomes(
+    client: HttpTestClient,
+) -> None:
     """O3 audit: rejected destructive calls must never be audited as success."""
     import io
     import json

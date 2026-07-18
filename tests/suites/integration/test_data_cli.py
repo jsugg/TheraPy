@@ -8,14 +8,15 @@ import logging
 import os
 import shutil
 import sqlite3
-from collections.abc import Iterator
+from collections.abc import Generator, Iterator
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Literal
+from typing import Literal, cast
 
 import numpy as np
 import pytest
 
+from tests.type_contracts import HttpTestClient
 from therapy.data import DataSovereignty
 from therapy.dialogue.outreach import ProactivityService
 from therapy.knowledge.embeddings import EmbeddingMetadata
@@ -81,7 +82,16 @@ def broad_log() -> Iterator[io.StringIO]:
 
 def _broad_events(stream: io.StringIO) -> list[dict[str, object]]:
     """Decode captured broad records."""
-    return [json.loads(line) for line in stream.getvalue().splitlines() if line]
+    from therapy.observability.interactions import require_json_object
+
+    return [
+        cast(
+            dict[str, object],
+            require_json_object(json.loads(line), "test.log.event"),
+        )
+        for line in stream.getvalue().splitlines()
+        if line
+    ]
 
 
 class ExportEmbedder:
@@ -119,7 +129,12 @@ def _seed(data_dir: Path) -> tuple[str, int]:
     model.add_boundary("never_initiate", "private topic")
     research = ResearchKB(data_dir, embedder=ExportEmbedder())
     research.ingest("Journaling paper", "Doe 2025", "Journaling supports planning.")
-    outreach = ProactivityService(data_dir, model=model, push_sender=lambda *_: None)
+    def _discard_push(subscription: dict[str, object], payload: str) -> None:
+        del subscription, payload
+
+    outreach = ProactivityService(
+        data_dir, model=model, push_sender=_discard_push
+    )
     outreach.update_settings(
         "greeting",
         enabled=True,
@@ -195,8 +210,12 @@ def test_cli_restore_round_trip_recovers_rows_audio_keys_and_settings(
 
     store = MemoryStore(tmp_path)
     assert store.sessions()[0]["id"] == session_id
-    assert store.turn_audio_path(session_id, store.session_turns(session_id)[0]["id"])
-    assert UserModel(tmp_path).get_node(node_id)["statement"] == "The user journals."
+    turn_id = store.session_turns(session_id)[0]["id"]
+    assert isinstance(turn_id, int)
+    assert store.turn_audio_path(session_id, turn_id)
+    node = UserModel(tmp_path).get_node(node_id)
+    assert node is not None
+    assert node["statement"] == "The user journals."
     assert ResearchKB(tmp_path, embedder=ExportEmbedder()).documents()[0]["source_ref"] == "Doe 2025"
     assert ProactivityService(tmp_path).vapid.public_key() == vapid_public_key
     greeting = next(
@@ -209,7 +228,16 @@ def test_invalid_restore_is_rejected_before_current_data_changes(tmp_path: Path)
     session_id, _ = _seed(tmp_path)
     service = DataSovereignty(tmp_path)
     snapshot = service.export_snapshot()
-    snapshot["tables"]["nodes"][0]["unknown_column"] = "bad"
+    tables_value = snapshot["tables"]
+    assert isinstance(tables_value, dict)
+    tables = cast(dict[str, object], tables_value)
+    nodes_value = tables["nodes"]
+    assert isinstance(nodes_value, list)
+    nodes = cast(list[object], nodes_value)
+    node_value = nodes[0]
+    assert isinstance(node_value, dict)
+    node = cast(dict[str, object], node_value)
+    node["unknown_column"] = "bad"
 
     with pytest.raises(ValueError, match="invalid columns"):
         service.restore_snapshot(snapshot)
@@ -283,7 +311,7 @@ def test_schema_migration_and_backup_emit_bounded_outcomes(
     @contextmanager
     def capture_span(
         name: str, *, component: str, operation: str
-    ) -> Iterator[_CapturedSpan]:
+    ) -> Generator[_CapturedSpan, None, None]:
         assert component == "schema"
         assert operation in {"migrate", "backup"}
         span = _CapturedSpan()
@@ -307,6 +335,11 @@ def test_schema_migration_and_backup_emit_bounded_outcomes(
     }
     assert migration_outcomes == {"success"}
     assert duration_outcomes == {"success"}
+    assert (
+        "therapy_schema_version",
+        schema.SCHEMA_VERSION,
+        {"component": "knowledge"},
+    ) in metric_calls
     version_attributes = [
         span.attributes
         for name, span in spans
@@ -337,7 +370,7 @@ def test_schema_migration_and_backup_emit_bounded_outcomes(
             )
             """
         )
-        backup = schema._backup_if_needed(legacy_database, connection)
+        backup = schema.backup_if_needed(legacy_database, connection)
 
     assert backup is not None
     assert backup.is_file()
@@ -419,6 +452,12 @@ def test_sovereignty_success_stages_are_complete_and_bounded(
     tmp_path: Path, metric_calls: list[MetricCall]
 ) -> None:
     from therapy import data as data_module
+    from therapy.observability.metrics import INSTRUMENT_INDEX
+
+    declared_stages = set(
+        INSTRUMENT_INDEX["therapy_sovereignty_stages_total"].attributes["stage"]
+    )
+    assert declared_stages == set().union(*data_module.SOVEREIGNTY_STAGES.values())
 
     service = DataSovereignty(tmp_path)
     snapshot = json.loads(service.export_json())
@@ -439,7 +478,7 @@ def test_sovereignty_success_stages_are_complete_and_bounded(
         attrs["stage"]
         for attrs in stage_attrs
         if attrs["operation"] == "delete" and attrs["outcome"] == "success"
-    } == data_module._DELETE_STAGES
+    } == data_module.DELETE_STAGES
     restored_tables = {
         attrs["stage"]
         for attrs in stage_attrs
@@ -447,16 +486,16 @@ def test_sovereignty_success_stages_are_complete_and_bounded(
         and attrs["stage"].startswith("table_")
         and attrs["outcome"] == "success"
     }
-    assert restored_tables == {f"table_{table}" for table in data_module._TABLES}
+    assert restored_tables == {f"table_{table}" for table in data_module.TABLES}
     for attrs in stage_attrs:
         operation = attrs["operation"]
         if operation == "export":
-            allowed_stages = data_module._EXPORT_STAGES
+            allowed_stages = data_module.EXPORT_STAGES
         elif operation == "restore":
-            allowed_stages = data_module._RESTORE_STAGES
+            allowed_stages = data_module.RESTORE_STAGES
         else:
             assert operation == "delete"
-            allowed_stages = data_module._DELETE_STAGES
+            allowed_stages = data_module.DELETE_STAGES
         assert attrs["stage"] in allowed_stages
         assert attrs["outcome"] in {"success", "error", "timeout", "rejected"}
         assert str(tmp_path) not in json.dumps(attrs)
@@ -473,11 +512,15 @@ def test_invalid_snapshot_is_categorized_and_rollback_cleanup_preserves_primary(
     service = DataSovereignty(tmp_path)
     session_id = service.store.create_session()
     snapshot = service.export_snapshot()
-    tables = snapshot["tables"]
-    assert isinstance(tables, dict)
-    sessions = tables["sessions"]
-    assert isinstance(sessions, list)
-    sessions.append(dict(sessions[0]))
+    tables_value = snapshot["tables"]
+    assert isinstance(tables_value, dict)
+    tables = cast(dict[str, object], tables_value)
+    sessions_value = tables["sessions"]
+    assert isinstance(sessions_value, list)
+    sessions = cast(list[object], sessions_value)
+    first_session = sessions[0]
+    assert isinstance(first_session, dict)
+    sessions.append(dict(cast(dict[object, object], first_session)))
     cleanup_canary = "cleanup-secret-message"
     original_rmtree = shutil.rmtree
 
@@ -562,9 +605,25 @@ def test_product_storage_inspection_is_bounded_and_failure_safe(
     monkeypatch: pytest.MonkeyPatch,
     metric_calls: list[MetricCall],
 ) -> None:
+    from therapy.knowledge.insight import InsightService
     from therapy.observability import capture
 
-    (tmp_path / "therapy.db").write_bytes(b"db")
+    model = UserModel(tmp_path)
+    assert model.add_observation(
+        "private-backlog-canary", session_id="private-session-canary"
+    ) is not None
+    claim_id: int | None = None
+    for index in range(3):
+        claim_id = model.upsert_node(
+            "pattern",
+            "private-insight-canary",
+            session_id=f"private-insight-session-{index}",
+            evidence_key=f"private-evidence-{index}",
+        )
+    assert claim_id is not None
+    assert model.propose(claim_id)
+    assert InsightService(model).sync_proposals() == 1
+    db_size = (tmp_path / "therapy.db").stat().st_size
     (tmp_path / "therapy.db-wal").write_bytes(b"wal")
     (tmp_path / "audio" / "nested").mkdir(parents=True)
     (tmp_path / "audio" / "nested" / "turn.wav").write_bytes(b"audio")
@@ -574,8 +633,9 @@ def test_product_storage_inspection_is_bounded_and_failure_safe(
     (tmp_path / "models" / "embeddings" / "model.bin").write_bytes(b"model")
     (tmp_path / "therapy.db.pre-phase4-test.bak").write_bytes(b"backup")
     monkeypatch.setenv("THERAPY_DATA_DIR", str(tmp_path))
+    metric_calls.clear()
 
-    capture._inspect_product_storage()
+    capture.inspect_product_storage()
 
     sizes = {
         attrs["kind"]: value
@@ -583,7 +643,7 @@ def test_product_storage_inspection_is_bounded_and_failure_safe(
         if name == "therapy_data_bytes"
     }
     assert sizes == {
-        "db": 2,
+        "db": db_size,
         "wal": 3,
         "audio": 5,
         "research": 8,
@@ -591,6 +651,25 @@ def test_product_storage_inspection_is_bounded_and_failure_safe(
         "backups": 6,
     }
     assert any(name == "therapy_disk_free_bytes" for name, _, _ in metric_calls)
+    assert any(name == "therapy_disk_free_inodes" for name, _, _ in metric_calls)
+    assert (
+        "therapy_observation_backlog",
+        1,
+        {},
+    ) in metric_calls
+    assert any(
+        name == "therapy_observation_oldest_pending_unixtime"
+        for name, _, _ in metric_calls
+    )
+    assert (
+        "therapy_insight_backlog",
+        1,
+        {"state": "queued"},
+    ) in metric_calls
+    assert any(
+        name == "therapy_graph_revalidation_backlog"
+        for name, _, _ in metric_calls
+    )
     assert (
         "therapy_storage_inspections_total",
         1,
@@ -607,7 +686,7 @@ def test_product_storage_inspection_is_bounded_and_failure_safe(
 
     metric_calls.clear()
     monkeypatch.setenv("THERAPY_DATA_DIR", str(tmp_path / "missing"))
-    capture._inspect_product_storage()
+    capture.inspect_product_storage()
     assert (
         "therapy_storage_inspections_total",
         1,
@@ -620,7 +699,9 @@ def test_product_storage_inspection_is_bounded_and_failure_safe(
             assert attrs["outcome"] in {"success", "error"}
 
 
-def test_api_export_delete_and_restore_round_trip(data_dir: Path, client) -> None:
+def test_api_export_delete_and_restore_round_trip(
+    data_dir: Path, client: HttpTestClient
+) -> None:
     session_id, _ = _seed(data_dir)
     exported = client.get("/api/data/export")
     assert exported.status_code == 200
