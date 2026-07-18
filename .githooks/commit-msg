@@ -1,0 +1,58 @@
+#!/bin/sh
+# TheraPy commit-msg — Conventional Commits format + the repo's no-branding rule.
+# Zero-dependency by design: a shell check that reuses the existing .githooks
+# setup instead of pulling a Node/commitlint toolchain into a Python/uv repo.
+# (Prefer a real linter? `commitizen` is the uv-native option — see make hooks
+# note.) Bypass in emergencies: git commit --no-verify
+set -eu
+
+msg_file=$1
+attr_lib="$(git rev-parse --show-toplevel)/.githooks/lib/no-attribution.sh"
+subject=$(sed -n '1p' "$msg_file")
+
+# Let git's own machine-generated subjects through untouched.
+case "$subject" in
+  "Merge "*|"Revert "*|"fixup!"*|"squash!"*|"amend!"*) exit 0 ;;
+esac
+
+# Conventional Commits header: type(optional-scope)(optional !): summary
+types='feat|fix|docs|style|refactor|perf|test|build|ci|chore|revert'
+if ! printf '%s' "$subject" | grep -Eq "^(${types})(\([a-z0-9._/-]+\))?!?: .+"; then
+  echo "commit-msg: subject must be Conventional Commits: '<type>(<scope>): <summary>'." >&2
+  echo "            types: ${types}" >&2
+  echo "            got:   ${subject}" >&2
+  exit 1
+fi
+
+# Keep the header readable (conventional guidance: <= ~100 chars).
+if [ "${#subject}" -gt 100 ]; then
+  echo "commit-msg: subject is ${#subject} chars (max 100): ${subject}" >&2
+  exit 1
+fi
+
+# Owner rule: no TOOL ATTRIBUTION (a tool crediting itself as author) — footers,
+# 'Co-authored-by:' trailers, robot emoji, '<verb> by/with <tool>' phrasing, tool
+# URLs, or a bare '— <tool>' signature. Plain vendor mentions ('anthropic adapter',
+# 'openai-compatible endpoint') stay legal. Scan real lines only (skip git's '#'
+# template lines). Predicate: .githooks/lib/no-attribution.sh — delete to disable.
+if [ -f "$attr_lib" ]; then
+  . "$attr_lib"
+  hits=$(grep -v '^#' "$msg_file" | attr_scan)
+  if [ -n "$hits" ]; then
+    echo "commit-msg: message reads like tool attribution (not mere vendor mention):" >&2
+    printf '%s\n' "$hits" | sed 's/^/    /' >&2
+    exit 1
+  fi
+fi
+
+# The branch being committed to must not be tool-owned either (earliest native
+# checkpoint — git has no branch-creation hook; pre-push re-checks every outgoing
+# ref). A tool named as the LEADING segment (claude/x, gpt/y) is agent branding;
+# a tool word deeper in the slug (feat/anthropic-adapter, fix/user-model-decay)
+# stays legal ('main' is safe — no tool word leads it).
+branch=$(git symbolic-ref --quiet --short HEAD || true)
+if [ -n "$branch" ] && printf '%s\n' "$branch" \
+     | grep -Eiq '^(ai|llm|gpt|bot|copilot|claude|anthropic|codex|openai|chatgpt|gemini|cursor|codeium|devin)([/_.-]|$)'; then
+  echo "commit-msg: branch '$branch' names a tool as its leading segment (no-branding rule)." >&2
+  exit 1
+fi
