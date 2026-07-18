@@ -169,14 +169,14 @@ A second knowledge store, deliberately separate from the user model: the user mo
 | Phase | Deliverable | Acceptance | Status |
 |-------|------------|-----------|--------|
 | 0 | New repo scaffold (Docker from day one); **framework spike: Pipecat vs. LiveKit Agents**; archive old TheraPy | Spike verdict written down; stub server runs in compose | ✅ Done — verdict: Pipecat ([framework-spike.md](framework-spike.md)) |
-| 1 | **Working voice+text loop** (P1): PWA (web + mobile) with WebRTC voice and text chat, mid-conversation switching, es/en/pt, barge-in; reachable from phone via Tailscale | Hold a natural 5-min mixed voice/text conversation in each language, from the phone | ✅ Done — human-accepted 2026-07-12; detailed hardening/evidence moved to [docs/evidence/field-tests-2026-07.md](evidence/field-tests-2026-07.md). TTFA-vs-R1 under the target provider is deferred to a later tuning pass. |
+| 1 | **Working voice+text loop** (P1): PWA (web + mobile) with WebRTC voice and text chat, mid-conversation switching, es/en/pt, barge-in; reachable from phone via Tailscale | Hold a natural 5-min mixed voice/text conversation in each language, from the phone | ✅ Done — human-accepted 2026-07-12; detailed hardening/evidence moved to [.local/working-notes/evidence/field-tests-2026-07.md](evidence/field-tests-2026-07.md). TTFA-vs-R1 under the target provider is deferred to a later tuning pass. |
 | 2 | **Memory + timeline + review UI**: SQLite store, transcripts, session summaries, continuity, user-model v1; browse transcripts in the PWA | Assistant correctly references something from a previous session | ✅ Done — scripted verification green; continuity, reconnect-resume + transcript replay, and export/delete round-trip verified. |
 | 3 | **ser integration** (P2 begins): per-turn emotion in context + timeline; emotion recap; review UI shows emotion alongside transcript (validates ser accuracy early) | Recap matches user's own read of the session | Not started |
 | 4 | **Longitudinal insight + proactivity + research KB v1**: cross-session pattern queries, reflections; check-ins/digest channels; corpus ingest + both retrieval modes | North-star test: one true non-obvious self-insight | Partial engineering slice landed; not product-complete. See [phase4-goal.md](phase4-goal.md) and [phase4-impl-log.md](phase4-impl-log.md). |
 | 5 | **Observability + evaluation foundation**: an owned, durable interaction journal for exact reconstruction and replay; correlated content-free operational telemetry across voice, web, storage, knowledge, outreach, and supervisors; dashboards, alerts, and runbooks | A versioned synthetic corpus round-trips and replays losslessly; leak tests keep restricted content and secrets out of broad telemetry; critical-path SLIs and actionable failure alerts stay within measured voice-latency and host-resource budgets | Not started |
 | 6 | P3 rehearsal mode / P4 daily structure; VPS migration when uptime starts to matter | Prioritize based on lived usage | Not started |
 
-Detailed July 2026 field-test and hardening chronology lives in [docs/evidence/field-tests-2026-07.md](evidence/field-tests-2026-07.md).
+Detailed July 2026 field-test and hardening chronology lives in [.local/working-notes/evidence/field-tests-2026-07.md](evidence/field-tests-2026-07.md).
 
 ## 10. Decisions log & open questions
 
